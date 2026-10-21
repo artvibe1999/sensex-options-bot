@@ -149,7 +149,8 @@ class TokenService:
                 try:
                     user = svc.exchange(q["request_token"][0], q.get("state", [None])[0])
                 except (ValueError, PermissionError) as exc:
-                    log.warning("Rejected callback: %s", exc)
+                    log.warning("Rejected callback: %s (state_in_url=%s, live_nonces=%d, nonce_file_exists=%s)",
+                                exc, "state" in q, len(svc._load_nonces()), os.path.exists(svc._nonce_file))
                     return self._reply(403, f"Rejected: {exc}")
                 except Exception:  # noqa: BLE001
                     log.exception("Token exchange failed")
