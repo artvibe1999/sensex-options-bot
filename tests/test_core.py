@@ -162,32 +162,32 @@ class InfraTests(unittest.TestCase):
             self.assertFalse(token_store.is_fresh(stale, dt.datetime(2026, 10, 21, 9, 0, tzinfo=IST)))
             self.assertTrue(token_store.is_fresh(stale, dt.datetime(2026, 10, 20, 20, 0, tzinfo=IST)))
 
-    def test_login_nonce_shared_across_processes_single_use_and_expiry(self):
-        import time as _t
+    def test_login_state_is_stateless_signed_and_expires(self):
         import token_service
-        from dataclasses import replace
         from config import Config, Credentials, Paths
-        with tempfile.TemporaryDirectory() as d:
-            cfg = Config(credentials=Credentials("k", "secret", None, None), paths=Paths(data_dir=d, token_file=os.path.join(d, "t.json")))
-            class FakeKite:
-                def __init__(self, **kw): pass
-                def login_url(self): return "https://kite.example/login?v=3"
-            orig = token_service.KiteConnect
-            token_service.KiteConnect = FakeKite
-            try:
-                maker, server = token_service.TokenService(cfg), token_service.TokenService(cfg)  # two "processes"
+        class FakeKite:
+            def __init__(self, **kw): pass
+            def login_url(self): return "https://kite.example/login?v=3"
+        orig = token_service.KiteConnect
+        token_service.KiteConnect = FakeKite
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                mk = lambda secret: token_service.TokenService(Config(
+                    credentials=Credentials("k", secret, None, None),
+                    paths=Paths(data_dir=d, token_file=os.path.join(d, "t.json"))))
+                maker, server, other = mk("s3cret"), mk("s3cret"), mk("different")
                 url = maker.login_url()
-                nonce = url.split("state%3D")[1]
-                self.assertTrue(server._consume_nonce(nonce))      # server accepts link made elsewhere
-                self.assertFalse(server._consume_nonce(nonce))     # single use
-                self.assertFalse(server._consume_nonce("forged"))
-                self.assertFalse(server._consume_nonce(None))
-                n2 = maker.login_url().split("state%3D")[1]
-                server._save_nonces({n2: _t.time() - 1})
-                self.assertFalse(server._consume_nonce(n2))        # expired
-                self.assertEqual(oct(os.stat(server._nonce_file).st_mode & 0o777), "0o600")
-            finally:
-                token_service.KiteConnect = orig
+                state = url.split("state%3D")[1]
+                self.assertTrue(server.check_state(state))                 # link from another process
+                self.assertFalse(other.check_state(state))                 # wrong secret = forged
+                self.assertFalse(server.check_state(state[:-1] + ("0" if state[-1] != "0" else "1")))  # tampered
+                self.assertFalse(server.check_state(None))
+                self.assertFalse(server.check_state("forged"))
+                import time as _t
+                self.assertFalse(server.check_state(state, now=_t.time() + 1900))  # expired
+                self.assertTrue(set(state) <= set("0123456789abcdefx"))            # URL/Kite safe
+        finally:
+            token_service.KiteConnect = orig
 
     def test_recorder_and_shadow_book(self):
         with tempfile.TemporaryDirectory() as d:

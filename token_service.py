@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import json
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -52,47 +53,37 @@ class TokenService:
         self.cfg = cfg
         self.kite = KiteConnect(api_key=cfg.credentials.api_key)
         self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id, dedupe_s=0)
-        # One-time login nonces live in a file so that a link made by `token_service.py url`
-        # (a separate process) is recognised by the running server. Each expires after 30 min.
-        self._nonce_file = os.path.join(cfg.paths.data_dir, "login_nonces.json")
         self._lock = threading.Lock()
+        self._last_rt: Optional[str] = None      # request_token already exchanged (guards browser reloads)
+        self._last_user = ""
 
-    def _load_nonces(self) -> dict:
-        try:
-            with open(self._nonce_file, encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (OSError, ValueError):
-            return {}
-        now = time.time()
-        return {k: v for k, v in data.items() if isinstance(v, (int, float)) and v > now}
+    # Login "state": stateless and self-verifying (HMAC with the API secret + timestamp), so a link
+    # made by `token_service.py url` (another process) is accepted by the running server without
+    # any shared file. Valid for 30 minutes. Replay is harmless on its own: the callback is useless
+    # without a fresh single-use request_token that only Zerodha can issue.
+    STATE_TTL_S = 1800
 
-    def _save_nonces(self, nonces: dict) -> None:
-        os.makedirs(os.path.dirname(self._nonce_file) or ".", exist_ok=True)
-        tmp = self._nonce_file + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(nonces, fh)
-        os.replace(tmp, self._nonce_file)
+    def _sign(self, body: str) -> str:
+        key = (self.cfg.credentials.api_secret or "").encode()
+        return hmac.new(key, body.encode(), hashlib.sha256).hexdigest()[:24]
+
+    def make_state(self, now: Optional[float] = None) -> str:
+        body = f"{int(now if now is not None else time.time())}x{secrets.token_hex(4)}"
+        return f"{body}x{self._sign(body)}"
+
+    def check_state(self, state: Optional[str], now: Optional[float] = None) -> bool:
+        if not state or state.count("x") != 2:
+            return False
+        ts_s, rnd, sig = state.split("x")
+        if not (ts_s.isdigit() and rnd and sig):
+            return False
+        if not hmac.compare_digest(sig, self._sign(f"{ts_s}x{rnd}")):
+            return False
+        age = (now if now is not None else time.time()) - int(ts_s)
+        return -60 <= age <= self.STATE_TTL_S
 
     def login_url(self) -> str:
-        nonce = secrets.token_urlsafe(16)
-        with self._lock:
-            nonces = self._load_nonces()
-            nonces[nonce] = time.time() + 1800
-            self._save_nonces(dict(list(nonces.items())[-20:]))
-        return f"{self.kite.login_url()}&redirect_params={quote('state=' + nonce)}"
-
-    def _consume_nonce(self, state: Optional[str]) -> bool:
-        if not state:
-            return False
-        with self._lock:
-            nonces = self._load_nonces()
-            match = next((k for k in nonces if secrets.compare_digest(k, state)), None)
-            if match is None:
-                return False
-            del nonces[match]                       # single use
-            self._save_nonces(nonces)
-            return True
+        return f"{self.kite.login_url()}&redirect_params={quote('state=' + self.make_state())}"
 
     def fresh(self) -> bool:
         return is_fresh(read_token(self.cfg.paths.token_file))
@@ -101,10 +92,13 @@ class TokenService:
         if not _TOKEN_RE.match(request_token):
             raise ValueError("malformed request_token")
         if check_state:
-            if not self._consume_nonce(state):
-                raise PermissionError("login state mismatch (stale, reused or forged link): "
-                                      "generate a fresh link and open it once")
+            if not self.check_state(state):
+                raise PermissionError("login state invalid or older than 30 minutes: "
+                                      "generate a fresh link and open it")
+        if request_token == self._last_rt and self.fresh():
+            return self._last_user                      # reload/replay of a login that already worked
         data = self.kite.generate_session(request_token, api_secret=self.cfg.credentials.api_secret)
+        self._last_rt, self._last_user = request_token, data.get("user_id", "")
         write_token(self.cfg.paths.token_file, data["access_token"], data.get("user_id", ""))
         self.alerts.send("Kite login complete: the bot will start its session shortly.")
         return data.get("user_id", "")
@@ -154,8 +148,7 @@ class TokenService:
                         log.info("Repeated callback ignored: a fresh token already exists")
                         return self._reply(200, "Already logged in today (this link was already used). "
                                                 "You can close this tab.")
-                    log.warning("Rejected callback: %s (state_in_url=%s, live_nonces=%d, nonce_file_exists=%s)",
-                                exc, "state" in q, len(svc._load_nonces()), os.path.exists(svc._nonce_file))
+                    log.warning("Rejected callback: %s (state_in_url=%s)", exc, "state" in q)
                     return self._reply(403, f"Rejected: {exc}")
                 except Exception:  # noqa: BLE001
                     log.exception("Token exchange failed")
