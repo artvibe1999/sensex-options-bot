@@ -31,3 +31,16 @@ Manual fallback: `docker compose exec token python token_service.py url`, log in
 - Logs: `docker compose logs -f bot`. Data: `./data` volume (back up `sxbot.db`).
 - Unknown positions in BFO halt the bot (`allow_foreign_positions=False`).
 - Kill switch: max daily loss; or `docker compose stop bot` (then square off manually).
+
+## Optional: live orders in a Google Sheet
+Tabs created automatically: **Orders** (every leg order with time, side, qty, LTP and fill price),
+**Trades** (one row per completed trade with P&L) and **Status** (session start / day summary).
+1. Create a Google Sheet. Extensions -> Apps Script -> paste `deploy/google_sheets_script.gs`.
+   Change `SECRET` to a long random string.
+2. Deploy -> New deployment -> Web app -> Execute as: Me, Who has access: Anyone -> Deploy
+   (authorise when asked). Copy the web app URL (ends in `/exec`).
+3. On the VM edit `.env`: `SHEETS_WEBHOOK_URL=<that URL>` and `SHEETS_SECRET=<same secret>`, then
+   `docker compose up -d`. Check `docker compose logs bot | grep -i sheets`.
+Rows are sent in the background, so a Sheets outage never affects trading. In paper mode the Orders tab
+shows the simulated fills (LTP plus modelled slippage). The 164-variant shadow book is not sent here:
+it stays in SQLite.

@@ -31,6 +31,7 @@ from costs import trade_cost
 from market_data import MarketData, Snapshot
 from recorder import Recorder
 from risk_manager import ManagedPosition, OpenLeg, RiskManager
+from sheets_sink import ORDERS_HEADER, STATUS_HEADER, TRADES_HEADER, SheetsSink
 from shadow import ShadowBook
 from strategy_engine import Leg, RegimeDetector, StrategyEngine, TradePlan
 from strategy_library import build_library, build_plan, load_approved
@@ -182,6 +183,7 @@ class Bot:
         self.broker = LiveBroker(self.client, cfg) if live else PaperBroker(cfg.execution.paper_slippage_pct)
         self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id)
         self.rec = Recorder(cfg.paths.db)
+        self.sheets = SheetsSink(cfg.sheets_url, cfg.sheets_secret)
         self.specs = build_library()
         self.spec_by_id = {s.id: s for s in self.specs}
         self.shadow = ShadowBook(self.specs, self.rec, cfg.risk, cfg.schedule, cfg.costs)
@@ -327,6 +329,9 @@ class Bot:
         if self.live:
             self._reconcile()
         self.session_ready = True
+        self.sheets.append("Status", STATUS_HEADER, [[now.isoformat(timespec="seconds"), self.mode,
+                                                      "SESSION_READY", f"capital {self.capital:,.0f}, "
+                                                      f"{len(self.approved)} approved variants"]])
         self.alerts.send(f"Session ready ({self.mode}), capital {self.capital:,.0f}, "
                          f"{len(self.approved)} approved variants", key="session")
         return True
@@ -359,6 +364,8 @@ class Bot:
         self.rec.event(now.isoformat(timespec="seconds"), "day_summary", "",
                        {"realized": self.realized, "trades": self.trades_today, "mode": self.mode})
         self.alerts.send(f"Day done ({self.mode}): net PnL {self.realized:,.0f} over {self.trades_today} trades")
+        self.sheets.append("Status", STATUS_HEADER, [[now.isoformat(timespec="seconds"), self.mode, "DAY_DONE",
+                                                      f"net {self.realized:,.0f} over {self.trades_today} trades"]])
         self.client.stop_stream()
         self.session_ready, self.eod_done = False, True
         self._save_state()
@@ -427,6 +434,9 @@ class Bot:
                    "regime": snap.rs.regime.value, "trend": snap.trend_dir}
         self.rec.event(ts, "entry", plan.variant_id, payload)
         self.rec.trade(ts, self.mode, plan.variant_id, "entry", "", 0.0, 0.0, 0.0, payload)
+        self.sheets.append("Orders", ORDERS_HEADER, [
+            [ts, self.mode, plan.variant_id, "ENTRY", l.contract.symbol, l.side, l.qty,
+             round(l.ref_price, 2), round(fills[l.contract.symbol], 2), plan.rationale[:120]] for l in legs])
         self.alerts.send(f"ENTRY {plan.name} x{lots} [{plan.variant_id}] {plan.rationale}")
 
     def _exit(self, reason: str) -> None:
@@ -457,6 +467,12 @@ class Bot:
         log.info("EXIT %s reason=%s net=%.0f day=%.0f", pos.plan.variant_id, reason, net, self.realized)
         self.rec.trade(ts, self.mode, pos.plan.variant_id, "exit", reason, gross, cost, net,
                        {"lots": pos.lots, "day_pnl": self.realized})
+        self.sheets.append("Orders", ORDERS_HEADER, [
+            [ts, self.mode, pos.plan.variant_id, "EXIT", o.contract.symbol, o.side, o.qty,
+             round(o.ref_price, 2), round(fills[o.contract.symbol], 2), reason] for o in legs])
+        self.sheets.append("Trades", TRADES_HEADER, [[ts, self.mode, pos.plan.variant_id, reason, pos.lots,
+                                                      round(gross, 2), round(cost, 2), round(net, 2),
+                                                      round(self.realized, 2)]])
         self._save_state()
         self.alerts.send(f"EXIT {pos.plan.name} [{reason}] net {net:,.0f}; day {self.realized:,.0f}")
 

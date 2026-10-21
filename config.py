@@ -161,6 +161,8 @@ class Config:
     execution: ExecutionParams = field(default_factory=ExecutionParams)
     schedule: Schedule = field(default_factory=Schedule)
     paper_capital: float = 500_000.0
+    sheets_url: str | None = None             # Google Apps Script web-app URL (optional live feed)
+    sheets_secret: str | None = None
     loop_interval_s: float = 3.0
     chain_interval_s: float = 10.0            # option-chain refresh + recording cadence
     allow_foreign_positions: bool = False     # False: halt if unknown BFO positions exist
@@ -191,6 +193,8 @@ def load_config() -> Config:
         ),
         execution=ExecutionParams(product=product),
         paper_capital=_env_float("PAPER_CAPITAL", 500_000.0),
+        sheets_url=_env("SHEETS_WEBHOOK_URL"),
+        sheets_secret=_env("SHEETS_SECRET"),
         chain_interval_s=_env_float("CHAIN_INTERVAL_S", 10.0),
         log_dir=_env("LOG_DIR", "logs") or "logs",
     )

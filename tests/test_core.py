@@ -189,6 +189,31 @@ class InfraTests(unittest.TestCase):
         finally:
             token_service.KiteConnect = orig
 
+    def test_sheets_sink_posts_rows_and_is_noop_when_disabled(self):
+        import json, threading, time as _t
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import sheets_sink
+        got = []
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                got.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
+            def log_message(self, *a): pass
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        sink = sheets_sink.SheetsSink(f"http://127.0.0.1:{srv.server_port}/x", "sec")
+        sink.append("Orders", sheets_sink.ORDERS_HEADER, [["2026-10-22T09:31:00+05:30", "paper", "v1", "ENTRY", "SENSEX26OCT80000CE", "SELL", 20, 100.0, 99.5, "r"]])
+        for _ in range(50):
+            if got: break
+            _t.sleep(0.1)
+        srv.shutdown()
+        self.assertEqual(got[0]["secret"], "sec")
+        self.assertEqual(got[0]["tab"], "Orders")
+        self.assertEqual(len(got[0]["rows"][0]), len(sheets_sink.ORDERS_HEADER))
+        off = sheets_sink.SheetsSink(None, None)
+        off.append("Orders", [], [[1]])                      # must not raise or start a thread
+        self.assertFalse(off.enabled)
+
     def test_recorder_and_shadow_book(self):
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "t.db")
