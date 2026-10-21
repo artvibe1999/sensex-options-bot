@@ -149,6 +149,11 @@ class TokenService:
                 try:
                     user = svc.exchange(q["request_token"][0], q.get("state", [None])[0])
                 except (ValueError, PermissionError) as exc:
+                    if isinstance(exc, PermissionError) and svc.fresh():
+                        # Typically a browser reload/replay of a link that already worked.
+                        log.info("Repeated callback ignored: a fresh token already exists")
+                        return self._reply(200, "Already logged in today (this link was already used). "
+                                                "You can close this tab.")
                     log.warning("Rejected callback: %s (state_in_url=%s, live_nonces=%d, nonce_file_exists=%s)",
                                 exc, "state" in q, len(svc._load_nonces()), os.path.exists(svc._nonce_file))
                     return self._reply(403, f"Rejected: {exc}")
