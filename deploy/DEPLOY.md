@@ -11,7 +11,8 @@ EC2 (Mumbai, Elastic IP), DigitalOcean (Bangalore, reserved IP) or any VPS with 
 2. Point a DNS A record (`BOT_DOMAIN`) at that IP. In the Kite app set Redirect URL to
    `https://<BOT_DOMAIN>/kite/callback`.
 3. `git clone`/copy the project, `cp .env.example .env`, fill it in (keep `LIVE_TRADING_CONFIRM=NO`).
-4. `docker compose up -d --build` (services: bot, token, caddy with automatic HTTPS).
+4. `mkdir -p data logs && sudo chown -R 10001:10001 data logs` (the containers run as user 10001),
+   then `docker compose up -d --build` (services: bot, token, caddy with automatic HTTPS).
 5. Run paper mode for 4+ weeks before any live money.
 
 ## Daily access token

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import logging
 import os
 import re
@@ -51,13 +52,47 @@ class TokenService:
         self.cfg = cfg
         self.kite = KiteConnect(api_key=cfg.credentials.api_key)
         self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id, dedupe_s=0)
-        self._nonce: Optional[str] = None
+        # One-time login nonces live in a file so that a link made by `token_service.py url`
+        # (a separate process) is recognised by the running server. Each expires after 30 min.
+        self._nonce_file = os.path.join(cfg.paths.data_dir, "login_nonces.json")
         self._lock = threading.Lock()
 
+    def _load_nonces(self) -> dict:
+        try:
+            with open(self._nonce_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        now = time.time()
+        return {k: v for k, v in data.items() if isinstance(v, (int, float)) and v > now}
+
+    def _save_nonces(self, nonces: dict) -> None:
+        os.makedirs(os.path.dirname(self._nonce_file) or ".", exist_ok=True)
+        tmp = self._nonce_file + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(nonces, fh)
+        os.replace(tmp, self._nonce_file)
+
     def login_url(self) -> str:
+        nonce = secrets.token_urlsafe(16)
         with self._lock:
-            self._nonce = secrets.token_urlsafe(16)
-        return f"{self.kite.login_url()}&redirect_params={quote('state=' + self._nonce)}"
+            nonces = self._load_nonces()
+            nonces[nonce] = time.time() + 1800
+            self._save_nonces(dict(list(nonces.items())[-20:]))
+        return f"{self.kite.login_url()}&redirect_params={quote('state=' + nonce)}"
+
+    def _consume_nonce(self, state: Optional[str]) -> bool:
+        if not state:
+            return False
+        with self._lock:
+            nonces = self._load_nonces()
+            match = next((k for k in nonces if secrets.compare_digest(k, state)), None)
+            if match is None:
+                return False
+            del nonces[match]                       # single use
+            self._save_nonces(nonces)
+            return True
 
     def fresh(self) -> bool:
         return is_fresh(read_token(self.cfg.paths.token_file))
@@ -66,12 +101,9 @@ class TokenService:
         if not _TOKEN_RE.match(request_token):
             raise ValueError("malformed request_token")
         if check_state:
-            with self._lock:
-                ok = self._nonce is not None and state is not None and secrets.compare_digest(state, self._nonce)
-                if ok:
-                    self._nonce = None            # single use
-            if not ok:
-                raise PermissionError("login state mismatch (stale or forged callback)")
+            if not self._consume_nonce(state):
+                raise PermissionError("login state mismatch (stale, reused or forged link): "
+                                      "generate a fresh link and open it once")
         data = self.kite.generate_session(request_token, api_secret=self.cfg.credentials.api_secret)
         write_token(self.cfg.paths.token_file, data["access_token"], data.get("user_id", ""))
         self.alerts.send("Kite login complete: the bot will start its session shortly.")
