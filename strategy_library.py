@@ -1,0 +1,267 @@
+"""Library of defined-risk SENSEX option strategy variants.
+
+IMPORTANT: these are CANDIDATES, not "proven" strategies. Each variant is a
+template (iron condor, credit/debit spread, straddle...) with a parameter set,
+a volatility-regime filter, a days-to-expiry band, a trend filter and exit
+rules. A variant only trades real or paper money after it passes the gates:
+
+  1. backtest.py   walk-forward backtest -> data/approved_backtest.json
+  2. paper mode    ShadowBook forward-tests ALL variants live, every day
+  3. promote.py    forward results + backtest -> data/approved_live.json
+
+All variants are defined-risk (no naked short options), so worst-case loss per
+lot is known at entry and the position sizer can enforce a hard risk budget.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import logging
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+from strategy_engine import Chain, Leg, OptionQuote, RegimeState, TradePlan
+
+log = logging.getLogger(__name__)
+
+LOW, NORM, HIGH = "LOW_VOL", "NORMAL", "HIGH_VOL"
+DTE_BANDS = ((1, 3), (4, 7))
+MIN_CREDIT_FRAC = 0.10      # minimum net credit as a fraction of spread width
+MIN_DEBIT_RR = 0.8          # minimum reward/risk for debit spreads
+
+
+@dataclass(frozen=True)
+class StrategySpec:
+    id: str
+    template: str
+    params: tuple                      # ((key, value), ...) hashable
+    regimes: tuple
+    dte_min: int
+    dte_max: int
+    trend: str = "none"                # none | with | flat
+    entry_after: dt.time = dt.time(9, 30)
+    sl_frac: float = 0.6               # hard stop as a fraction of max loss
+    tp_frac: float = 0.6               # take-profit as a fraction of max profit
+
+    @property
+    def p(self) -> dict:
+        return dict(self.params)
+
+
+# ------------------------------------------------------------------ helpers
+def _otm_by_delta(chain: Chain, kind: str, target: float) -> Optional[OptionQuote]:
+    best: Optional[tuple[float, OptionQuote]] = None
+    for q in chain.quotes.values():
+        c = q.contract
+        if c.kind != kind or q.greeks is None or q.ltp <= 0:
+            continue
+        if (kind == "CE" and c.strike <= chain.spot) or (kind == "PE" and c.strike >= chain.spot):
+            continue
+        d = abs(abs(q.greeks.delta) - target)
+        if best is None or d < best[0]:
+            best = (d, q)
+    return best[1] if best else None
+
+
+Built = Optional[tuple[tuple[Leg, ...], float, float, str]]  # legs, max_loss, max_profit, why
+
+
+def _leg(q: OptionQuote, side: str) -> Leg:
+    return Leg(q.contract, side, q.ltp)
+
+
+def _iron_condor(chain: Chain, p: dict) -> Built:
+    sc, sp = _otm_by_delta(chain, "CE", p["delta"]), _otm_by_delta(chain, "PE", p["delta"])
+    if not sc or not sp:
+        return None
+    w = p["wing"]
+    lc, lp = chain.get(sc.contract.strike + w, "CE"), chain.get(sp.contract.strike - w, "PE")
+    if not lc or not lp:
+        return None
+    credit = sc.ltp + sp.ltp - lc.ltp - lp.ltp
+    if credit < MIN_CREDIT_FRAC * w:
+        return None
+    legs = (_leg(sc, "SELL"), _leg(sp, "SELL"), _leg(lc, "BUY"), _leg(lp, "BUY"))
+    return legs, w - credit, credit, f"shorts {sp.contract.strike:.0f}/{sc.contract.strike:.0f} credit {credit:.1f}"
+
+
+def _iron_fly(chain: Chain, p: dict) -> Built:
+    w = p["wing"]
+    sc, sp = chain.get(chain.atm, "CE"), chain.get(chain.atm, "PE")
+    lc, lp = chain.get(chain.atm + w, "CE"), chain.get(chain.atm - w, "PE")
+    if not (sc and sp and lc and lp):
+        return None
+    credit = sc.ltp + sp.ltp - lc.ltp - lp.ltp
+    if credit < 0.15 * w:
+        return None
+    legs = (_leg(sc, "SELL"), _leg(sp, "SELL"), _leg(lc, "BUY"), _leg(lp, "BUY"))
+    return legs, w - credit, credit, f"fly @{chain.atm:.0f} credit {credit:.1f}"
+
+
+def _bull_put(chain: Chain, p: dict) -> Built:
+    sp = _otm_by_delta(chain, "PE", p["delta"])
+    if not sp:
+        return None
+    lp = chain.get(sp.contract.strike - p["width"], "PE")
+    if not lp:
+        return None
+    credit = sp.ltp - lp.ltp
+    if credit < 0.15 * p["width"]:
+        return None
+    return (_leg(sp, "SELL"), _leg(lp, "BUY")), p["width"] - credit, credit, \
+        f"short {sp.contract.strike:.0f}P credit {credit:.1f}"
+
+
+def _bear_call(chain: Chain, p: dict) -> Built:
+    sc = _otm_by_delta(chain, "CE", p["delta"])
+    if not sc:
+        return None
+    lc = chain.get(sc.contract.strike + p["width"], "CE")
+    if not lc:
+        return None
+    credit = sc.ltp - lc.ltp
+    if credit < 0.15 * p["width"]:
+        return None
+    return (_leg(sc, "SELL"), _leg(lc, "BUY")), p["width"] - credit, credit, \
+        f"short {sc.contract.strike:.0f}C credit {credit:.1f}"
+
+
+def _debit_spread(chain: Chain, p: dict, kind: str, direction: int) -> Built:
+    long_q = chain.get(chain.atm, kind)
+    short_q = chain.get(chain.atm + direction * p["width"], kind)
+    if not long_q or not short_q:
+        return None
+    debit = long_q.ltp - short_q.ltp
+    reward = p["width"] - debit
+    if debit <= 0 or reward <= 0 or reward / debit < MIN_DEBIT_RR:
+        return None
+    return (_leg(long_q, "BUY"), _leg(short_q, "SELL")), debit, reward, f"debit {debit:.1f}"
+
+
+def _bull_call_debit(chain: Chain, p: dict) -> Built:
+    return _debit_spread(chain, p, "CE", 1)
+
+
+def _bear_put_debit(chain: Chain, p: dict) -> Built:
+    return _debit_spread(chain, p, "PE", -1)
+
+
+def _long_straddle(chain: Chain, p: dict) -> Built:
+    ce, pe = chain.get(chain.atm, "CE"), chain.get(chain.atm, "PE")
+    if not ce or not pe:
+        return None
+    debit = ce.ltp + pe.ltp
+    return (_leg(ce, "BUY"), _leg(pe, "BUY")), debit, debit * p["tp_mult"], f"straddle debit {debit:.1f}"
+
+
+def _long_strangle(chain: Chain, p: dict) -> Built:
+    ce, pe = _otm_by_delta(chain, "CE", p["delta"]), _otm_by_delta(chain, "PE", p["delta"])
+    if not ce or not pe:
+        return None
+    debit = ce.ltp + pe.ltp
+    return (_leg(ce, "BUY"), _leg(pe, "BUY")), debit, debit * p["tp_mult"], f"strangle debit {debit:.1f}"
+
+
+_BUILDERS: dict[str, Callable[[Chain, dict], Built]] = {
+    "iron_condor": _iron_condor, "iron_fly": _iron_fly,
+    "bull_put_spread": _bull_put, "bear_call_spread": _bear_call,
+    "bull_call_debit": _bull_call_debit, "bear_put_debit": _bear_put_debit,
+    "long_straddle": _long_straddle, "long_strangle": _long_strangle,
+}
+TEMPLATE_DIRECTION = {"bull_put_spread": 1, "bull_call_debit": 1,
+                      "bear_call_spread": -1, "bear_put_debit": -1}
+
+
+# ------------------------------------------------------------------ library
+def _make_id(template: str, params: tuple, regimes: tuple, band: tuple[int, int],
+             trend: str, sl: float, tp: float) -> str:
+    ptxt = "_".join(f"{k}{v:g}" for k, v in params)
+    rtxt = "".join(r[0] for r in regimes)
+    return f"{template}|{ptxt}|r{rtxt}|d{band[0]}-{band[1]}|t{trend}|x{sl:g}-{tp:g}"
+
+
+def build_library() -> list[StrategySpec]:
+    out: list[StrategySpec] = []
+
+    def add(template: str, params: dict, regimes: tuple, band: tuple[int, int],
+            trend: str = "none", sl: float = 0.6, tp: float = 0.6) -> None:
+        pt = tuple(params.items())
+        out.append(StrategySpec(_make_id(template, pt, regimes, band, trend, sl, tp),
+                                template, pt, regimes, band[0], band[1], trend, sl_frac=sl, tp_frac=tp))
+
+    neutral_regimes = ((LOW,), (LOW, NORM))
+    for band in DTE_BANDS:
+        for regimes in neutral_regimes:
+            for delta in (0.10, 0.15, 0.20):
+                for wing in (500, 1000, 1500):
+                    add("iron_condor", {"delta": delta, "wing": wing}, regimes, band)
+            for wing in (500, 1000, 1500):
+                for trend in ("none", "flat"):
+                    add("iron_fly", {"wing": wing}, regimes, band, trend)
+        for delta in (0.15, 0.25, 0.30):
+            for width in (500, 1000):
+                for trend in ("none", "with"):
+                    add("bull_put_spread", {"delta": delta, "width": width}, (LOW, NORM), band, trend)
+                    add("bear_call_spread", {"delta": delta, "width": width}, (LOW, NORM), band, trend)
+        for width in (500, 1000):
+            for regimes in ((HIGH,), (NORM, HIGH)):
+                for sl, tp in ((0.6, 0.6), (0.5, 1.0)):
+                    add("bull_call_debit", {"width": width}, regimes, band, "with", sl, tp)
+                    add("bear_put_debit", {"width": width}, regimes, band, "with", sl, tp)
+        for regimes in ((NORM, HIGH), (HIGH,)):
+            for tp_mult in (0.5, 1.0):
+                add("long_straddle", {"tp_mult": tp_mult}, regimes, band, "none", 0.5, 1.0)
+                for delta in (0.25, 0.35):
+                    add("long_strangle", {"delta": delta, "tp_mult": tp_mult}, regimes, band, "none", 0.5, 1.0)
+    ids = [s.id for s in out]
+    assert len(ids) == len(set(ids)), "duplicate strategy ids"
+    return out
+
+
+# ------------------------------------------------------------------ planning
+def _trend_ok(spec: StrategySpec, trend_dir: Optional[int]) -> bool:
+    if spec.trend == "none":
+        return True
+    if trend_dir is None:
+        return False
+    if spec.trend == "flat":
+        return trend_dir == 0
+    want = TEMPLATE_DIRECTION.get(spec.template, 0)   # "with"
+    return want == 0 or trend_dir == want
+
+
+def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Optional[int],
+               today: dt.date, now: dt.datetime) -> Optional[TradePlan]:
+    """Return a concrete trade for this variant right now, or None."""
+    if rs.spike or rs.regime.value not in spec.regimes:
+        return None
+    if now.time() < spec.entry_after:
+        return None
+    if not (spec.dte_min <= (chain.expiry - today).days <= spec.dte_max):
+        return None
+    if not _trend_ok(spec, trend_dir):
+        return None
+    built = _BUILDERS[spec.template](chain, spec.p)
+    if not built:
+        return None
+    legs, max_loss, max_profit, why = built
+    if max_loss <= 0 or max_profit <= 0:
+        return None
+    return TradePlan(
+        name=spec.template.upper(), regime=rs.regime.value, expiry=chain.expiry, legs=legs,
+        lot_size=legs[0].contract.lot_size, max_loss_unit=max_loss, max_profit_unit=max_profit,
+        rationale=why, variant_id=spec.id, sl_frac=spec.sl_frac, tp_frac=spec.tp_frac)
+
+
+# ------------------------------------------------------------------ approvals
+def load_approved(path: str, today: dt.date) -> dict[str, float]:
+    """Variant id -> score. Missing, malformed or expired approvals return {} (fail closed)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        if dt.date.fromisoformat(doc["valid_until"]) < today:
+            log.warning("Approvals in %s expired on %s", path, doc["valid_until"])
+            return {}
+        return {v["id"]: float(v.get("score", 0.0)) for v in doc["variants"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}

@@ -1,0 +1,38 @@
+services:
+  bot:
+    build: .
+    # Change to ["python", "main.py", "--live"] only after the paper -> promote
+    # pipeline in README.md, and set LIVE_TRADING_CONFIRM=YES in .env.
+    command: ["python", "main.py", "--paper"]
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+  token:
+    build: .
+    command: ["python", "token_service.py", "serve"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TOKEN_SERVICE_HOST: "0.0.0.0"
+    volumes:
+      - ./data:/app/data
+
+  caddy:                      # automatic HTTPS for the Kite redirect URL
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      BOT_DOMAIN: ${BOT_DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    depends_on:
+      - token
+
+volumes:
+  caddy_data:

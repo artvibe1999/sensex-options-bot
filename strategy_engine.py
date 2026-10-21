@@ -1,0 +1,331 @@
+"""Greeks/IV, option-chain snapshot, regime detection and strategy selection."""
+from __future__ import annotations
+
+import datetime as dt
+import logging
+import math
+import statistics
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional, Sequence
+
+from config import IST, StrategyParams
+from zerodha_client import OptionContract, ZerodhaClient
+
+log = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------ Black-Scholes
+def _cdf(x: float) -> float:
+    return 0.5 * math.erfc(-x / math.sqrt(2.0))
+
+
+def _pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+@dataclass(frozen=True)
+class Greeks:
+    delta: float
+    gamma: float
+    theta: float  # per calendar day, in index points
+    vega: float   # per 1 vol point
+
+
+def bs_price(S: float, K: float, T: float, r: float, sigma: float, kind: str) -> float:
+    if T <= 0 or sigma <= 0:
+        return max(S - K, 0.0) if kind == "CE" else max(K - S, 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if kind == "CE":
+        return S * _cdf(d1) - K * math.exp(-r * T) * _cdf(d2)
+    return K * math.exp(-r * T) * _cdf(-d2) - S * _cdf(-d1)
+
+
+def bs_greeks(S: float, K: float, T: float, r: float, sigma: float, kind: str) -> Greeks:
+    sq = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sq)
+    d2 = d1 - sigma * sq
+    decay = -S * _pdf(d1) * sigma / (2 * sq)
+    if kind == "CE":
+        delta = _cdf(d1)
+        theta = decay - r * K * math.exp(-r * T) * _cdf(d2)
+    else:
+        delta = _cdf(d1) - 1.0
+        theta = decay + r * K * math.exp(-r * T) * _cdf(-d2)
+    return Greeks(delta, _pdf(d1) / (S * sigma * sq), theta / 365.0, S * _pdf(d1) * sq / 100.0)
+
+
+def implied_vol(price: float, S: float, K: float, T: float, r: float, kind: str) -> Optional[float]:
+    """Bisection IV solver; None if the price is outside no-arbitrage bounds."""
+    if T <= 0 or price <= 0:
+        return None
+    lo, hi = 0.01, 3.0
+    if not (bs_price(S, K, T, r, lo, kind) <= price <= bs_price(S, K, T, r, hi, kind)):
+        return None
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        if bs_price(S, K, T, r, mid, kind) < price:
+            lo = mid
+        else:
+            hi = mid
+        if hi - lo < 1e-5:
+            break
+    return 0.5 * (lo + hi)
+
+
+# ------------------------------------------------------------ chain model
+@dataclass(frozen=True)
+class OptionQuote:
+    contract: OptionContract
+    ltp: float
+    oi: float
+    iv: Optional[float]
+    greeks: Optional[Greeks]
+
+
+@dataclass
+class Chain:
+    expiry: dt.date
+    spot: float
+    atm: float
+    step: float
+    pcr: float
+    quotes: dict[tuple[float, str], OptionQuote] = field(default_factory=dict)
+
+    def get(self, strike: float, kind: str) -> Optional[OptionQuote]:
+        q = self.quotes.get((strike, kind))
+        return q if q and q.ltp > 0 else None
+
+
+@dataclass(frozen=True)
+class Leg:
+    contract: OptionContract
+    side: str  # BUY / SELL
+    ref_price: float
+
+
+@dataclass(frozen=True)
+class TradePlan:
+    name: str
+    regime: str
+    expiry: dt.date
+    legs: tuple[Leg, ...]
+    lot_size: int
+    max_loss_unit: float    # points per unit, worst case
+    max_profit_unit: float
+    rationale: str
+    variant_id: str = ""
+    sl_frac: Optional[float] = None   # hard stop as a fraction of max loss (None: RiskParams default)
+    tp_frac: Optional[float] = None   # take-profit as a fraction of max profit
+
+    @property
+    def max_loss_per_lot(self) -> float:
+        return self.max_loss_unit * self.lot_size
+
+    @property
+    def max_profit_per_lot(self) -> float:
+        return self.max_profit_unit * self.lot_size
+
+
+# ---------------------------------------------------------------- regime
+class Regime(str, Enum):
+    LOW_VOL = "LOW_VOL"
+    HIGH_VOL = "HIGH_VOL"
+    NORMAL = "NORMAL"
+
+
+@dataclass(frozen=True)
+class RegimeState:
+    regime: Regime
+    vix: float
+    atr_pct: float
+    realized_vol: float
+    spike: bool
+    score: int
+
+
+class RegimeDetector:
+    """Votes from VIX, daily ATR% and realised vol, with hysteresis."""
+
+    def __init__(self, p: StrategyParams) -> None:
+        self.p = p
+        self.current = Regime.NORMAL
+        self._vix_hist: deque[tuple[float, float]] = deque()
+
+    @staticmethod
+    def atr_pct(candles: Sequence[dict], n: int = 14) -> float:
+        if len(candles) < n + 1:
+            return float("nan")
+        trs = []
+        for prev, cur in zip(candles[-n - 1:-1], candles[-n:]):
+            trs.append(max(cur["high"] - cur["low"], abs(cur["high"] - prev["close"]),
+                           abs(cur["low"] - prev["close"])))
+        return 100.0 * statistics.mean(trs) / candles[-1]["close"]
+
+    @staticmethod
+    def realized_vol(candles: Sequence[dict], n: int = 20) -> float:
+        closes = [c["close"] for c in candles[-n - 1:]]
+        if len(closes) < n + 1:
+            return float("nan")
+        rets = [math.log(b / a) for a, b in zip(closes, closes[1:])]
+        return 100.0 * statistics.stdev(rets) * math.sqrt(252)
+
+    def update(self, vix: float, daily: Sequence[dict], t: Optional[float] = None) -> RegimeState:
+        """``t`` is a monotonic-style clock in seconds; the backtester passes simulated time."""
+        p, now = self.p, (time.monotonic() if t is None else t)
+        self._vix_hist.append((now, vix))
+        while self._vix_hist and now - self._vix_hist[0][0] > 900:
+            self._vix_hist.popleft()
+        ref = self._vix_hist[0][1]
+        spike = ref > 0 and (vix / ref - 1.0) >= p.vix_spike_pct
+
+        atr, rv = self.atr_pct(daily), self.realized_vol(daily)
+        score = 0
+        score += 1 if vix >= p.vix_high else -1 if vix <= p.vix_low else 0
+        if not math.isnan(atr):
+            score += 1 if atr >= p.atr_pct_high else -1 if atr <= p.atr_pct_low else 0
+        if not math.isnan(rv):
+            score += 1 if rv >= p.rv_high else -1 if rv <= p.rv_low else 0
+
+        if score >= 2 or (self.current is Regime.HIGH_VOL and score >= 1):
+            new = Regime.HIGH_VOL
+        elif score <= -2 or (self.current is Regime.LOW_VOL and score <= -1):
+            new = Regime.LOW_VOL
+        else:
+            new = Regime.NORMAL
+        if new is not self.current:
+            log.info("Regime %s -> %s (vix=%.2f atr%%=%.2f rv=%.2f score=%d)",
+                     self.current.value, new.value, vix, atr, rv, score)
+        self.current = new
+        return RegimeState(new, vix, atr, rv, spike, score)
+
+
+def ema(values: Sequence[float], n: int) -> float:
+    k = 2.0 / (n + 1)
+    out = values[0]
+    for v in values[1:]:
+        out = v * k + out * (1 - k)
+    return out
+
+
+def trend_direction(closes: Sequence[float], p: StrategyParams) -> Optional[int]:
+    """+1 up-trend, -1 down-trend, 0 flat, None if there is not enough history."""
+    if len(closes) < p.ema_slow + 1:
+        return None
+    fast, slow = ema(closes, p.ema_fast), ema(closes, p.ema_slow)
+    if fast > slow * (1 + p.trend_buffer_pct):
+        return 1
+    if fast < slow * (1 - p.trend_buffer_pct):
+        return -1
+    return 0
+
+
+# ---------------------------------------------------------------- engine
+class StrategyEngine:
+    def __init__(self, client: ZerodhaClient, params: StrategyParams) -> None:
+        self.client, self.p = client, params
+
+    def pick_expiry(self, today: dt.date) -> Optional[dt.date]:
+        ok = [e for e in self.client.expiries() if self.p.min_dte <= (e - today).days <= self.p.max_dte]
+        return min(ok) if ok else None
+
+    def build_chain(self, expiry: dt.date, spot: float, now: dt.datetime) -> Optional[Chain]:
+        contracts = self.client.contracts_for(expiry)
+        strikes = sorted({c.strike for c in contracts})
+        if len(strikes) < 3:
+            return None
+        step = min(b - a for a, b in zip(strikes, strikes[1:]))  # derived, not assumed
+        atm = min(strikes, key=lambda k: abs(k - spot))
+        idx = strikes.index(atm)
+        w = self.p.chain_window_strikes
+        window = set(strikes[max(0, idx - w): idx + w + 1])
+        sel = [c for c in contracts if c.strike in window]
+        raw = self.client.quote([c.key for c in sel])
+
+        expiry_dt = dt.datetime.combine(expiry, dt.time(15, 30), tzinfo=IST)
+        T = max((expiry_dt - now).total_seconds(), 60.0) / (365 * 24 * 3600)
+        chain = Chain(expiry, spot, atm, step, 0.0)
+        put_oi = call_oi = 0.0
+        for c in sel:
+            q = raw.get(c.key)
+            if not q:
+                continue
+            ltp, oi = float(q["last_price"]), float(q.get("oi") or 0)
+            iv = implied_vol(ltp, spot, c.strike, T, self.p.risk_free_rate, c.kind)
+            g = bs_greeks(spot, c.strike, T, self.p.risk_free_rate, iv, c.kind) if iv else None
+            chain.quotes[(c.strike, c.kind)] = OptionQuote(c, ltp, oi, iv, g)
+            if c.kind == "PE":
+                put_oi += oi
+            else:
+                call_oi += oi
+        chain.pcr = put_oi / call_oi if call_oi else float("nan")
+        return chain
+
+    # ----------------------------------------------------------- selection
+    def select(self, rs: RegimeState, chain: Chain, closes_5m: Sequence[float]) -> Optional[TradePlan]:
+        if rs.spike:
+            log.info("VIX spike: no new entries")
+            return None
+        if rs.regime is Regime.LOW_VOL:
+            return self._iron_condor(rs, chain)
+        if rs.regime is Regime.HIGH_VOL:
+            return self._debit_spread(rs, chain, closes_5m)
+        return None
+
+    def _iron_condor(self, rs: RegimeState, chain: Chain) -> Optional[TradePlan]:
+        p = self.p
+        calls = [q for q in chain.quotes.values() if q.contract.kind == "CE"
+                 and q.contract.strike > chain.spot and q.greeks and q.ltp > 0]
+        puts = [q for q in chain.quotes.values() if q.contract.kind == "PE"
+                and q.contract.strike < chain.spot and q.greeks and q.ltp > 0]
+        if not calls or not puts:
+            return None
+        sc = min(calls, key=lambda q: abs(q.greeks.delta - p.condor_short_delta))
+        sp = min(puts, key=lambda q: abs(abs(q.greeks.delta) - p.condor_short_delta))
+        lc = chain.get(sc.contract.strike + p.condor_wing_points, "CE")
+        lp = chain.get(sp.contract.strike - p.condor_wing_points, "PE")
+        if not lc or not lp:
+            log.info("Condor wings not available in chain")
+            return None
+        credit = sc.ltp + sp.ltp - lc.ltp - lp.ltp
+        if credit < p.condor_min_credit_pct_of_width * p.condor_wing_points:
+            log.info("Condor credit %.1f too small", credit)
+            return None
+        legs = (Leg(sc.contract, "SELL", sc.ltp), Leg(sp.contract, "SELL", sp.ltp),
+                Leg(lc.contract, "BUY", lc.ltp), Leg(lp.contract, "BUY", lp.ltp))
+        return TradePlan(
+            "IRON_CONDOR", rs.regime.value, chain.expiry, legs, sc.contract.lot_size,
+            max_loss_unit=p.condor_wing_points - credit, max_profit_unit=credit,
+            rationale=f"shorts {sp.contract.strike:.0f}/{sc.contract.strike:.0f}, credit {credit:.1f}, pcr {chain.pcr:.2f}",
+        )
+
+    def _debit_spread(self, rs: RegimeState, chain: Chain, closes: Sequence[float]) -> Optional[TradePlan]:
+        p = self.p
+        if len(closes) < p.ema_slow + 1:
+            return None
+        fast, slow = ema(closes, p.ema_fast), ema(closes, p.ema_slow)
+        if fast > slow * (1 + p.trend_buffer_pct):
+            kind, direction = "CE", 1
+        elif fast < slow * (1 - p.trend_buffer_pct):
+            kind, direction = "PE", -1
+        else:
+            log.info("No clear trend; skipping debit spread")
+            return None
+        long_q = chain.get(chain.atm, kind)
+        short_q = chain.get(chain.atm + direction * p.spread_width_points, kind)
+        if not long_q or not short_q:
+            return None
+        debit = long_q.ltp - short_q.ltp
+        reward = p.spread_width_points - debit
+        if debit <= 0 or reward / debit < p.spread_min_reward_to_risk:
+            log.info("Spread reward/risk too low (debit %.1f)", debit)
+            return None
+        legs = (Leg(long_q.contract, "BUY", long_q.ltp), Leg(short_q.contract, "SELL", short_q.ltp))
+        return TradePlan(
+            f"{'BULL_CALL' if direction > 0 else 'BEAR_PUT'}_DEBIT_SPREAD", rs.regime.value,
+            chain.expiry, legs, long_q.contract.lot_size, max_loss_unit=debit, max_profit_unit=reward,
+            rationale=f"EMA{p.ema_fast}/{p.ema_slow} trend, debit {debit:.1f}",
+        )

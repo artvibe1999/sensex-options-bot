@@ -1,0 +1,9 @@
+{$BOT_DOMAIN} {
+	@public path /kite/callback /health
+	handle @public {
+		reverse_proxy token:8765
+	}
+	handle {
+		respond "not found" 404
+	}
+}

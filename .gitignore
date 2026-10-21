@@ -1,0 +1,12 @@
+# secrets and runtime data: never commit
+.env
+data/
+logs/
+*.db
+*.db-wal
+*.db-shm
+token.json
+# python
+__pycache__/
+*.pyc
+.venv/

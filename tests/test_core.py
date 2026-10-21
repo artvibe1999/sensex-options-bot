@@ -1,0 +1,209 @@
+"""Offline tests: python -m unittest discover -s tests -v"""
+import datetime as dt
+import os
+import sqlite3
+import sys
+import tempfile
+import types
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:  # allow the suite to run without kiteconnect installed
+    import kiteconnect  # noqa: F401
+except ImportError:  # pragma: no cover
+    m = types.ModuleType("kiteconnect")
+    m.KiteConnect = m.KiteTicker = object
+    e = types.ModuleType("kiteconnect.exceptions")
+    for n in ("NetworkException", "GeneralException", "TokenException"):
+        setattr(e, n, type(n, (Exception,), {}))
+    m.exceptions = e
+    sys.modules.update({"kiteconnect": m, "kiteconnect.exceptions": e})
+
+import backtest as bt
+import recorder
+import strategy_library as lib
+import token_store
+from config import IST, BacktestParams, RiskParams, Schedule, StrategyParams
+from costs import CostParams, trade_cost
+from main import _position_from_dict, _position_to_dict
+from market_data import Snapshot
+from risk_manager import ManagedPosition, OpenLeg, RiskManager
+from shadow import ShadowBook
+from strategy_engine import Regime, RegimeState, TradePlan, bs_price, implied_vol
+
+BP, SP = BacktestParams(), StrategyParams()
+TODAY = dt.date(2026, 10, 21)
+NOW = dt.datetime(2026, 10, 21, 10, 0, tzinfo=IST)
+IV = {"LOW_VOL": 0.11, "NORMAL": 0.15, "HIGH_VOL": 0.22}
+
+
+def plan_for(spec, spot=80000.0):
+    dte = 2 if spec.dte_max <= 3 else 5
+    regime = spec.regimes[0]
+    chain = bt.model_chain(spot, IV[regime], TODAY + dt.timedelta(days=dte), NOW, BP, SP.risk_free_rate)
+    rs = RegimeState(Regime(regime), 15.0, 1.0, 12.0, False, 0)
+    tdir = lib.TEMPLATE_DIRECTION.get(spec.template, 0)
+    return lib.build_plan(spec, chain, rs, tdir, TODAY, NOW), chain, rs
+
+
+class LibraryTests(unittest.TestCase):
+    def test_at_least_100_unique_variants(self):
+        specs = lib.build_library()
+        self.assertGreaterEqual(len(specs), 100)
+        self.assertEqual(len({s.id for s in specs}), len(specs))
+        self.assertGreaterEqual(len({s.template for s in specs}), 8)
+
+    def test_every_template_can_produce_a_trade_and_is_defined_risk(self):
+        by_template, total, built = {}, 0, 0
+        for spec in lib.build_library():
+            plan, _, _ = plan_for(spec)
+            total += 1
+            if plan:
+                built += 1
+                by_template[spec.template] = by_template.get(spec.template, 0) + 1
+                self.assertGreater(plan.max_loss_unit, 0)
+                self.assertGreater(plan.max_profit_unit, 0)
+        self.assertEqual(set(by_template), {s.template for s in lib.build_library()},
+                         f"templates that never built a plan: built={by_template}")
+        print(f"\n  library coverage on a sample chain: {built}/{total} variants produced a plan")
+        self.assertGreater(built / total, 0.5)
+
+    def test_regime_and_spike_gates(self):
+        spec = next(s for s in lib.build_library() if s.template == "iron_condor" and s.regimes == ("LOW_VOL",))
+        plan, chain, _ = plan_for(spec)
+        self.assertIsNotNone(plan)
+        high = RegimeState(Regime.HIGH_VOL, 25, 2, 20, False, 3)
+        self.assertIsNone(lib.build_plan(spec, chain, high, 0, TODAY, NOW))
+        spike = RegimeState(Regime.LOW_VOL, 12, 0.5, 9, True, -2)
+        self.assertIsNone(lib.build_plan(spec, chain, spike, 0, TODAY, NOW))
+
+    def test_load_approved_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.json")
+            self.assertEqual(lib.load_approved(p, TODAY), {})
+            open(p, "w").write('{"valid_until": "2026-10-01", "variants": [{"id": "x", "score": 1}]}')
+            self.assertEqual(lib.load_approved(p, TODAY), {})
+            open(p, "w").write('{"valid_until": "2026-12-01", "variants": [{"id": "x", "score": 1}]}')
+            self.assertEqual(lib.load_approved(p, TODAY), {"x": 1.0})
+
+
+class MathAndCostTests(unittest.TestCase):
+    def test_iv_roundtrip(self):
+        p = bs_price(80000, 80500, 5 / 365, 0.065, 0.17, "CE")
+        self.assertAlmostEqual(implied_vol(p, 80000, 80500, 5 / 365, 0.065, "CE"), 0.17, places=3)
+
+    def test_costs(self):
+        c = trade_cost([("SELL", 100.0, 20), ("BUY", 100.0, 20)], CostParams())
+        self.assertGreater(c, 40.0)                       # two orders of brokerage at minimum
+        sell_only = trade_cost([("SELL", 100.0, 20)], CostParams())
+        buy_only = trade_cost([("BUY", 100.0, 20)], CostParams())
+        self.assertGreater(sell_only, buy_only)           # STT applies on the sell side
+
+    def test_position_sizing_respects_risk_budget(self):
+        spec = next(s for s in lib.build_library() if s.template == "iron_condor")
+        plan, _, _ = plan_for(spec)
+        rm = RiskManager(RiskParams(), Schedule())
+        lots = rm.size(plan, 500_000.0)
+        self.assertLessEqual(lots * plan.max_loss_per_lot, 500_000 * RiskParams().max_risk_per_trade_pct + 1e-6)
+        self.assertEqual(rm.size(plan, 1_000.0), 0)       # too small an account: no trade
+
+
+class BacktestTests(unittest.TestCase):
+    def test_simulation_stop_loss_on_crash_day(self):
+        spec = next(s for s in lib.build_library() if s.template == "iron_condor" and s.regimes == ("LOW_VOL",))
+        plan, _, _ = plan_for(spec)
+        crash = {"date": TODAY, "open": 80000.0, "high": 80100.0, "low": 74000.0, "close": 74500.0}
+        t = bt.simulate_trade(plan, spec, crash, 0.11, 0.2, BP, CostParams(), SP.risk_free_rate, NOW)
+        self.assertEqual(t.reason, "SL")
+        self.assertLess(t.net, -0.5 * plan.max_loss_per_lot)
+
+    def test_no_phantom_edge_for_option_buyers(self):
+        """Regression: a calendar-time decay clock made long straddles/strangles look
+        hugely profitable on daily bars. Buyers must not show a large positive average
+        on synthetic data where implied vol >= realised vol."""
+        import statistics
+        bars = bt.synthetic_bars(500)
+        specs = [s for s in lib.build_library() if s.template in ("long_straddle", "long_strangle")][::3]
+        results = bt.run_backtest(bars, specs, SP, BP, CostParams())
+        nets = [t.net for v in results.values() for t in v]
+        self.assertGreater(len(nets), 50)
+        self.assertLess(statistics.mean(nets), 500.0)
+
+    def test_trading_time_clock(self):
+        # Friday 10:00 -> next Monday close must count 1 trading day, not 3 calendar days
+        fri = dt.datetime(2026, 10, 23, 10, 0, tzinfo=IST)
+        y = bt._years(dt.date(2026, 10, 26), fri)
+        self.assertLess(y * 252, 2.0)
+        self.assertGreater(y * 252, 1.0)
+
+    def test_pipeline_runs_end_to_end_on_synthetic_data(self):
+        bars = bt.synthetic_bars(420)
+        specs = lib.build_library()[::12]
+        results = bt.run_backtest(bars, specs, SP, BP, CostParams())
+        self.assertEqual(set(results), {s.id for s in specs})
+        self.assertGreater(sum(len(v) for v in results.values()), 0)
+        rows, per = bt.walk_forward(results, [b["date"] for b in bars[30:]], bt.Criteria(train_days=100, test_days=40))
+        self.assertGreater(len(rows), 0)
+        self.assertEqual(set(per), set(results))
+        for v in per.values():
+            self.assertIn("approved", v)
+
+
+class InfraTests(unittest.TestCase):
+    def test_token_freshness(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "t.json")
+            rec = token_store.write_token(path, "abc", "U1")
+            self.assertEqual(token_store.read_token(path)["access_token"], "abc")
+            self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+            self.assertTrue(token_store.is_fresh(rec))
+            stale = {"access_token": "x", "issued_at": dt.datetime(2026, 10, 20, 10, 0, tzinfo=IST).isoformat()}
+            self.assertFalse(token_store.is_fresh(stale, dt.datetime(2026, 10, 21, 9, 0, tzinfo=IST)))
+            self.assertTrue(token_store.is_fresh(stale, dt.datetime(2026, 10, 20, 20, 0, tzinfo=IST)))
+
+    def test_recorder_and_shadow_book(self):
+        with tempfile.TemporaryDirectory() as d:
+            db = os.path.join(d, "t.db")
+            rec = recorder.Recorder(db)
+            specs = [s for s in lib.build_library()
+                     if s.template == "iron_condor" and s.regimes == ("LOW_VOL",) and s.dte_max == 3][:4]
+            book = ShadowBook(specs, rec, RiskParams(), Schedule(), CostParams())
+            expiry = TODAY + dt.timedelta(days=2)
+            rs = RegimeState(Regime.LOW_VOL, 12.0, 0.5, 9.0, False, -2)
+            t = dt.datetime(2026, 10, 21, 9, 35, tzinfo=IST)
+            first = None
+            while t.time() <= dt.time(15, 25):
+                spot = 80000.0 + (t.hour - 9) * 15
+                chain = bt.model_chain(spot, 0.11, expiry, t, BP, SP.risk_free_rate)
+                snap = Snapshot(t, spot, 12.0, rs, chain, 0, True)
+                first = first or snap
+                rec.record_snapshot(snap)
+                book.step(snap, t)
+                t += dt.timedelta(minutes=10)
+            con = sqlite3.connect(db)
+            self.assertGreater(con.execute("SELECT COUNT(*) FROM chain").fetchone()[0], 100)
+            self.assertGreater(con.execute("SELECT COUNT(*) FROM market").fetchone()[0], 10)
+            n = con.execute("SELECT COUNT(*) FROM shadow_trades").fetchone()[0]
+            self.assertGreaterEqual(n, 1)
+            self.assertEqual(len(book.open), 0)            # everything squared off by 15:15
+            out = os.path.join(d, "chain.csv")
+            self.assertGreater(recorder._export(db, "chain", None, out), 100)
+            con.close()
+            rec.close()
+
+    def test_position_state_roundtrip(self):
+        spec = next(s for s in lib.build_library() if s.template == "iron_condor")
+        plan, _, _ = plan_for(spec)
+        legs = [OpenLeg(l.contract, l.side, 20, l.ref_price) for l in plan.legs]
+        pos = ManagedPosition(plan, 1, legs, NOW, plan.max_loss_per_lot, plan.max_profit_per_lot, 123.0)
+        back = _position_from_dict(_position_to_dict(pos))
+        self.assertEqual(back.plan.variant_id, plan.variant_id)
+        self.assertEqual([(l.contract.symbol, l.side, l.qty) for l in back.legs],
+                         [(l.contract.symbol, l.side, l.qty) for l in legs])
+        self.assertEqual(back.peak_pnl, 123.0)
+        self.assertEqual(back.plan.expiry, plan.expiry)
+
+
+if __name__ == "__main__":
+    unittest.main()
