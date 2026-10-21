@@ -24,7 +24,7 @@ Kite tokens expire ~06:00 IST and login needs password + TOTP, so it cannot be f
 If you skip it, the bot stays idle and alerts you; it never trades without a fresh token.
 
 Manual fallback: `docker compose exec token python token_service.py url`, log in, then
-`python token_service.py exchange <request_token>`; `status` shows freshness.
+`python token_service.py exchange --request-token <request_token>`; `status` shows freshness.
 
 ## Operations
 - Logs: `docker compose logs -f bot`. Data: `./data` volume (back up `sxbot.db`).
