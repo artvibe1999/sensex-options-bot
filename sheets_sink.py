@@ -61,3 +61,36 @@ class SheetsSink:
                 time.sleep(2 ** attempt)
             else:
                 log.error("Dropped %d rows for tab %s after 5 failures", len(rows), tab)
+
+
+def _selftest() -> int:
+    """python sheets_sink.py  -> posts one row to the Status tab and prints what Google answered."""
+    import datetime as dt
+    import os
+    url, secret = os.getenv("SHEETS_WEBHOOK_URL"), os.getenv("SHEETS_SECRET")
+    print("SHEETS_WEBHOOK_URL set:", bool(url), "| SHEETS_SECRET set:", bool(secret))
+    if not (url and secret):
+        print("Fill both in .env, then run: docker compose up -d")
+        return 1
+    try:
+        r = requests.post(url, json={"secret": secret, "tab": "Status", "header": STATUS_HEADER,
+                                     "rows": [[dt.datetime.now().isoformat(timespec="seconds"), "test",
+                                               "SELFTEST", "connection check"]]}, timeout=30)
+    except requests.RequestException as exc:
+        print("Could not reach the URL:", exc.__class__.__name__)
+        return 1
+    body = r.text.strip()
+    print("HTTP", r.status_code, "| reply:", body[:80].replace("\n", " "))
+    if body == "ok":
+        print("OK: check your sheet for a 'Status' tab.")
+        return 0
+    if body == "forbidden":
+        print("The secret in .env differs from SECRET in the Apps Script.")
+    elif "<html" in body.lower() or r.status_code in (302, 401, 403, 404):
+        print("Google returned a page, not 'ok': the web app is not deployed with 'Who has access: Anyone', "
+              "or the URL is wrong/old. Redeploy and copy the /exec URL.")
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_selftest())

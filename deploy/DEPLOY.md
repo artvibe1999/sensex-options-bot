@@ -40,7 +40,8 @@ Tabs created automatically: **Orders** (every leg order with time, side, qty, LT
 2. Deploy -> New deployment -> Web app -> Execute as: Me, Who has access: Anyone -> Deploy
    (authorise when asked). Copy the web app URL (ends in `/exec`).
 3. On the VM edit `.env`: `SHEETS_WEBHOOK_URL=<that URL>` and `SHEETS_SECRET=<same secret>`, then
-   `docker compose up -d`. Check `docker compose logs bot | grep -i sheets`.
+   `docker compose up -d`. Test the link: `docker compose exec bot python sheets_sink.py`
+   (writes a row to a `Status` tab and explains any problem). Real tabs appear when the bot sends its first row.
 Rows are sent in the background, so a Sheets outage never affects trading. In paper mode the Orders tab
 shows the simulated fills (LTP plus modelled slippage). The 164-variant shadow book is not sent here:
 it stays in SQLite.
