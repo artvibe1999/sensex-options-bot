@@ -214,6 +214,29 @@ class InfraTests(unittest.TestCase):
         off.append("Orders", [], [[1]])                      # must not raise or start a thread
         self.assertFalse(off.enabled)
 
+    def test_health_collect_and_sheet_row(self):
+        import health_report as hr
+        from config import Config, Credentials, Paths
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(credentials=Credentials("k", None, None, None),
+                         paths=Paths(data_dir=d, token_file=os.path.join(d, "t.json")))
+            now = dt.datetime(2026, 10, 22, 11, 0, tzinfo=IST)
+            res = hr.collect(cfg, now)                              # no DB yet: must not raise
+            self.assertTrue(res["flags"])
+            rec = recorder.Recorder(cfg.paths.db)
+            rs = RegimeState(Regime.LOW_VOL, 12.0, 0.5, 9.0, False, 0)
+            chain = bt.model_chain(80000.0, 0.11, now.date() + dt.timedelta(days=2), now, BP, SP.risk_free_rate)
+            rec.record_snapshot(Snapshot(now - dt.timedelta(seconds=5), 80000.0, 12.0, rs, chain, 0, True))
+            rec.close()
+            res = hr.collect(cfg, now)
+            i = res["info"]
+            self.assertEqual(i["market_rows"], 1)
+            self.assertGreater(i["chain_rows"], 50)
+            self.assertAlmostEqual(i["age_s"], 5, delta=1)
+            row = hr.sheet_row(now, "paper", res)
+            self.assertEqual(len(row), len(hr.HEALTH_HEADER))
+            self.assertIn("Not logged in", row[-1])                 # no token file in the temp dir
+
     def test_recorder_and_shadow_book(self):
         with tempfile.TemporaryDirectory() as d:
             db = os.path.join(d, "t.db")

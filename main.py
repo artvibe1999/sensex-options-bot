@@ -30,6 +30,7 @@ from config import IST, Config, load_config
 from costs import trade_cost
 from market_data import MarketData, Snapshot
 from recorder import Recorder
+from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
 from risk_manager import ManagedPosition, OpenLeg, RiskManager
 from sheets_sink import ORDERS_HEADER, STATUS_HEADER, TRADES_HEADER, SheetsSink
 from shadow import ShadowBook
@@ -200,6 +201,7 @@ class Bot:
         self._halt_alerted = False
         self._exit_failures = 0
         self._last_state_save = 0.0
+        self._last_heartbeat = 0.0
         self._load_state()
 
     # ------------------------------------------------------------ persistence
@@ -276,6 +278,7 @@ class Bot:
                 self._end_day(now)
             self.stop.wait(60)
             return
+        self._heartbeat(now)
         if not self.session_ready and not self._ensure_session(now):
             return
         if not self.client.market_is_live():
@@ -291,6 +294,16 @@ class Bot:
         if self.risk.halted and not self._halt_alerted:
             self._halt_alerted = True
             self.alerts.send(f"Trading halted: {self.risk.halt_reason}", level="CRITICAL")
+
+    def _heartbeat(self, now: dt.datetime, every_s: float = 900.0) -> None:
+        """Append a health summary row to the Google Sheet ('Health' tab) every 15 minutes. Never raises."""
+        if not self.sheets.enabled or time.monotonic() - self._last_heartbeat < every_s:
+            return
+        self._last_heartbeat = time.monotonic()
+        try:
+            self.sheets.append("Health", HEALTH_HEADER, [health_row(now, self.mode, health_collect(self.cfg, now))])
+        except Exception:  # noqa: BLE001 - monitoring must never disturb trading
+            log.exception("Heartbeat failed")
 
     def _new_day(self, now: dt.datetime) -> None:
         log.info("New trading day %s", now.date())
