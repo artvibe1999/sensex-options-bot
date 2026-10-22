@@ -313,6 +313,63 @@ class InfraTests(unittest.TestCase):
             self.assertEqual(bot.approved, {"v1": 2.0})
             self.assertEqual(bot._approved_stamp[-1], now.date())
 
+    def test_chain_is_built_from_stream_without_rest_and_rest_is_rate_limited(self):
+        import time as _t
+        from strategy_engine import StrategyEngine
+        from zerodha_client import OptionContract
+        expiry = TODAY + dt.timedelta(days=3)
+        cons = [OptionContract(1000 + i * 2 + j, f"S{i}{k}", "BFO", 73000.0 + i * 100, expiry, k, 20, 0.05)
+                for i in range(0, 61) for j, k in enumerate(("CE", "PE"))]
+
+        class FakeClient:
+            def __init__(self):
+                self.flow, self.rest_calls, self.full = {}, 0, set()
+            def contracts_for(self, e): return cons
+            def subscribe_full(self, m): self.full |= set(m)
+            def flow_snapshot(self, max_age_s=15.0):
+                now = _t.monotonic()
+                return {k: v for k, v in self.flow.items() if now - v["mono"] <= max_age_s}
+            def quote(self, keys):
+                self.rest_calls += 1
+                return {k: {"last_price": 50.0, "oi": 10, "volume": 5, "depth": {}} for k in keys}
+
+        cl = FakeClient()
+        eng = StrategyEngine(cl, SP)
+        spot = 76000.0
+        now = dt.datetime(2026, 10, 21, 10, 0, tzinfo=IST)
+        c1 = eng.build_chain(expiry, spot, now)              # nothing ticked yet: REST warm-up
+        self.assertIsNotNone(c1)
+        self.assertEqual((eng.last_source, cl.rest_calls), ("rest", 1))
+        self.assertTrue(cl.full)                             # whole window now subscribed in FULL mode
+        self.assertIsNone(eng.build_chain(expiry, spot, now))  # still no ticks: 2nd REST call < 2 s later is refused
+        self.assertEqual(cl.rest_calls, 1)
+        for c in cons:                                       # ticks arrive
+            intrinsic = max(0.0, (spot - c.strike) if c.kind == "CE" else (c.strike - spot))
+            cl.flow[c.token] = {"mono": _t.monotonic(), "ltp": intrinsic + 40.0, "oi": 1000, "volume": 7,
+                                "bid": intrinsic + 39.0, "ask": intrinsic + 41.0}
+        t0 = _t.perf_counter()
+        for _ in range(20):
+            ch = eng.build_chain(expiry, spot, now)
+        per_call = (_t.perf_counter() - t0) / 20
+        self.assertEqual((eng.last_source, cl.rest_calls), ("stream", 1))   # no further REST calls
+        q = ch.get(ch.atm, "CE")
+        self.assertEqual((q.ltp - q.contract.strike * 0 > 0, q.bid, q.ask), (True, q.ltp - 1.0, q.ltp + 1.0))
+        self.assertLess(per_call, 0.25, "chain build must fit comfortably inside a 1 s cycle")
+        for k in list(cl.flow):                              # feed dies: stale ATM ticks -> no stream chain
+            cl.flow[k]["mono"] -= 4000.0
+        eng._last_rest = -1e9
+        eng.build_chain(expiry, spot, now)
+        self.assertEqual(eng.last_source, "rest")
+
+    def test_recorder_full_chain_throttle_and_flow_prune(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = recorder.Recorder(os.path.join(d, "t.db"))
+            rec.flow([("2026-09-01T10:00:00", "S", 1.0, "CE", 1, 1, 1, 1, 1),
+                      ("2026-10-20T10:00:00", "S", 1.0, "CE", 1, 1, 1, 1, 1)])
+            self.assertEqual(rec.prune_flow(30, "2026-10-21"), 1)
+            self.assertEqual(rec.prune_flow(0, "2026-10-21"), 0)
+            rec.close()
+
     def test_recorder_stores_features_and_flow(self):
         from chain_features import compute
         with tempfile.TemporaryDirectory() as d:

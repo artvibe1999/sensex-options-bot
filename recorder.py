@@ -1,7 +1,8 @@
 """SQLite recorder: market state, full option chain, decisions, trades.
 
-Every refresh of the option chain (default every 10 s, see CHAIN_INTERVAL_S)
-is stored with IV and Greeks, so you accumulate your own historical option
+The option chain is rebuilt every second (stream-built); the full chain is stored every
+10 s (CHAIN_RECORD_EVERY_S) and ATM+/-5 strikes every second in table `flow`
+(CHAIN_INTERVAL_S, FLOW_RECORD_EVERY_S). Chain rows carry IV and Greeks, so you accumulate your own historical option
 data, which Kite does not provide for expired contracts. Roughly 160 rows per
 snapshot: about 0.5-0.7M rows per trading day at 10 s. Archive/export old
 days periodically (see the export command below).
@@ -85,13 +86,13 @@ class Recorder:
                     pass
 
     # ------------------------------------------------------------------ writes
-    def record_snapshot(self, snap: Any) -> None:
+    def record_snapshot(self, snap: Any, with_chain: bool = True) -> None:
         ts = snap.ts.isoformat(timespec="seconds")
         rs = snap.rs
         self._write("INSERT INTO market VALUES (?,?,?,?,?,?,?,?,?)", [(
             ts, snap.spot, snap.vix, rs.regime.value, rs.score,
             _num(rs.atr_pct), _num(rs.realized_vol), int(rs.spike), snap.trend_dir)])
-        if snap.chain is not None:
+        if snap.chain is not None and with_chain:
             rows = []
             exp = snap.chain.expiry.isoformat()
             for (strike, kind), q in snap.chain.quotes.items():
@@ -124,6 +125,21 @@ class Recorder:
                      regime: str, gross: float, cost: float, net: float, max_loss: float) -> None:
         self._write("INSERT INTO shadow_trades VALUES (?,?,?,?,?,?,?,?,?)", [(
             variant, entry_ts, exit_ts, reason, regime, gross, cost, net, max_loss)])
+
+    def prune_flow(self, keep_days: int, today: str) -> int:
+        """Delete flow rows older than keep_days (the 1 s capture is the bulky table). 0 = keep everything."""
+        if keep_days <= 0:
+            return 0
+        import datetime as _dt
+        cutoff = (_dt.date.fromisoformat(today) - _dt.timedelta(days=keep_days)).isoformat()
+        with self._lock:
+            try:
+                n = self._db.execute("DELETE FROM flow WHERE ts < ?", (cutoff,)).rowcount
+                self._db.commit()
+                return n
+            except sqlite3.Error:
+                log.exception("Flow prune failed")
+                return 0
 
     def close(self) -> None:
         with self._lock:

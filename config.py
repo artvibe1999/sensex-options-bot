@@ -104,6 +104,9 @@ class StrategyParams:
     min_dte: int = 1
     max_dte: int = 7
     chain_window_strikes: int = 40            # strikes each side of ATM to quote
+    stream_min_coverage: float = 0.8          # share of the window that must have ticked to use the stream
+    stream_near_age_s: float = 60.0           # strikes around ATM must have ticked this recently
+    rest_min_gap_s: float = 2.0               # min gap between REST quote calls (Kite: ~1 req/s)
     ema_fast: int = 9
     ema_slow: int = 21
     trend_buffer_pct: float = 0.0005
@@ -163,8 +166,13 @@ class Config:
     paper_capital: float = 500_000.0
     sheets_url: str | None = None             # Google Apps Script web-app URL (optional live feed)
     sheets_secret: str | None = None
-    loop_interval_s: float = 3.0
-    chain_interval_s: float = 10.0            # option-chain refresh + recording cadence
+    loop_interval_s: float = 1.0              # decision cadence (seconds)
+    chain_interval_s: float = 1.0             # option-chain rebuild cadence (stream-built)
+    chain_record_every_s: float = 10.0        # full chain rows stored this often (every second would be ~3.6M rows/day)
+    flow_record_every_s: float = 1.0          # ATM+/-flow_strikes rows (ltp, oi, volume, bid, ask) stored this often
+    flow_strikes: int = 5
+    stream_chain: bool = True                 # False: REST polling only (then use CHAIN_INTERVAL_S >= 2)
+    flow_retention_days: int = 30             # flow rows older than this are deleted at start of day (0 = keep)
     allow_foreign_positions: bool = False     # False: halt if unknown BFO positions exist
     log_dir: str = "logs"
 
@@ -196,6 +204,12 @@ def load_config() -> Config:
         paper_capital=_env_float("PAPER_CAPITAL", 500_000.0),
         sheets_url=_env("SHEETS_WEBHOOK_URL"),
         sheets_secret=_env("SHEETS_SECRET"),
-        chain_interval_s=_env_float("CHAIN_INTERVAL_S", 10.0),
+        loop_interval_s=_env_float("LOOP_INTERVAL_S", 1.0),
+        chain_interval_s=_env_float("CHAIN_INTERVAL_S", 1.0),
+        chain_record_every_s=_env_float("CHAIN_RECORD_EVERY_S", 10.0),
+        flow_record_every_s=_env_float("FLOW_RECORD_EVERY_S", 1.0),
+        flow_strikes=int(_env_float("FLOW_STRIKES", 5)),
+        stream_chain=(_env("STREAM_CHAIN", "1") or "1") != "0",
+        flow_retention_days=int(_env_float("FLOW_RETENTION_DAYS", 30)),
         log_dir=_env("LOG_DIR", "logs") or "logs",
     )

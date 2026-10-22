@@ -203,6 +203,8 @@ class Bot:
         self._last_state_save = 0.0
         self._last_heartbeat = 0.0
         self._last_flow = 0.0
+        self._last_chain_rec = 0.0
+        self.engine.use_stream = cfg.stream_chain
         self.stream_full = os.getenv("STREAM_FULL", "1") != "0"   # tick-level OI/volume/depth near ATM
         self._approved_stamp: Optional[tuple] = None
         self._load_state()
@@ -245,6 +247,7 @@ class Bot:
     # -------------------------------------------------------------- lifecycle
     def run(self) -> None:
         self.alerts.send(f"Bot started in {self.mode} mode", key="start")
+        next_at = time.monotonic()
         while not self.stop.is_set():
             now = dt.datetime.now(IST)
             try:
@@ -259,7 +262,11 @@ class Bot:
             except Exception:  # noqa: BLE001
                 log.exception("Loop error (continuing)")
                 self.alerts.send("Unhandled error in main loop; see logs", level="ERROR", key="loop-error")
-            self.stop.wait(self.cfg.loop_interval_s)
+            next_at += self.cfg.loop_interval_s                    # fixed-rate: no drift from processing time
+            lag = next_at - time.monotonic()
+            if lag < -5 * self.cfg.loop_interval_s:                 # fell far behind: resync, don't burst
+                next_at = time.monotonic()
+            self.stop.wait(max(0.0, lag))
         if self.position:
             log.warning("Shutting down with open position; flattening")
             try:
@@ -289,9 +296,12 @@ class Bot:
             return                                    # pre-open, holiday or stalled feed
         snap = self.md.snapshot(now)
         if snap.fresh:
-            self.rec.record_snapshot(snap)
+            full = time.monotonic() - self._last_chain_rec >= self.cfg.chain_record_every_s
+            if full:
+                self._last_chain_rec = time.monotonic()
+            self.rec.record_snapshot(snap, with_chain=full)
             self.shadow.step(snap, now)
-        self._record_flow(now, snap)
+            self._record_flow(now, snap)
         if self.position:
             self._manage(now)
         elif not self.risk.halted:
@@ -300,20 +310,19 @@ class Bot:
             self._halt_alerted = True
             self.alerts.send(f"Trading halted: {self.risk.halt_reason}", level="CRITICAL")
 
-    def _record_flow(self, now: dt.datetime, snap: Snapshot, every_s: float = 5.0) -> None:
-        """Stream ATM+/-10 strikes in FULL mode and store their OI / volume / bid / ask every 5 s.
+    def _record_flow(self, now: dt.datetime, snap: Snapshot) -> None:
+        """Store ltp / OI / volume / bid / ask for ATM +/- flow_strikes on every fresh chain (1 s by default).
         Purely additive data capture: any failure is logged and ignored."""
-        if not self.stream_full or snap.chain is None or time.monotonic() - self._last_flow < every_s:
+        cfg = self.cfg
+        if not self.stream_full or snap.chain is None \
+                or time.monotonic() - self._last_flow < cfg.flow_record_every_s - 0.05:
             return
         self._last_flow = time.monotonic()
         try:
             ch = snap.chain
-            near = [q.contract for (k, _), q in ch.quotes.items() if abs(k - ch.atm) <= 10 * ch.step]
-            self.client.subscribe_full({c.token: c.key for c in near})
-            flow = self.client.flow_snapshot()
             ts = now.isoformat(timespec="seconds")
-            rows = [(ts, c.symbol, c.strike, c.kind, f["ltp"], f["oi"], f["volume"], f["bid"], f["ask"])
-                    for c in near if (f := flow.get(c.token))]
+            rows = [(ts, q.contract.symbol, k, kind, q.ltp, q.oi, q.volume, q.bid, q.ask)
+                    for (k, kind), q in ch.quotes.items() if abs(k - ch.atm) <= cfg.flow_strikes * ch.step]
             self.rec.flow(rows)
         except Exception:  # noqa: BLE001
             log.exception("Flow capture failed (continuing without it)")
@@ -361,6 +370,12 @@ class Bot:
         self.risk.reset_day()
         self.shadow.reset_day()
         self.md.reset_day()
+        try:
+            n = self.rec.prune_flow(self.cfg.flow_retention_days, now.date().isoformat())
+            if n:
+                log.info("Pruned %d old flow rows", n)
+        except Exception:  # noqa: BLE001
+            log.exception("Prune failed")
         self.session_ready = self.eod_done = False
         self._auth_alerted = self._halt_alerted = False
         self._exit_failures = 0

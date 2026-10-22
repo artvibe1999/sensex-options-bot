@@ -230,10 +230,35 @@ def trend_direction(closes: Sequence[float], p: StrategyParams) -> Optional[int]
 class StrategyEngine:
     def __init__(self, client: ZerodhaClient, params: StrategyParams) -> None:
         self.client, self.p = client, params
+        self.use_stream = True          # build the chain from WebSocket ticks (1 s cadence); REST is the fallback
+        self.last_source = ""
+        self._last_rest = -1e9
+        self._step: Optional[float] = None
 
     def pick_expiry(self, today: dt.date) -> Optional[dt.date]:
         ok = [e for e in self.client.expiries() if self.p.min_dte <= (e - today).days <= self.p.max_dte]
         return min(ok) if ok else None
+
+    def _stream_raw(self, sel: list) -> Optional[dict]:
+        """Quote-shaped dict built from WebSocket FULL ticks (no REST call, so no rate limit).
+        None unless nearly the whole window has ticked and the strikes around ATM are current."""
+        self.client.subscribe_full({c.token: c.key for c in sel})        # idempotent
+        flow = self.client.flow_snapshot(max_age_s=3600.0)
+        fresh = self.client.flow_snapshot(max_age_s=self.p.stream_near_age_s)
+        raw: dict = {}
+        for c in sel:
+            f = flow.get(c.token)
+            if f and f.get("ltp"):
+                raw[c.key] = {"last_price": f["ltp"], "oi": f.get("oi") or 0, "volume": f.get("volume") or 0,
+                              "depth": {"buy": [{"price": f["bid"]}] if f.get("bid") else [],
+                                        "sell": [{"price": f["ask"]}] if f.get("ask") else []}}
+        if len(raw) < self.p.stream_min_coverage * len(sel):
+            return None
+        mid = sorted(c.strike for c in sel)[len(sel) // 2]
+        near = [c for c in sel if abs(c.strike - mid) <= 3 * (self._step or 100.0)]
+        if near and sum(1 for c in near if c.token in fresh) < 0.5 * len(near):
+            return None                                                    # feed stalled around ATM
+        return raw
 
     def build_chain(self, expiry: dt.date, spot: float, now: dt.datetime) -> Optional[Chain]:
         contracts = self.client.contracts_for(expiry)
@@ -241,12 +266,20 @@ class StrategyEngine:
         if len(strikes) < 3:
             return None
         step = min(b - a for a, b in zip(strikes, strikes[1:]))  # derived, not assumed
+        self._step = step
         atm = min(strikes, key=lambda k: abs(k - spot))
         idx = strikes.index(atm)
         w = self.p.chain_window_strikes
         window = set(strikes[max(0, idx - w): idx + w + 1])
         sel = [c for c in contracts if c.strike in window]
-        raw = self.client.quote([c.key for c in sel])
+        raw = self._stream_raw(sel) if self.use_stream else None
+        self.last_source = "stream"
+        if raw is None:                                   # warm-up, stalled feed or stream disabled
+            if time.monotonic() - self._last_rest < self.p.rest_min_gap_s:
+                return None                               # Kite allows ~1 quote request/s: never exceed it
+            self._last_rest = time.monotonic()
+            raw = self.client.quote([c.key for c in sel])
+            self.last_source = "rest"
 
         expiry_dt = dt.datetime.combine(expiry, dt.time(15, 30), tzinfo=IST)
         T = max((expiry_dt - now).total_seconds(), 60.0) / (365 * 24 * 3600)

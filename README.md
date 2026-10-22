@@ -8,7 +8,7 @@ Autonomous, defined-risk SENSEX options bot. **Paper mode by default.** Live tra
   *candidates*, not "proven". Nothing trades live until it passes: walk-forward backtest -> forward shadow
   book -> `promote.py` -> `data/approved_live.json` (valid 30 days; missing/expired = no trades).
 - The backtest prices options with Black-Scholes (Kite has no expired-option history). It is an approximation.
-  Real evidence = the data the bot records every 10 s (`data/sxbot.db`, table `chain`).
+  Real evidence = the data the bot records (`data/sxbot.db`): full chain every 10 s, ATM+/-5 strikes every second.
 - On synthetic data every template is slightly negative after costs. That is expected: costs are real and
   the model gives no free edge. Do not expect the pipeline to approve much until real data says so.
 - NOT verified (flagged VERIFY in `config.py`): SENSEX weekly expiry weekday (Thursday assumed), strike step
@@ -40,11 +40,20 @@ LIVE_TRADING_CONFIRM=YES python main.py --live
 ```
 Export recorded data: `python recorder.py export --table chain --since 2026-10-01 --out chain.csv`
 
+## 1-second data cadence
+The bot decides, shadow-tests and records every second (`LOOP_INTERVAL_S=1`, `CHAIN_INTERVAL_S=1`). Kite's REST
+quote endpoint allows only ~1 request/s, so the chain is built from WebSocket FULL-mode ticks (all ~160 contracts
+in the +/-40 strike window; LTP, OI, volume, bid, ask) and Black-Scholes IV/greeks are recomputed each second.
+REST is used only for warm-up or if the feed stalls, and never more than once per 2 s. Stored per second: `market`,
+`features`, and ATM+/-5 strikes in `flow`; the full 160-strike `chain` table stays at 10 s (`CHAIN_RECORD_EVERY_S`)
+because every second would be ~3.6M rows/day. `flow` older than 30 days is deleted (`FLOW_RETENTION_DAYS`, 0 = keep).
+Note: Kite sends a tick only when a contract trades or its book changes, so illiquid strikes carry their last value.
+
 ## OI / gamma features (research layer)
-Every fresh chain (10 s) the bot also computes and stores (table `features`): PCR, call/put OI walls, max pain,
-net gamma exposure (a disputed proxy), 25-delta skew, 5-minute OI change, ATM spread and volume. ATM+/-10 strikes
-are streamed in WebSocket FULL mode and sampled every 5 s into table `flow` (OI, volume, bid, ask); set
-`STREAM_FULL=0` to switch that off. 104 extra variants (ids ending `|oi=<rule>`) add one of these as a filter to
+Every fresh chain (1 s) the bot also computes and stores (table `features`): PCR, call/put OI walls, max pain,
+net gamma exposure (a disputed proxy), 25-delta skew, 5-minute OI change, ATM spread and volume. ATM+/-5 strikes
+are stored every second in table `flow` (OI, volume, bid, ask); set `STREAM_FULL=0` to switch that off
+(`STREAM_CHAIN=0` goes back to REST polling; then set `CHAIN_INTERVAL_S=3` or more). 104 extra variants (ids ending `|oi=<rule>`) add one of these as a filter to
 a plain strategy: `walls` (OI walls sit between spot and the short strikes), `pcr_calm`, `gex_pos`, `gex_neg`,
 `flow`. They cannot be backtested (no historical OI), so they are shadow-tested live and `promote.py` only
 promotes one if it beats its plain twin (avg net per trade and profit factor) over 40+ forward trades.

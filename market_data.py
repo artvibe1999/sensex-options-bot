@@ -124,7 +124,7 @@ class MarketData:
         if expiry is None:
             self._chain = None
         elif (self._chain is None or self._chain.expiry != expiry
-              or time.monotonic() - self._chain_at >= self.chain_interval_s):
+              or time.monotonic() - self._chain_at >= self.chain_interval_s - 0.05):
             chain = self.engine.build_chain(expiry, spot, now)
             if chain is not None:
                 self._chain, self._chain_at, fresh = chain, time.monotonic(), True
