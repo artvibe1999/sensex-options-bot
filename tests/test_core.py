@@ -370,6 +370,22 @@ class InfraTests(unittest.TestCase):
             self.assertEqual(rec.prune_flow(0, "2026-10-21"), 0)
             rec.close()
 
+    def test_autostop_guard_blocks_on_open_position_and_fails_closed(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deploy"))
+        import json as _json
+        import can_stop
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "state.json")
+            self.assertEqual(can_stop.check(p)[0], 0)                       # never traded: safe
+            open(p, "w").write(_json.dumps({"mode": "PAPER", "position": None}))
+            self.assertEqual(can_stop.check(p)[0], 0)
+            open(p, "w").write(_json.dumps({"mode": "LIVE", "position": {"plan": {"name": "IRON_CONDOR"}}}))
+            code, msg = can_stop.check(p)
+            self.assertEqual(code, 1)
+            self.assertIn("IRON_CONDOR", msg)
+            open(p, "w").write("{not json")
+            self.assertEqual(can_stop.check(p)[0], 2)                       # unreadable: do NOT stop
+
     def test_recorder_stores_features_and_flow(self):
         from chain_features import compute
         with tempfile.TemporaryDirectory() as d:
