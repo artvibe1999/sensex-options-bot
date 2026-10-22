@@ -397,6 +397,7 @@ class Bot:
         if self.position:
             self.client.subscribe_tokens({l.contract.token: l.contract.key for l in self.position.legs})
         self.capital = self.client.available_cash() if self.live else self.cfg.paper_capital
+        self.risk.apply_capital(self.capital, self.cfg.capital_profile)
         log.info("Session ready: mode=%s capital=%.0f", self.mode, self.capital)
         if self.live:
             self._reconcile()

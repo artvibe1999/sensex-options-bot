@@ -87,6 +87,32 @@ class RiskParams:
     trail_giveback_pct: float = 0.40          # exit after giving back 40% of peak
     portfolio_trail_activation_pct: float = 0.015
     portfolio_trail_giveback_pct: float = 0.50
+    # Small accounts: one SENSEX lot can risk more than max_risk_per_trade_pct of capital. If
+    # one_lot_risk_pct > 0 a plan whose worst-case loss for ONE lot is <= this share of capital
+    # may still trade 1 lot. 0 = off (standard accounts never exceed max_risk_per_trade_pct).
+    one_lot_risk_pct: float = 0.0
+
+
+# Capital profiles. A SENSEX lot cannot be split, so on a small account even the narrowest defined-risk
+# spread can risk more than the standard 2%-per-trade budget. Below SMALL_ACCOUNT_BELOW the bot may trade ONE lot
+# whose worst-case loss is at most min(15% of capital, Rs 7,500). The daily loss limit is widened to match, so a
+# normal stop-loss (60% of max loss) is not pre-empted. Standard accounts are unchanged.
+SMALL_ACCOUNT_BELOW = 375_000.0
+ONE_LOT_MAX_PCT = 0.15
+ONE_LOT_MAX_RUPEES = 7_500.0
+
+
+def risk_for_capital(base: RiskParams, capital: float, profile: str = "auto") -> RiskParams:
+    """Return the risk parameters to use for this account size. profile: auto | standard | small."""
+    import dataclasses
+    small = profile == "small" or (profile == "auto" and capital < SMALL_ACCOUNT_BELOW)
+    if not small or capital <= 0:
+        return base
+    one_lot = max(base.one_lot_risk_pct, min(ONE_LOT_MAX_PCT, ONE_LOT_MAX_RUPEES / capital))
+    return dataclasses.replace(
+        base, one_lot_risk_pct=one_lot,
+        max_daily_loss_pct=max(base.max_daily_loss_pct, 0.8 * one_lot),
+        margin_utilisation=max(base.margin_utilisation, 0.80))
 
 
 @dataclass(frozen=True)
@@ -173,6 +199,7 @@ class Config:
     flow_strikes: int = 5
     stream_chain: bool = True                 # False: REST polling only (then use CHAIN_INTERVAL_S >= 2)
     flow_retention_days: int = 30             # flow rows older than this are deleted at start of day (0 = keep)
+    capital_profile: str = "auto"            # auto | standard | small (see risk_for_capital)
     allow_foreign_positions: bool = False     # False: halt if unknown BFO positions exist
     log_dir: str = "logs"
 
@@ -211,5 +238,6 @@ def load_config() -> Config:
         flow_strikes=int(_env_float("FLOW_STRIKES", 5)),
         stream_chain=(_env("STREAM_CHAIN", "1") or "1") != "0",
         flow_retention_days=int(_env_float("FLOW_RETENTION_DAYS", 30)),
+        capital_profile=(_env("CAPITAL_PROFILE", "auto") or "auto").lower(),
         log_dir=_env("LOG_DIR", "logs") or "logs",
     )

@@ -213,11 +213,11 @@ def build_library() -> list[StrategySpec]:
                 for trend in ("none", "flat"):
                     add("iron_fly", {"wing": wing}, regimes, band, trend)
         for delta in (0.15, 0.25, 0.30):
-            for width in (500, 1000):
+            for width in (200, 500, 1000):                 # 200 = fits small accounts (about Rs 3.3k max loss/lot)
                 for trend in ("none", "with"):
                     add("bull_put_spread", {"delta": delta, "width": width}, (LOW, NORM), band, trend)
                     add("bear_call_spread", {"delta": delta, "width": width}, (LOW, NORM), band, trend)
-        for width in (500, 1000):
+        for width in (200, 300, 500, 1000):                # 200/300 = about Rs 2k / 2.9k max loss per lot
             for regimes in ((HIGH,), (NORM, HIGH)):
                 for sl, tp in ((0.6, 0.6), (0.5, 1.0)):
                     add("bull_call_debit", {"width": width}, regimes, band, "with", sl, tp)

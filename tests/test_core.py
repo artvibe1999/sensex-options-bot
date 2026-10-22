@@ -386,6 +386,21 @@ class InfraTests(unittest.TestCase):
             open(p, "w").write("{not json")
             self.assertEqual(can_stop.check(p)[0], 2)                       # unreadable: do NOT stop
 
+    def test_capital_profiles_small_accounts_trade_one_affordable_lot_only(self):
+        from config import risk_for_capital
+        from risk_manager import RiskManager as RM
+        lot = lambda loss: types.SimpleNamespace(max_loss_per_lot=loss)
+        for cap, fits, too_big in ((15_000, 2_000, 3_300), (50_000, 7_000, 8_500), (150_000, 7_400, 17_700)):
+            rm = RM(risk_for_capital(RiskParams(), cap), Schedule())
+            self.assertEqual(rm.size(lot(fits), cap), 1, f"capital {cap}")
+            self.assertEqual(rm.size(lot(too_big), cap), 0, f"capital {cap}")
+            self.assertGreaterEqual(rm.p.max_daily_loss_pct, 0.03)
+        big = risk_for_capital(RiskParams(), 500_000)
+        self.assertEqual((big.one_lot_risk_pct, big.max_daily_loss_pct), (0.0, 0.03))      # unchanged
+        self.assertEqual(RM(big, Schedule()).size(lot(5_000), 500_000), 2)                # 2% = 10k budget -> 2 lots
+        self.assertEqual(RM(big, Schedule()).size(lot(12_000), 500_000), 0)               # never above 2%
+        self.assertEqual(risk_for_capital(RiskParams(), 15_000, "standard"), RiskParams())  # explicit override
+
     def test_recorder_stores_features_and_flow(self):
         from chain_features import compute
         with tempfile.TemporaryDirectory() as d:

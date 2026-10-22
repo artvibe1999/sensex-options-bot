@@ -59,6 +59,16 @@ a plain strategy: `walls` (OI walls sit between spot and the short strikes), `pc
 promotes one if it beats its plain twin (avg net per trade and profit factor) over 40+ forward trades.
 Nothing here is a proven edge; the filters are hypotheses the shadow book will confirm or reject.
 
+## Small vs large accounts
+A SENSEX lot cannot be split. At 73,000 spot one lot of a defined-risk spread loses Rs 1,800-17,000 in the worst
+case, more than 2% of a small account, so the standard limits would place NO trades below about Rs 3.75 lakh.
+`CAPITAL_PROFILE=auto` therefore lets accounts below Rs 3.75 lakh trade ONE lot whose worst-case loss is at most
+min(15% of capital, Rs 7,500), with the daily loss limit widened to match (accounts above keep 2% / 3%).
+`python capital_check.py` shows which variants fit which capital. Rs 15,000 can only use the narrow debit spreads
+(about 20 variants); Rs 50,000 about 90. Fixed brokerage makes a small lot proportionally dearer (about Rs 145
+round trip on a Rs 2,000-risk spread = 7%). Nothing here promises profit: test each size in paper mode first
+(`PAPER_CAPITAL=15000`), and re-run `backtest.py` so the new 200/300-point spreads get approved or rejected.
+
 ## Is it working?
 `docker compose exec bot python health_report.py` prints login status, approvals, latest spot/VIX/regime,
 recorded rows, shadow-trade results and a list of problems. With no approved variants the bot records data and

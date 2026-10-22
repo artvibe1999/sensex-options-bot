@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from config import RiskParams, Schedule
+from config import RiskParams, Schedule, risk_for_capital
 from strategy_engine import TradePlan
 from zerodha_client import OptionContract
 
@@ -42,10 +42,17 @@ class ManagedPosition:
 
 class RiskManager:
     def __init__(self, params: RiskParams, schedule: Schedule) -> None:
-        self.p, self.sched = params, schedule
+        self.p, self._base, self.sched = params, params, schedule
         self.halted = False
         self.halt_reason = ""
         self._day_peak = 0.0
+
+    def apply_capital(self, capital: float, profile: str = "auto") -> None:
+        """Pick the standard or small-account risk limits for this account size (call once capital is known)."""
+        self.p = risk_for_capital(self._base, capital, profile)
+        log.info("Risk profile for capital %.0f: per-trade %.1f%%, one-lot cap %.0f%%, daily loss %.0f%%",
+                 capital, self.p.max_risk_per_trade_pct * 100, self.p.one_lot_risk_pct * 100,
+                 self.p.max_daily_loss_pct * 100)
 
     # -------------------------------------------------------------- sizing
     def size(self, plan: TradePlan, capital: float,
@@ -58,8 +65,10 @@ class RiskManager:
             return 0
         budget = capital * self.p.max_risk_per_trade_pct
         lots = min(self.p.max_lots, math.floor(budget / plan.max_loss_per_lot))
+        if lots < 1 and plan.max_loss_per_lot <= capital * self.p.one_lot_risk_pct:
+            lots = 1                                   # small account: one lot, capped by one_lot_risk_pct
         if lots < 1:
-            log.info("Risk budget %.0f < max loss per lot %.0f", budget, plan.max_loss_per_lot)
+            log.debug("Risk budget %.0f < max loss per lot %.0f", budget, plan.max_loss_per_lot)
             return 0
         if margin_fn is not None:
             while lots >= 1:
