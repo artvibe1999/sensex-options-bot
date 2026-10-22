@@ -40,5 +40,10 @@ LIVE_TRADING_CONFIRM=YES python main.py --live
 ```
 Export recorded data: `python recorder.py export --table chain --since 2026-10-01 --out chain.csv`
 
+## Is it working?
+`docker compose exec bot python health_report.py` prints login status, approvals, latest spot/VIX/regime,
+recorded rows, shadow-trade results and a list of problems. With no approved variants the bot records data and
+shadow-trades but places NO paper orders; run the backtest first (step 1 above), then restart the bot.
+
 ## Daily token
 See `deploy/DEPLOY.md`.
