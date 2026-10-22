@@ -26,6 +26,6 @@ function doPost(e) {
     if (d.id) cache.put(d.id, '1', 21600);
     return ContentService.createTextOutput('ok');
   } finally {
-    lock.release();
+    lock.releaseLock();
   }
 }
