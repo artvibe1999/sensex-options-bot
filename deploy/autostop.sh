@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Powers the VM off after the market closes, but ONLY if the bot has no open position.
 # Run every 5 minutes by a systemd timer (see install_autostop.sh). Safe to run by hand.
-#   Window: 15:40-19:00 IST (the bot squares off at 15:15 and finishes its day at 15:30).
+#   Window: 15:40-16:30 IST (the bot squares off at 15:15 and finishes its day at 15:30).
 #   Skip:   create data/NO_AUTOSTOP to keep the VM up (delete it to resume).
 set -u
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 export TZ=Asia/Kolkata
 hm=$((10#$(date +%H%M)))
-if [ "$hm" -lt 1540 ] || [ "$hm" -ge 1900 ]; then exit 0; fi
+if [ "$hm" -lt 1540 ] || [ "$hm" -ge 1630 ]; then exit 0; fi
 if [ -e "$DIR/data/NO_AUTOSTOP" ]; then echo "NO_AUTOSTOP present: staying up"; exit 0; fi
 
 msg="$(python3 "$DIR/deploy/can_stop.py" "$DIR/data/state.json")"; code=$?

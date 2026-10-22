@@ -57,7 +57,7 @@ Stop: do NOT use a scheduled stop (it would kill the bot even with a position op
 ```bash
 cd ~/sxbot && git pull && sudo bash deploy/install_autostop.sh
 ```
-Every 5 minutes between 15:40 and 19:00 IST it checks `data/state.json`. No open position: containers are stopped
+Every 5 minutes between 15:40 and 16:30 IST it checks `data/state.json`. No open position: containers are stopped
 cleanly and the VM powers off. Open position (or unreadable state file): it does NOT stop, and sends one Telegram alert.
 Keep the VM up on a given day: `touch data/NO_AUTOSTOP` (delete the file to resume). Logs: `journalctl -u sxbot-autostop -n 20`.
 It only reads the bot's own record; with live money also check the broker's positions page if you get the alert.
