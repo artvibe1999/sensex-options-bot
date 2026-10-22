@@ -9,6 +9,9 @@ function doPost(e) {
   try {
     const d = JSON.parse(e.postData.contents);
     if (d.secret !== SECRET) return ContentService.createTextOutput('forbidden');
+    // A retried batch carries the same id: acknowledge it without writing the rows twice.
+    const cache = CacheService.getScriptCache();
+    if (d.id && cache.get(d.id)) return ContentService.createTextOutput('ok');
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const sh = ss.getSheetByName(d.tab) || ss.insertSheet(d.tab);
     if (sh.getLastRow() === 0 && d.header) {
@@ -20,6 +23,7 @@ function doPost(e) {
       const rows = d.rows.map(r => r.map(v => (typeof v === 'string' && /^\d{4}-\d\d-\d\dT/.test(v)) ? v.replace('T', ' ').slice(0, 19) : v));
       sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
     }
+    if (d.id) cache.put(d.id, '1', 21600);
     return ContentService.createTextOutput('ok');
   } finally {
     lock.release();

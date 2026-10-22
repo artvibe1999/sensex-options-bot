@@ -14,6 +14,7 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from typing import Optional, Sequence
 
 import requests
@@ -49,18 +50,25 @@ class SheetsSink:
     def _worker(self) -> None:
         while True:
             tab, header, rows = self._q.get()
-            for attempt in range(5):
+            batch_id = uuid.uuid4().hex             # lets the script ignore a retried batch (no duplicate rows)
+            for attempt in range(4):
                 try:
-                    r = requests.post(self._url, json={"secret": self._secret, "tab": tab,
-                                                       "header": list(header), "rows": rows}, timeout=20)
-                    if r.ok and r.text.strip() == "ok":
+                    r = requests.post(self._url, json={"secret": self._secret, "tab": tab, "id": batch_id,
+                                                       "header": list(header), "rows": rows}, timeout=30)
+                    body = r.text.strip()
+                    if body == "ok":
                         break
-                    log.warning("Sheets rejected rows (HTTP %s): check the script URL/secret", r.status_code)
+                    if r.status_code == 200 and "forbidden" not in body and "<html" not in body.lower():
+                        # Unexpected but non-error reply: the script ran. Do NOT retry (would duplicate rows).
+                        log.warning("Sheets reply was %r instead of 'ok'; treating as delivered", body[:60])
+                        break
+                    log.warning("Sheets did not accept rows (HTTP %s, reply %r): check script URL/secret/deployment",
+                                r.status_code, body[:60])
                 except requests.RequestException as exc:
                     log.warning("Sheets post failed: %s", exc.__class__.__name__)
                 time.sleep(2 ** attempt)
             else:
-                log.error("Dropped %d rows for tab %s after 5 failures", len(rows), tab)
+                log.error("Dropped %d rows for tab %s after 4 failures", len(rows), tab)
 
 
 def _selftest() -> int:

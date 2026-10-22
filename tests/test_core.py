@@ -214,6 +214,25 @@ class InfraTests(unittest.TestCase):
         off.append("Orders", [], [[1]])                      # must not raise or start a thread
         self.assertFalse(off.enabled)
 
+    def test_sheets_sink_does_not_retry_unexpected_200_reply(self):
+        import json, threading, time as _t
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import sheets_sink
+        got = []
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                got.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.send_response(200); self.end_headers(); self.wfile.write(b"done")   # not exactly "ok"
+            def log_message(self, *a): pass
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        sink = sheets_sink.SheetsSink(f"http://127.0.0.1:{srv.server_port}/x", "sec")
+        sink.append("Health", ["a"], [["row"]])
+        _t.sleep(2.5)
+        srv.shutdown()
+        self.assertEqual(len(got), 1)                       # exactly one delivery, no retry storm
+        self.assertTrue(got[0]["id"])
+
     def test_health_collect_and_sheet_row(self):
         import health_report as hr
         from config import Config, Credentials, Paths
