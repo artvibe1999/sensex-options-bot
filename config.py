@@ -191,6 +191,7 @@ def load_config() -> Config:
             max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.03),
             max_lots=int(_env_float("MAX_LOTS", 10)),
         ),
+        backtest=BacktestParams(iv_scale=_env_float("BT_IV_SCALE", 0.95)),
         execution=ExecutionParams(product=product),
         paper_capital=_env_float("PAPER_CAPITAL", 500_000.0),
         sheets_url=_env("SHEETS_WEBHOOK_URL"),

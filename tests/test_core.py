@@ -233,6 +233,25 @@ class InfraTests(unittest.TestCase):
         self.assertEqual(len(got), 1)                       # exactly one delivery, no retry storm
         self.assertTrue(got[0]["id"])
 
+    def test_approvals_load_on_same_day_restart_and_reload_on_change(self):
+        import json as _j
+        import main as m
+        from config import Config, Credentials, Paths
+        with tempfile.TemporaryDirectory() as d:
+            cfg = Config(credentials=Credentials("k", None, None, None),
+                         paths=Paths(data_dir=d, token_file=os.path.join(d, "t.json")))
+            bot = object.__new__(m.Bot)
+            bot.cfg, bot.live, bot.approved, bot._approved_stamp = cfg, False, {}, None
+            bot.alerts = types.SimpleNamespace(send=lambda *a, **k: None)
+            now = dt.datetime(2026, 10, 22, 11, 0, tzinfo=IST)
+            bot._refresh_approvals(now)                          # file missing: fails closed
+            self.assertEqual(bot.approved, {})
+            with open(cfg.paths.approved_backtest, "w") as fh:   # backtest finishes while bot is running
+                _j.dump({"valid_until": "2026-12-31", "variants": [{"id": "v1", "score": 2.0}]}, fh)
+            bot._refresh_approvals(now)                          # no new-day step needed
+            self.assertEqual(bot.approved, {"v1": 2.0})
+            self.assertEqual(bot._approved_stamp[1], now.date())
+
     def test_health_collect_and_sheet_row(self):
         import health_report as hr
         from config import Config, Credentials, Paths

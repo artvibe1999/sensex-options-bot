@@ -202,6 +202,7 @@ class Bot:
         self._exit_failures = 0
         self._last_state_save = 0.0
         self._last_heartbeat = 0.0
+        self._approved_stamp: Optional[tuple] = None
         self._load_state()
 
     # ------------------------------------------------------------ persistence
@@ -278,6 +279,7 @@ class Bot:
                 self._end_day(now)
             self.stop.wait(60)
             return
+        self._refresh_approvals(now)
         self._heartbeat(now)
         if not self.session_ready and not self._ensure_session(now):
             return
@@ -305,6 +307,26 @@ class Bot:
         except Exception:  # noqa: BLE001 - monitoring must never disturb trading
             log.exception("Heartbeat failed")
 
+    def _refresh_approvals(self, now: dt.datetime) -> None:
+        """Load approved variants at startup (also after a same-day restart, when the new-day step is
+        skipped) and again whenever the approvals file changes or the date rolls over."""
+        path = self.cfg.paths.approved_live if self.live else self.cfg.paths.approved_backtest
+        try:
+            mtime: Optional[float] = os.stat(path).st_mtime
+        except OSError:
+            mtime = None
+        stamp = (mtime, now.date())
+        if stamp == self._approved_stamp:
+            return
+        self._approved_stamp = stamp
+        self.approved = load_approved(path, now.date())
+        if self.approved:
+            log.info("%d approved variants loaded from %s", len(self.approved), path)
+            self.alerts.send(f"{len(self.approved)} approved variants loaded", key="approved-loaded")
+        else:
+            log.warning("No valid approved variants in %s: shadow data collection only, no trades", path)
+            self.alerts.send("No approved strategies: only shadow data collection is running", key="noapprove")
+
     def _new_day(self, now: dt.datetime) -> None:
         log.info("New trading day %s", now.date())
         self.day = now.date()
@@ -315,13 +337,8 @@ class Bot:
         self.session_ready = self.eod_done = False
         self._auth_alerted = self._halt_alerted = False
         self._exit_failures = 0
-        path = self.cfg.paths.approved_live if self.live else self.cfg.paths.approved_backtest
-        self.approved = load_approved(path, now.date())
-        if self.approved:
-            log.info("%d approved variants loaded from %s", len(self.approved), path)
-        else:
-            log.warning("No valid approved variants in %s: shadow data collection only, no trades", path)
-            self.alerts.send("No approved strategies: only shadow data collection is running", key="noapprove")
+        self._approved_stamp = None            # force a reload below
+        self._refresh_approvals(now)
         self._save_state()
 
     def _ensure_session(self, now: dt.datetime) -> bool:
