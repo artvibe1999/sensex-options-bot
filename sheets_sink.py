@@ -71,6 +71,19 @@ class SheetsSink:
                 log.error("Dropped %d rows for tab %s after 4 failures", len(rows), tab)
 
 
+def _explain(r: "requests.Response") -> None:
+    """Print how Google answered (redirect hops, content type, visible text) with no secrets or keys."""
+    import re
+    from urllib.parse import urlparse
+    for h in list(r.history) + [r]:
+        u = urlparse(h.url)
+        print(f"  hop: HTTP {h.status_code} {u.netloc}{u.path[:40]} type={h.headers.get('Content-Type', '?')[:40]}")
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", r.text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    print("  page text:", text[:300] or "(none)")
+
+
 def _selftest() -> int:
     """python sheets_sink.py  -> posts one row to the Status tab and prints what Google answered."""
     import datetime as dt
@@ -89,6 +102,8 @@ def _selftest() -> int:
         return 1
     body = r.text.strip()
     print("HTTP", r.status_code, "| reply:", body[:80].replace("\n", " "))
+    if body != "ok":
+        _explain(r)
     if body == "ok":
         print("OK: check your sheet for a 'Status' tab.")
         return 0
