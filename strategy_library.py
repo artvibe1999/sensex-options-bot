@@ -245,6 +245,40 @@ def build_library() -> list[StrategySpec]:
                 for delta in (0.25, 0.35):
                     add("long_strangle", {"delta": delta, "tp_mult": tp_mult}, regimes, band,
                         "none", 0.5, 1.0, oi="gex_neg")
+    # ---- small-account family: narrow (200/300-point) defined-risk structures, worst case about Rs 1.8k-5k per lot.
+    # More parameter combinations are MORE candidates, not more edge: each one still has to pass the backtest and
+    # the forward shadow gates, and the more that are tried the more some pass by luck.
+    seen = {s.id for s in out}
+    before = len(out)
+
+    def add_new(template: str, params: dict, regimes: tuple, band: tuple[int, int],
+                trend: str, sl: float, tp: float) -> None:
+        if _make_id(template, tuple(params.items()), regimes, band, trend, sl, tp) not in seen:
+            add(template, params, regimes, band, trend, sl, tp)
+            seen.add(out[-1].id)
+
+    for band in DTE_BANDS:
+        for width in (200, 300):
+            for delta in (0.20, 0.25, 0.30):
+                for trend in ("none", "with"):
+                    for sl, tp in ((0.6, 0.6), (0.5, 0.4), (0.8, 0.5)):
+                        add_new("bull_put_spread", {"delta": delta, "width": width}, (LOW, NORM), band, trend, sl, tp)
+                        add_new("bear_call_spread", {"delta": delta, "width": width}, (LOW, NORM), band, trend, sl, tp)
+        for regimes in ((LOW,), (LOW, NORM)):
+            for wing in (200, 300):
+                for delta in (0.15, 0.20):
+                    for sl, tp in ((0.6, 0.6), (0.5, 0.4)):
+                        add_new("iron_condor", {"delta": delta, "wing": wing}, regimes, band, "none", sl, tp)
+        for width in (200, 300):
+            for regimes in ((HIGH,), (NORM, HIGH)):
+                for sl, tp in ((0.5, 0.7), (0.7, 0.5)):
+                    add_new("bull_call_debit", {"width": width}, regimes, band, "with", sl, tp)
+                    add_new("bear_put_debit", {"width": width}, regimes, band, "with", sl, tp)
+        for width in (200, 300):                           # nearer-the-money credit spreads, trend-aligned
+            add_new("bull_put_spread", {"delta": 0.35, "width": width}, (LOW, NORM), band, "with", 0.6, 0.6)
+            add_new("bear_call_spread", {"delta": 0.35, "width": width}, (LOW, NORM), band, "with", 0.6, 0.6)
+    SMALL_FAMILY_SIZE = len(out) - before
+    assert SMALL_FAMILY_SIZE == 200, f"small-account family should be 200 variants, got {SMALL_FAMILY_SIZE}"
     ids = [s.id for s in out]
     assert len(ids) == len(set(ids)), "duplicate strategy ids"
     return out

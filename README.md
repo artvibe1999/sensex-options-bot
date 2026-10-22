@@ -69,6 +69,15 @@ min(15% of capital, Rs 7,500), with the daily loss limit widened to match (accou
 round trip on a Rs 2,000-risk spread = 7%). Nothing here promises profit: test each size in paper mode first
 (`PAPER_CAPITAL=15000`), and re-run `backtest.py` so the new 200/300-point spreads get approved or rejected.
 
+### 200 extra small-account variants
+The library now has 420 plain variants (+104 OI-rule ones): 200 were added for small accounts (narrow 200/300-point
+credit spreads, condors and debit spreads, several stop/target settings; worst case about Rs 1.8k-5k per lot).
+They get no special treatment: each must pass the same walk-forward backtest, then forward shadow trading, before it
+trades. Win rate is recorded (`full.win_rate` in `data/approved_backtest.json`) but is NOT the approval criterion:
+credit spreads win often and still lose money when the rare loss is 5-10x the typical win. Approval needs profit
+factor and positive net after costs. Trying more variants also raises the chance that some pass by luck, which is why
+the forward shadow stage matters.
+
 ## Is it working?
 `docker compose exec bot python health_report.py` prints login status, approvals, latest spot/VIX/regime,
 recorded rows, shadow-trade results and a list of problems. With no approved variants the bot records data and
