@@ -19,6 +19,7 @@ Commands:
   python token_service.py url                            # print a login link (manual use)
   python token_service.py exchange --request-token XXXX  # no public endpoint? paste request_token from the redirect URL
   python token_service.py status
+  python token_service.py telegram-test                  # send a test Telegram message
 """
 from __future__ import annotations
 
@@ -168,6 +169,7 @@ def main() -> int:
     sub.add_parser("serve")
     sub.add_parser("url")
     sub.add_parser("status")
+    sub.add_parser("telegram-test")
     ex = sub.add_parser("exchange")
     ex.add_argument("--request-token", required=True)
     args = ap.parse_args()
@@ -177,6 +179,12 @@ def main() -> int:
         rec = read_token(cfg.paths.token_file)
         print("fresh" if is_fresh(rec) else "missing or expired",
               f"(issued {rec['issued_at']})" if rec else "")
+        return 0
+    if args.cmd == "telegram-test":
+        a = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id, dedupe_s=0)
+        print("Telegram configured:", a.enabled,
+              "(token set: %s, chat id set: %s)" % (bool(cfg.alerts.telegram_token), bool(cfg.alerts.telegram_chat_id)))
+        a.send("Test message from your SENSEX bot. If you can read this, Telegram alerts work.")
         return 0
     svc = TokenService(cfg)
     if args.cmd == "url":

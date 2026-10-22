@@ -31,11 +31,17 @@ class Alerter:
                 return
             self._last[key] = now
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{self._token}/sendMessage",
                 json={"chat_id": self._chat, "text": f"[{level}] {text}"[:4000],
                       "disable_web_page_preview": True},
                 timeout=5,
             )
+            if not r.ok:   # e.g. 401 bad token, 400/403 wrong chat id or bot never started
+                try:
+                    desc = r.json().get("description", "")
+                except ValueError:
+                    desc = ""
+                log.warning("Telegram rejected the message (HTTP %s): %s", r.status_code, desc)
         except requests.RequestException as exc:
-            log.warning("Telegram send failed: %s", exc)
+            log.warning("Telegram send failed: %s", exc.__class__.__name__)  # class only: URL holds the bot token
