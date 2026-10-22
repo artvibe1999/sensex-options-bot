@@ -96,7 +96,7 @@ def collect(cfg: Config, now: dt.datetime, day: Optional[str] = None) -> dict[st
 def sheet_row(now: dt.datetime, mode: str, res: dict[str, Any]) -> list:
     i, f = res["info"], res["flags"]
     return [now.isoformat(timespec="seconds"), mode, "yes" if i["token_fresh"] else "NO",
-            i["paper_approved"] if mode == "paper" else i["live_approved"],
+            i["paper_approved"] if str(mode).lower() == "paper" else i["live_approved"],
             i["spot"], i["vix"], i["regime"], i["market_rows"], i["chain_rows"],
             None if i["age_s"] is None else round(i["age_s"]), len(i["trades"]), i["shadow_closed"],
             round(i["shadow_net"]), "OK" if not f else " | ".join(f)[:300]]
