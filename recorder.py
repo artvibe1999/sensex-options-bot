@@ -37,13 +37,20 @@ CREATE TABLE IF NOT EXISTS trades(
 CREATE TABLE IF NOT EXISTS shadow_trades(
   variant TEXT, entry_ts TEXT, exit_ts TEXT, reason TEXT, regime TEXT,
   gross REAL, cost REAL, net REAL, max_loss REAL);
+CREATE TABLE IF NOT EXISTS features(
+  ts TEXT, pcr REAL, call_wall REAL, put_wall REAL, max_pain REAL, net_gex REAL, atm_iv REAL,
+  skew REAL, call_oi_chg REAL, put_oi_chg REAL, pcr_chg REAL, atm_spread_pct REAL, atm_volume REAL);
+CREATE TABLE IF NOT EXISTS flow(
+  ts TEXT, symbol TEXT, strike REAL, kind TEXT, ltp REAL, oi REAL, volume REAL, bid REAL, ask REAL);
+CREATE INDEX IF NOT EXISTS ix_features_ts ON features(ts);
+CREATE INDEX IF NOT EXISTS ix_flow_ts ON flow(ts);
 CREATE INDEX IF NOT EXISTS ix_market_ts ON market(ts);
 CREATE INDEX IF NOT EXISTS ix_chain_ts ON chain(ts);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_shadow_variant ON shadow_trades(variant);
 """
 
-TABLES = ("market", "chain", "events", "trades", "shadow_trades")
+TABLES = ("market", "chain", "features", "flow", "events", "trades", "shadow_trades")
 
 
 def _num(x: Optional[float]) -> Optional[float]:
@@ -93,6 +100,16 @@ class Recorder:
                              g.delta if g else None, g.gamma if g else None,
                              g.theta if g else None, g.vega if g else None))
             self._write("INSERT INTO chain VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        f = getattr(snap, "features", None)
+        if f is not None:
+            self._write("INSERT INTO features VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", [(
+                ts, _num(f.pcr), f.call_wall, f.put_wall, f.max_pain, _num(f.net_gex), _num(f.atm_iv),
+                _num(f.skew), _num(f.call_oi_chg), _num(f.put_oi_chg), _num(f.pcr_chg),
+                _num(f.atm_spread_pct), f.atm_volume)])
+
+    def flow(self, rows: list[tuple]) -> None:
+        """rows: (ts, symbol, strike, kind, ltp, oi, volume, bid, ask) sampled from the WebSocket stream."""
+        self._write("INSERT INTO flow VALUES (?,?,?,?,?,?,?,?,?)", rows)
 
     def event(self, ts: str, kind: str, variant: str, payload: dict) -> None:
         self._write("INSERT INTO events VALUES (?,?,?,?)",

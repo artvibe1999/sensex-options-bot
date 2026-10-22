@@ -84,6 +84,9 @@ class OptionQuote:
     oi: float
     iv: Optional[float]
     greeks: Optional[Greeks]
+    volume: float = 0.0
+    bid: Optional[float] = None       # best bid / ask from market depth (None if not quoted)
+    ask: Optional[float] = None
 
 
 @dataclass
@@ -256,7 +259,11 @@ class StrategyEngine:
             ltp, oi = float(q["last_price"]), float(q.get("oi") or 0)
             iv = implied_vol(ltp, spot, c.strike, T, self.p.risk_free_rate, c.kind)
             g = bs_greeks(spot, c.strike, T, self.p.risk_free_rate, iv, c.kind) if iv else None
-            chain.quotes[(c.strike, c.kind)] = OptionQuote(c, ltp, oi, iv, g)
+            depth = q.get("depth") or {}
+            buy, sell = depth.get("buy") or [], depth.get("sell") or []
+            bid = float(buy[0]["price"]) if buy and buy[0].get("price") else None
+            ask = float(sell[0]["price"]) if sell and sell[0].get("price") else None
+            chain.quotes[(c.strike, c.kind)] = OptionQuote(c, ltp, oi, iv, g, float(q.get("volume") or 0), bid, ask)
             if c.kind == "PE":
                 put_oi += oi
             else:

@@ -72,7 +72,7 @@ class ShadowBook:
         for spec in self.specs:
             if spec.id in self.open or spec.id in self.done_today:
                 continue
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now)
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features)
             if plan is None:
                 continue
             legs = []

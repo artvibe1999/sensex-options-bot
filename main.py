@@ -202,6 +202,8 @@ class Bot:
         self._exit_failures = 0
         self._last_state_save = 0.0
         self._last_heartbeat = 0.0
+        self._last_flow = 0.0
+        self.stream_full = os.getenv("STREAM_FULL", "1") != "0"   # tick-level OI/volume/depth near ATM
         self._approved_stamp: Optional[tuple] = None
         self._load_state()
 
@@ -289,6 +291,7 @@ class Bot:
         if snap.fresh:
             self.rec.record_snapshot(snap)
             self.shadow.step(snap, now)
+        self._record_flow(now, snap)
         if self.position:
             self._manage(now)
         elif not self.risk.halted:
@@ -296,6 +299,24 @@ class Bot:
         if self.risk.halted and not self._halt_alerted:
             self._halt_alerted = True
             self.alerts.send(f"Trading halted: {self.risk.halt_reason}", level="CRITICAL")
+
+    def _record_flow(self, now: dt.datetime, snap: Snapshot, every_s: float = 5.0) -> None:
+        """Stream ATM+/-10 strikes in FULL mode and store their OI / volume / bid / ask every 5 s.
+        Purely additive data capture: any failure is logged and ignored."""
+        if not self.stream_full or snap.chain is None or time.monotonic() - self._last_flow < every_s:
+            return
+        self._last_flow = time.monotonic()
+        try:
+            ch = snap.chain
+            near = [q.contract for (k, _), q in ch.quotes.items() if abs(k - ch.atm) <= 10 * ch.step]
+            self.client.subscribe_full({c.token: c.key for c in near})
+            flow = self.client.flow_snapshot()
+            ts = now.isoformat(timespec="seconds")
+            rows = [(ts, c.symbol, c.strike, c.kind, f["ltp"], f["oi"], f["volume"], f["bid"], f["ask"])
+                    for c in near if (f := flow.get(c.token))]
+            self.rec.flow(rows)
+        except Exception:  # noqa: BLE001
+            log.exception("Flow capture failed (continuing without it)")
 
     def _heartbeat(self, now: dt.datetime, every_s: float = 900.0) -> None:
         """Append a health summary row to the Google Sheet ('Health' tab) every 15 minutes. Never raises."""
@@ -310,21 +331,27 @@ class Bot:
     def _refresh_approvals(self, now: dt.datetime) -> None:
         """Load approved variants at startup (also after a same-day restart, when the new-day step is
         skipped) and again whenever the approvals file changes or the date rolls over."""
-        path = self.cfg.paths.approved_live if self.live else self.cfg.paths.approved_backtest
-        try:
-            mtime: Optional[float] = os.stat(path).st_mtime
-        except OSError:
-            mtime = None
-        stamp = (mtime, now.date())
+        paths = [self.cfg.paths.approved_live] if self.live else \
+            [self.cfg.paths.approved_backtest, self.cfg.paths.approved_live]   # paper also runs promoted variants
+        mtimes = []
+        for p in paths:
+            try:
+                mtimes.append(os.stat(p).st_mtime)
+            except OSError:
+                mtimes.append(None)
+        stamp = (tuple(mtimes), now.date())
         if stamp == self._approved_stamp:
             return
         self._approved_stamp = stamp
-        self.approved = load_approved(path, now.date())
+        approved: dict[str, float] = {}
+        for p in paths:
+            approved.update(load_approved(p, now.date()))
+        self.approved = approved
         if self.approved:
-            log.info("%d approved variants loaded from %s", len(self.approved), path)
+            log.info("%d approved variants loaded from %s", len(self.approved), ", ".join(paths))
             self.alerts.send(f"{len(self.approved)} approved variants loaded", key="approved-loaded")
         else:
-            log.warning("No valid approved variants in %s: shadow data collection only, no trades", path)
+            log.warning("No valid approved variants in %s: shadow data collection only, no trades", paths)
             self.alerts.send("No approved strategies: only shadow data collection is running", key="noapprove")
 
     def _new_day(self, now: dt.datetime) -> None:
@@ -427,7 +454,7 @@ class Bot:
         candidates: list[tuple[float, TradePlan]] = []
         for vid, score in self.approved.items():
             spec = self.spec_by_id.get(vid)
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now) if spec else None
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features) if spec else None
             if plan:
                 candidates.append((score, plan))
         candidates.sort(key=lambda c: c[0], reverse=True)

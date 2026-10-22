@@ -33,6 +33,7 @@ from shadow import ShadowBook
 from strategy_engine import Regime, RegimeState, TradePlan, bs_price, implied_vol
 
 BP, SP = BacktestParams(), StrategyParams()
+LOW = "LOW_VOL"
 TODAY = dt.date(2026, 10, 21)
 NOW = dt.datetime(2026, 10, 21, 10, 0, tzinfo=IST)
 IV = {"LOW_VOL": 0.11, "NORMAL": 0.15, "HIGH_VOL": 0.22}
@@ -56,7 +57,7 @@ class LibraryTests(unittest.TestCase):
 
     def test_every_template_can_produce_a_trade_and_is_defined_risk(self):
         by_template, total, built = {}, 0, 0
-        for spec in lib.build_library():
+        for spec in (s for s in lib.build_library() if not s.needs_oi):   # OI variants need live OI data
             plan, _, _ = plan_for(spec)
             total += 1
             if plan:
@@ -68,6 +69,66 @@ class LibraryTests(unittest.TestCase):
                          f"templates that never built a plan: built={by_template}")
         print(f"\n  library coverage on a sample chain: {built}/{total} variants produced a plan")
         self.assertGreater(built / total, 0.5)
+
+    def test_oi_variants_have_plain_twins_and_are_not_backtested(self):
+        specs = lib.build_library()
+        ids = {s.id for s in specs}
+        oi = [s for s in specs if s.needs_oi]
+        self.assertGreaterEqual(len(specs), 250)
+        self.assertGreater(len(oi), 50)
+        for s in oi:
+            self.assertIn(s.base_id, ids, f"no plain twin for {s.id}")      # needed by promote.py's benchmark
+            self.assertTrue(s.id.endswith("|oi=" + s.oi_rule))
+        res = bt.run_backtest(bt.synthetic_bars(200), oi[:6], SP, BP, CostParams())
+        self.assertEqual(sum(len(v) for v in res.values()), 0)                # skipped: no historical OI
+
+    def test_chain_features_rules_and_fail_closed(self):
+        import dataclasses
+        from chain_features import FeatureTracker, compute
+        plain = next(s for s in lib.build_library() if s.template == "iron_condor" and s.regimes == (LOW,)
+                     and dict(s.params) == {"delta": 0.15, "wing": 500} and s.dte_max == 3)
+        walls = next(s for s in lib.build_library() if s.id == plain.id + "|oi=walls")
+        pcr_calm = next(s for s in lib.build_library() if s.id == plain.id + "|oi=pcr_calm")
+        gex_pos = next(s for s in lib.build_library() if s.id == plain.id + "|oi=gex_pos")
+        base_plan, chain, rs = plan_for(plain)
+        sc = min(l.contract.strike for l in base_plan.legs if l.side == "SELL" and l.contract.kind == "CE")
+        sp = max(l.contract.strike for l in base_plan.legs if l.side == "SELL" and l.contract.kind == "PE")
+
+        def with_oi(call_peak, put_peak, call_base=1000.0, put_base=1000.0):
+            c2 = dataclasses.replace(chain, quotes={})
+            for (k, kind), q in chain.quotes.items():
+                peak = call_peak if kind == "CE" else put_peak
+                base = call_base if kind == "CE" else put_base
+                c2.quotes[(k, kind)] = dataclasses.replace(q, oi=base * (50 if k == peak else 1))
+            return c2
+
+        inside = compute(with_oi(sc - 200, sp + 200))               # walls between spot and the shorts
+        self.assertEqual(inside.call_wall, sc - 200)
+        self.assertEqual(inside.put_wall, sp + 200)
+        self.assertIsNotNone(lib.build_plan(walls, chain, rs, 0, TODAY, NOW, inside))
+        beyond = compute(with_oi(sc + 300, sp - 300))               # walls beyond the shorts: no protection
+        self.assertIsNone(lib.build_plan(walls, chain, rs, 0, TODAY, NOW, beyond))
+        self.assertIsNone(lib.build_plan(walls, chain, rs, 0, TODAY, NOW, None))      # no features: fail closed
+        self.assertIsNone(lib.build_plan(walls, chain, rs, 0, TODAY, NOW))
+        balanced = compute(with_oi(sc - 200, sp + 200, 1000.0, 1000.0))
+        self.assertTrue(0.8 <= balanced.pcr <= 1.3)
+        self.assertIsNotNone(lib.build_plan(pcr_calm, chain, rs, 0, TODAY, NOW, balanced))
+        put_heavy = compute(with_oi(sc - 200, sp + 200, 1000.0, 5000.0))
+        self.assertGreater(put_heavy.pcr, 1.3)
+        self.assertIsNone(lib.build_plan(pcr_calm, chain, rs, 0, TODAY, NOW, put_heavy))
+        self.assertEqual(compute(with_oi(sc - 200, sp + 200, 5000.0, 1000.0)).net_gex > 0,
+                         lib.build_plan(gex_pos, chain, rs, 0, TODAY, NOW,
+                                        compute(with_oi(sc - 200, sp + 200, 5000.0, 1000.0))) is not None)
+        self.assertLess(compute(with_oi(sc - 200, sp + 200, 1000.0, 5000.0)).net_gex, 0)
+        self.assertIsNone(lib.build_plan(gex_pos, chain, rs, 0, TODAY, NOW,
+                                         compute(with_oi(sc - 200, sp + 200, 1000.0, 5000.0))))
+        # OI change vs a reference taken >= 5 minutes earlier
+        tr = FeatureTracker()
+        tr.update(0.0, with_oi(sc - 200, sp + 200, 1000.0, 1000.0))
+        f = tr.update(400.0, with_oi(sc - 200, sp + 200, 2000.0, 1000.0))
+        self.assertGreater(f.call_oi_chg, 0)
+        self.assertAlmostEqual(f.put_oi_chg, 0.0)
+        self.assertIsNone(FeatureTracker().update(0.0, chain).call_oi_chg)      # no reference yet
 
     def test_regime_and_spike_gates(self):
         spec = next(s for s in lib.build_library() if s.template == "iron_condor" and s.regimes == ("LOW_VOL",))
@@ -250,7 +311,21 @@ class InfraTests(unittest.TestCase):
                 _j.dump({"valid_until": "2026-12-31", "variants": [{"id": "v1", "score": 2.0}]}, fh)
             bot._refresh_approvals(now)                          # no new-day step needed
             self.assertEqual(bot.approved, {"v1": 2.0})
-            self.assertEqual(bot._approved_stamp[1], now.date())
+            self.assertEqual(bot._approved_stamp[-1], now.date())
+
+    def test_recorder_stores_features_and_flow(self):
+        from chain_features import compute
+        with tempfile.TemporaryDirectory() as d:
+            rec = recorder.Recorder(os.path.join(d, "t.db"))
+            rs = RegimeState(Regime.LOW_VOL, 12.0, 0.5, 9.0, False, 0)
+            chain = bt.model_chain(80000.0, 0.11, TODAY + dt.timedelta(days=2), NOW, BP, SP.risk_free_rate)
+            snap = Snapshot(NOW, 80000.0, 12.0, rs, chain, 0, True, compute(chain))
+            rec.record_snapshot(snap)
+            rec.flow([(NOW.isoformat(), "SX1", 80000.0, "CE", 100.0, 5000.0, 123.0, 99.5, 100.5)])
+            con = sqlite3.connect(os.path.join(d, "t.db"))
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM features").fetchone()[0], 1)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM flow").fetchone()[0], 1)
+            con.close(); rec.close()
 
     def test_health_collect_and_sheet_row(self):
         import health_report as hr

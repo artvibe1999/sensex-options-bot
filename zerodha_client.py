@@ -75,6 +75,8 @@ class ZerodhaClient:
         self.vix_token: int = 0
         self._keys: dict[int, str] = {}                      # token -> "EXCH:SYMBOL"
         self._ticks: dict[int, tuple[float, float]] = {}     # token -> (ltp, monotonic ts)
+        self._full_subs: set[int] = set()                    # tokens streamed in FULL mode (OI, volume, depth)
+        self._flow: dict[int, dict] = {}                     # token -> latest full-mode fields
         self._subs: set[int] = set()
         self._ticker: Optional[KiteTicker] = None
         self._ws_connected = threading.Event()
@@ -220,6 +222,7 @@ class ZerodhaClient:
             except Exception:  # noqa: BLE001
                 log.debug("stream close error", exc_info=True)
         self._ticker, self._subs, self._ticks = None, set(), {}
+        self._full_subs, self._flow = set(), {}
         self._ws_connected.clear()
         self.stream_dead = False
 
@@ -227,7 +230,12 @@ class ZerodhaClient:
         self._ws_connected.set()
         if self._subs:
             ws.subscribe(list(self._subs))
-            ws.set_mode(ws.MODE_LTP, list(self._subs))
+            ltp_only = list(self._subs - self._full_subs)
+            if ltp_only:
+                ws.set_mode(ws.MODE_LTP, ltp_only)
+            full = list(self._full_subs & self._subs)
+            if full:
+                ws.set_mode(ws.MODE_FULL, full)
         log.info("WebSocket connected; %d tokens", len(self._subs))
 
     def _on_noreconnect(self, _ws) -> None:
@@ -237,7 +245,14 @@ class ZerodhaClient:
     def _on_ticks(self, _ws, ticks: list[dict]) -> None:
         now = time.monotonic()
         for t in ticks:
-            self._ticks[t["instrument_token"]] = (t["last_price"], now)
+            tok = t["instrument_token"]
+            self._ticks[tok] = (t["last_price"], now)
+            if tok in self._full_subs and ("oi" in t or "volume_traded" in t):
+                depth = t.get("depth") or {}
+                buy, sell = depth.get("buy") or [], depth.get("sell") or []
+                self._flow[tok] = {
+                    "mono": now, "ltp": t["last_price"], "oi": t.get("oi"), "volume": t.get("volume_traded"),
+                    "bid": buy[0].get("price") if buy else None, "ask": sell[0].get("price") if sell else None}
 
     def subscribe_tokens(self, mapping: dict[int, str]) -> None:
         self._keys.update(mapping)
@@ -246,6 +261,25 @@ class ZerodhaClient:
         if new and self._ticker is not None and self._ws_connected.is_set():
             self._ticker.subscribe(list(new))
             self._ticker.set_mode(self._ticker.MODE_LTP, list(new))
+
+    def subscribe_full(self, mapping: dict[int, str]) -> None:
+        """Stream these option tokens in FULL mode (adds OI, volume and top-of-book to every tick)."""
+        self._keys.update(mapping)
+        new_full = set(mapping) - self._full_subs
+        if not new_full:
+            return
+        self._full_subs |= new_full
+        new_subs = set(mapping) - self._subs
+        self._subs |= set(mapping)
+        if self._ticker is not None and self._ws_connected.is_set():
+            if new_subs:
+                self._ticker.subscribe(list(new_subs))
+            self._ticker.set_mode(self._ticker.MODE_FULL, list(new_full))
+
+    def flow_snapshot(self, max_age_s: float = 15.0) -> dict[int, dict]:
+        """Latest FULL-mode fields per token, only those that ticked within max_age_s."""
+        now = time.monotonic()
+        return {tok: d for tok, d in list(self._flow.items()) if now - d["mono"] <= max_age_s}
 
     def market_is_live(self, max_age_s: float = 30.0) -> bool:
         """True when the SENSEX index has ticked recently.

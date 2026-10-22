@@ -78,6 +78,14 @@ def collect(cfg: Config, now: dt.datetime, day: Optional[str] = None) -> dict[st
             for key, order in (("best", "DESC"), ("worst", "ASC")):
                 info[key] = _q(con, f"SELECT variant, net FROM shadow_trades WHERE entry_ts>=? AND entry_ts<? "
                                     f"ORDER BY net {order} LIMIT 2", lo, hi)
+        try:
+            r = _q(con, "SELECT ts, pcr, call_wall, put_wall, max_pain, net_gex, atm_iv, skew, call_oi_chg, "
+                        "put_oi_chg FROM features WHERE ts>=? AND ts<? ORDER BY ts DESC LIMIT 1", lo, hi)
+            info["features"] = r[0] if r else None
+            info["feature_rows"] = _q(con, "SELECT COUNT(*) FROM features WHERE ts>=? AND ts<?", lo, hi)[0][0]
+            info["flow_rows"] = _q(con, "SELECT COUNT(*) FROM flow WHERE ts>=? AND ts<?", lo, hi)[0][0]
+        except sqlite3.OperationalError:          # database created by an older version
+            info["features"], info["feature_rows"], info["flow_rows"] = None, 0, 0
         info["shadow_total"] = _q(con, "SELECT COUNT(*) FROM shadow_trades")[0][0]
         info["days"] = _q(con, "SELECT COUNT(DISTINCT substr(ts,1,10)) FROM market")[0][0]
     finally:
@@ -116,6 +124,14 @@ def main() -> int:
     if i["spot"] is not None:
         print(f"latest market   : spot {i['spot']:.0f}  VIX {i['vix']}  regime {i['regime']}  "
               f"score {i['score']}  spike {i['spike']}")
+    if i.get("features"):
+        f = i["features"]
+        fmt = lambda x, n=2: "n/a" if x is None else f"{x:,.{n}f}"
+        print(f"OI structure    : PCR {fmt(f[1])}  call wall {fmt(f[2], 0)}  put wall {fmt(f[3], 0)}  "
+              f"max pain {fmt(f[4], 0)}  net GEX {fmt(f[5], 0)}  ATM IV {fmt(f[6] and f[6] * 100, 1)}%  "
+              f"skew {fmt(f[7], 1)}")
+        print(f"                  5-min OI change: calls {fmt(f[8], 0)}  puts {fmt(f[9], 0)}  "
+              f"| feature rows {i['feature_rows']}, tick-flow rows {i['flow_rows']}")
     print("events today    :", i["events"] or "none")
     print(f"real/paper trades today: {len(i['trades'])}")
     for t in i["trades"]:

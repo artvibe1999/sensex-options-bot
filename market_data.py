@@ -15,6 +15,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
 
+from chain_features import ChainFeatures, FeatureTracker
 from config import IST, StrategyParams
 from strategy_engine import Chain, RegimeDetector, RegimeState, StrategyEngine, trend_direction
 from zerodha_client import ZerodhaClient
@@ -31,6 +32,7 @@ class Snapshot:
     chain: Optional[Chain]
     trend_dir: Optional[int]
     fresh: bool          # True when the chain was rebuilt for this snapshot
+    features: Optional[ChainFeatures] = None   # OI / gamma / skew features of the latest chain
 
 
 class MarketData:
@@ -46,9 +48,13 @@ class MarketData:
         self._bars: "OrderedDict[int, float]" = OrderedDict()
         self._chain: Optional[Chain] = None
         self._chain_at = -1e9
+        self.tracker = FeatureTracker()
+        self._feat: Optional[ChainFeatures] = None
 
     def reset_day(self) -> None:
         self._chain, self._chain_at = None, -1e9
+        self._feat = None
+        self.tracker.reset()
         self._bars.clear()
         self._daily_day = None
 
@@ -122,5 +128,11 @@ class MarketData:
             chain = self.engine.build_chain(expiry, spot, now)
             if chain is not None:
                 self._chain, self._chain_at, fresh = chain, time.monotonic(), True
+                try:
+                    self._feat = self.tracker.update(time.monotonic(), chain)
+                except Exception:  # noqa: BLE001 - features are optional; never block price data
+                    log.exception("Feature computation failed")
+                    self._feat = None
         trend = trend_direction(self.closes_5m(now), self.p)
-        return Snapshot(now, spot, vix, rs, self._chain, trend, fresh)
+        return Snapshot(now, spot, vix, rs, self._chain, trend, fresh,
+                        self._feat if self._chain is not None else None)

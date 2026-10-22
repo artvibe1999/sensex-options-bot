@@ -170,6 +170,8 @@ def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams
                 tdir = trend_direction([c["close"] for c in candles], sp)
                 chain = model_chain(bar["open"], iv0, expiry, now, bp, sp.risk_free_rate)
                 for spec in specs:
+                    if spec.needs_oi:
+                        continue                       # no historical OI: validated forward only
                     plan = build_plan(spec, chain, rs, tdir, bar["date"], now)
                     if plan:
                         results[spec.id].append(

@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from chain_features import ChainFeatures
 from strategy_engine import Chain, Leg, OptionQuote, RegimeState, TradePlan
 
 log = logging.getLogger(__name__)
@@ -42,10 +43,21 @@ class StrategySpec:
     entry_after: dt.time = dt.time(9, 30)
     sl_frac: float = 0.6               # hard stop as a fraction of max loss
     tp_frac: float = 0.6               # take-profit as a fraction of max profit
+    oi_rule: str = "none"              # none | walls | pcr_calm | gex_pos | gex_neg | flow  (needs live OI data)
 
     @property
     def p(self) -> dict:
         return dict(self.params)
+
+    @property
+    def needs_oi(self) -> bool:
+        """OI-rule variants cannot be backtested (no historical OI): they are validated forward only."""
+        return self.oi_rule != "none"
+
+    @property
+    def base_id(self) -> str:
+        """Id of the plain twin (same trade, no OI filter) used as the benchmark."""
+        return self.id.split("|oi=")[0]
 
 
 # ------------------------------------------------------------------ helpers
@@ -174,20 +186,22 @@ TEMPLATE_DIRECTION = {"bull_put_spread": 1, "bull_call_debit": 1,
 
 # ------------------------------------------------------------------ library
 def _make_id(template: str, params: tuple, regimes: tuple, band: tuple[int, int],
-             trend: str, sl: float, tp: float) -> str:
+             trend: str, sl: float, tp: float, oi: str = "none") -> str:
     ptxt = "_".join(f"{k}{v:g}" for k, v in params)
     rtxt = "".join(r[0] for r in regimes)
-    return f"{template}|{ptxt}|r{rtxt}|d{band[0]}-{band[1]}|t{trend}|x{sl:g}-{tp:g}"
+    base = f"{template}|{ptxt}|r{rtxt}|d{band[0]}-{band[1]}|t{trend}|x{sl:g}-{tp:g}"
+    return base if oi == "none" else f"{base}|oi={oi}"   # plain ids stay unchanged (approvals keep working)
 
 
 def build_library() -> list[StrategySpec]:
     out: list[StrategySpec] = []
 
     def add(template: str, params: dict, regimes: tuple, band: tuple[int, int],
-            trend: str = "none", sl: float = 0.6, tp: float = 0.6) -> None:
+            trend: str = "none", sl: float = 0.6, tp: float = 0.6, oi: str = "none") -> None:
         pt = tuple(params.items())
-        out.append(StrategySpec(_make_id(template, pt, regimes, band, trend, sl, tp),
-                                template, pt, regimes, band[0], band[1], trend, sl_frac=sl, tp_frac=tp))
+        out.append(StrategySpec(_make_id(template, pt, regimes, band, trend, sl, tp, oi),
+                                template, pt, regimes, band[0], band[1], trend, sl_frac=sl, tp_frac=tp,
+                                oi_rule=oi))
 
     neutral_regimes = ((LOW,), (LOW, NORM))
     for band in DTE_BANDS:
@@ -213,6 +227,24 @@ def build_library() -> list[StrategySpec]:
                 add("long_straddle", {"tp_mult": tp_mult}, regimes, band, "none", 0.5, 1.0)
                 for delta in (0.25, 0.35):
                     add("long_strangle", {"delta": delta, "tp_mult": tp_mult}, regimes, band, "none", 0.5, 1.0)
+    # ---- OI / gamma-rule variants: same trades as plain twins, plus a live-data filter. Not backtestable.
+    for band in DTE_BANDS:
+        for regimes in neutral_regimes:
+            for delta in (0.15, 0.20):
+                for wing in (500, 1000):
+                    for rule in ("walls", "pcr_calm", "gex_pos"):
+                        add("iron_condor", {"delta": delta, "wing": wing}, regimes, band, oi=rule)
+        for delta in (0.15, 0.25):
+            for width in (500, 1000):
+                for rule in ("walls", "flow"):
+                    add("bull_put_spread", {"delta": delta, "width": width}, (LOW, NORM), band, oi=rule)
+                    add("bear_call_spread", {"delta": delta, "width": width}, (LOW, NORM), band, oi=rule)
+        for regimes in ((NORM, HIGH), (HIGH,)):
+            for tp_mult in (0.5, 1.0):
+                add("long_straddle", {"tp_mult": tp_mult}, regimes, band, "none", 0.5, 1.0, oi="gex_neg")
+                for delta in (0.25, 0.35):
+                    add("long_strangle", {"delta": delta, "tp_mult": tp_mult}, regimes, band,
+                        "none", 0.5, 1.0, oi="gex_neg")
     ids = [s.id for s in out]
     assert len(ids) == len(set(ids)), "duplicate strategy ids"
     return out
@@ -230,8 +262,43 @@ def _trend_ok(spec: StrategySpec, trend_dir: Optional[int]) -> bool:
     return want == 0 or trend_dir == want
 
 
+def _oi_ok(spec: StrategySpec, legs: tuple[Leg, ...], f: Optional[ChainFeatures]) -> bool:
+    """Evaluate the variant's OI/gamma rule. Fails closed when features are unavailable."""
+    if spec.oi_rule == "none":
+        return True
+    if f is None:
+        return False
+    shorts_c = [l.contract.strike for l in legs if l.side == "SELL" and l.contract.kind == "CE"]
+    shorts_p = [l.contract.strike for l in legs if l.side == "SELL" and l.contract.kind == "PE"]
+    rule = spec.oi_rule
+    if rule == "walls":
+        # The biggest OI strikes must sit between spot and our short strikes, so price has to push
+        # through the wall before it threatens the position.
+        ok = bool(shorts_c or shorts_p)
+        if shorts_c:
+            ok = ok and f.call_wall is not None and f.call_wall <= min(shorts_c)
+        if shorts_p:
+            ok = ok and f.put_wall is not None and f.put_wall >= max(shorts_p)
+        return ok
+    if rule == "pcr_calm":
+        return 0.8 <= f.pcr <= 1.3                 # NaN compares False -> fail closed
+    if rule == "gex_pos":
+        return f.net_gex > 0
+    if rule == "gex_neg":
+        return f.net_gex < 0
+    if rule == "flow":
+        if f.call_oi_chg is None or f.put_oi_chg is None:
+            return False
+        if spec.template == "bull_put_spread":     # put writing building faster than call writing
+            return f.put_oi_chg > 0 and f.put_oi_chg > f.call_oi_chg
+        if spec.template == "bear_call_spread":
+            return f.call_oi_chg > 0 and f.call_oi_chg > f.put_oi_chg
+        return False
+    return False
+
+
 def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Optional[int],
-               today: dt.date, now: dt.datetime) -> Optional[TradePlan]:
+               today: dt.date, now: dt.datetime, features: Optional[ChainFeatures] = None) -> Optional[TradePlan]:
     """Return a concrete trade for this variant right now, or None."""
     if rs.spike or rs.regime.value not in spec.regimes:
         return None
@@ -247,6 +314,10 @@ def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Opt
     legs, max_loss, max_profit, why = built
     if max_loss <= 0 or max_profit <= 0:
         return None
+    if not _oi_ok(spec, legs, features):
+        return None
+    if spec.oi_rule != "none":
+        why += f" [{spec.oi_rule}]"
     return TradePlan(
         name=spec.template.upper(), regime=rs.regime.value, expiry=chain.expiry, legs=legs,
         lot_size=legs[0].contract.lot_size, max_loss_unit=max_loss, max_profit_unit=max_profit,

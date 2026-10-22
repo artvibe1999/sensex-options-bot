@@ -40,6 +40,16 @@ LIVE_TRADING_CONFIRM=YES python main.py --live
 ```
 Export recorded data: `python recorder.py export --table chain --since 2026-10-01 --out chain.csv`
 
+## OI / gamma features (research layer)
+Every fresh chain (10 s) the bot also computes and stores (table `features`): PCR, call/put OI walls, max pain,
+net gamma exposure (a disputed proxy), 25-delta skew, 5-minute OI change, ATM spread and volume. ATM+/-10 strikes
+are streamed in WebSocket FULL mode and sampled every 5 s into table `flow` (OI, volume, bid, ask); set
+`STREAM_FULL=0` to switch that off. 104 extra variants (ids ending `|oi=<rule>`) add one of these as a filter to
+a plain strategy: `walls` (OI walls sit between spot and the short strikes), `pcr_calm`, `gex_pos`, `gex_neg`,
+`flow`. They cannot be backtested (no historical OI), so they are shadow-tested live and `promote.py` only
+promotes one if it beats its plain twin (avg net per trade and profit factor) over 40+ forward trades.
+Nothing here is a proven edge; the filters are hypotheses the shadow book will confirm or reject.
+
 ## Is it working?
 `docker compose exec bot python health_report.py` prints login status, approvals, latest spot/VIX/regime,
 recorded rows, shadow-trade results and a list of problems. With no approved variants the bot records data and
