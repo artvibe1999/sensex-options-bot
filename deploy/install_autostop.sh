@@ -22,6 +22,26 @@ Persistent=false
 [Install]
 WantedBy=timers.target
 UNIT
+# Boot guard: bring the containers up on every boot, even if they were left in a "stopped" state.
+cat > /etc/systemd/system/sxbot-compose.service <<UNIT
+[Unit]
+Description=SXBOT: start containers at boot
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=$DIR
+ExecStart=/usr/bin/docker compose up -d
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+UNIT
 systemctl daemon-reload
+systemctl enable sxbot-compose.service
+systemctl start sxbot-compose.service
 systemctl enable --now sxbot-autostop.timer
-echo "Installed. Check with: systemctl list-timers sxbot-autostop.timer ; journalctl -u sxbot-autostop -n 20"
+echo "Installed (autostop timer + boot-start service). Check with: systemctl list-timers sxbot-autostop.timer ; journalctl -u sxbot-autostop -n 20"

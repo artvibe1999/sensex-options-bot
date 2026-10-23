@@ -26,8 +26,9 @@ if [ "$code" -ne 0 ]; then
   fi
   exit 0
 fi
-# Give the containers a clean stop (they flush the database), then power off.
-echo "$(date '+%F %T') $msg: stopping containers and powering off"
-(cd "$DIR" && docker compose stop -t 30) || true
+# Power off. Do NOT run "docker compose stop" first: containers stopped by hand are marked "manually stopped" and
+# Docker will NOT restart them at the next boot (restart: unless-stopped), so the bot would stay down. A normal
+# shutdown stops them gracefully (SIGTERM, stop_grace_period) and they come back on boot.
+echo "$(date '+%F %T') $msg: powering off"
 sync
 systemctl poweroff

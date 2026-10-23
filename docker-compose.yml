@@ -5,6 +5,7 @@ services:
     # pipeline in README.md, and set LIVE_TRADING_CONFIRM=YES in .env.
     command: ["python", "main.py", "--paper"]
     restart: unless-stopped
+    stop_grace_period: 40s      # time to flatten/flush on shutdown
     env_file: .env
     volumes:
       - ./data:/app/data
