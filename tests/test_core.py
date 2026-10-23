@@ -553,5 +553,31 @@ class TrendAndTierTests(unittest.TestCase):
             self.assertEqual(set(lib.load_approved(p, today)), {"a", "b", "c"})
 
 
+class ScannerTests(unittest.TestCase):
+    def _snap(self, trend_dir=1, spread=1.5, spike=False):
+        import trend_regime as tr
+        from chain_features import ChainFeatures
+        spec = next(s for s in lib.build_library() if s.template == "iron_condor")
+        _, chain, rs = plan_for(spec)
+        rs = RegimeState(rs.regime, rs.vix, rs.atr_pct, rs.realized_vol, spike, rs.score)
+        f = ChainFeatures(1.1, chain.spot * 1.02, chain.spot * 0.98, chain.spot, 5e9, 0.15, -0.5, 10, 30, 0.1,
+                          spread, 1000)
+        st = tr.TrendState(trend_dir, True, None, 0.8)
+        return Snapshot(NOW, chain.spot, 14.0, rs, chain, trend_dir, True, f, tr.TrendInfo(st, st))
+
+    def test_ranks_trend_first_and_explains(self):
+        import scanner
+        top = scanner.scan(self._snap())[0]
+        self.assertEqual((top.setup, top.bias), ("TREND_UP", 1))
+        self.assertIn("intraday_trend", top.passed)
+        self.assertEqual(scanner.scan(self._snap(-1))[0].setup, "TREND_DOWN")
+
+    def test_no_signal_when_illiquid_spiking_or_no_data(self):
+        import scanner
+        self.assertEqual(scanner.scan(self._snap(spread=9.0)), [])
+        self.assertEqual(scanner.scan(self._snap(spike=True)), [])
+        self.assertEqual(scanner.scan(None), [])
+
+
 if __name__ == "__main__":
     unittest.main()

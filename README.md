@@ -84,6 +84,12 @@ debit spreads, entered only on a valid trend or trap, and skipped when round-tri
 profit (`|c20` in the id). On a sample chain about 32 fit Rs 15k (debit spreads), more fit Rs 20k+. Fitting an account is not the
 same as being profitable: they still have to pass the backtest (daily modes) or forward shadow gates (intraday modes).
 
+**Opportunity scanner** (`scanner.py`). Each second-level snapshot is scored for six setups: `TREND_UP/DOWN`,
+`TRAP_REVERSAL_UP/DOWN`, `RANGE_PIN` (sell premium, defined risk) and `VOL_EXPANSION` (buy premium). A setup's score is the
+share of weighted checks that hold (trend/trap state, regime, OI walls, PCR, gamma, max pain, liquidity), and the passed
+and missing checks are stored in the `scan` table every 10 s. It never trades by itself; it is a ranked, explained
+shortlist, and the forward shadow results show whether high scores really win before anything relies on them.
+
 Limits: nothing here guarantees a trade in every situation. A tier with no approved variant simply does not trade.
 
 ## Small vs large accounts

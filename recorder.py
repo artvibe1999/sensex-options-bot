@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS flow(
 CREATE TABLE IF NOT EXISTS trend(
   ts TEXT, d_dir INTEGER, d_valid INTEGER, d_trap TEXT, d_er REAL,
   i_dir INTEGER, i_valid INTEGER, i_trap TEXT, i_er REAL);
+CREATE TABLE IF NOT EXISTS scan(
+  ts TEXT, setup TEXT, bias INTEGER, score REAL, evidence TEXT);
 CREATE INDEX IF NOT EXISTS ix_features_ts ON features(ts);
 CREATE INDEX IF NOT EXISTS ix_flow_ts ON flow(ts);
 CREATE INDEX IF NOT EXISTS ix_market_ts ON market(ts);
@@ -54,7 +56,7 @@ CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_shadow_variant ON shadow_trades(variant);
 """
 
-TABLES = ("market", "chain", "features", "flow", "trend", "events", "trades", "shadow_trades")
+TABLES = ("market", "chain", "features", "flow", "trend", "scan", "events", "trades", "shadow_trades")
 
 
 def _num(x: Optional[float]) -> Optional[float]:
@@ -101,6 +103,14 @@ class Recorder:
             self._write("INSERT INTO trend VALUES (?,?,?,?,?,?,?,?,?)", [(
                 ts, d.dir, int(d.valid), d.trap, d.er,
                 *((i.dir, int(i.valid), i.trap, i.er) if i else (None, None, None, None)))])
+        if with_chain:
+            try:
+                from scanner import scan
+                rows = [(ts, o.setup, o.bias, o.score, o.evidence) for o in scan(snap)[:3]]
+                if rows:
+                    self._write("INSERT INTO scan VALUES (?,?,?,?,?)", rows)
+            except Exception:  # noqa: BLE001 - the scanner is advisory; never block data recording
+                pass
         if snap.chain is not None and with_chain:
             rows = []
             exp = snap.chain.expiry.isoformat()
