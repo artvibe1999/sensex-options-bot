@@ -110,7 +110,10 @@ class Recorder:
                 if rows:
                     self._write("INSERT INTO scan VALUES (?,?,?,?,?)", rows)
             except Exception:  # noqa: BLE001 - the scanner is advisory; never block data recording
-                pass
+                if not getattr(self, "_scan_err_logged", False):
+                    self._scan_err_logged = True
+                    import logging
+                    logging.getLogger("recorder").exception("Scanner failed (logged once)")
         if snap.chain is not None and with_chain:
             rows = []
             exp = snap.chain.expiry.isoformat()
