@@ -45,7 +45,9 @@ def plan_for(spec, spot=80000.0):
     chain = bt.model_chain(spot, IV[regime], TODAY + dt.timedelta(days=dte), NOW, BP, SP.risk_free_rate)
     rs = RegimeState(Regime(regime), 15.0, 1.0, 12.0, False, 0)
     tdir = lib.TEMPLATE_DIRECTION.get(spec.template, 0)
-    return lib.build_plan(spec, chain, rs, tdir, TODAY, NOW), chain, rs
+    import trend_regime as _tr
+    st = _tr.TrendState(tdir, True, _tr.BEAR_TRAP if tdir == 1 else _tr.BULL_TRAP, 0.9)
+    return lib.build_plan(spec, chain, rs, tdir, TODAY, NOW, None, _tr.TrendInfo(st, st)), chain, rs
 
 
 class LibraryTests(unittest.TestCase):
@@ -501,7 +503,8 @@ class TrendAndTierTests(unittest.TestCase):
     def test_trend_modes_fail_closed_and_match_direction(self):
         import trend_regime as tr
         from strategy_library import TEMPLATE_DIRECTION, _trend_ok
-        specs = [s for s in lib.build_library() if s.trend in ("dvalid", "dtrap", "ivalid", "itrap")]
+        specs = [s for s in lib.build_library() if s.trend in ("dvalid", "dtrap", "ivalid", "itrap")
+                 and s.max_cost_frac == 0]
         self.assertEqual(len(specs), 160)
         bull = next(s for s in specs if s.trend == "dvalid" and TEMPLATE_DIRECTION[s.template] == 1)
         up = tr.TrendInfo(tr.TrendState(1, True, None, 0.9))

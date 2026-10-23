@@ -79,6 +79,11 @@ lists the tiers each variant passed; the bot loads only variants approved for it
 (below Rs 30k small, below Rs 3L medium, otherwise large). `promote.py` applies the same split to forward evidence.
 `python health_report.py` shows approvals per tier.
 
+**Low-cost directional family (small accounts).** 192 more variants: single-leg `long_call`/`long_put` and 200/300-point
+debit spreads, entered only on a valid trend or trap, and skipped when round-trip costs would exceed 20% of the target
+profit (`|c20` in the id). On a sample chain about 32 fit Rs 15k (debit spreads), more fit Rs 20k+. Fitting an account is not the
+same as being profitable: they still have to pass the backtest (daily modes) or forward shadow gates (intraday modes).
+
 Limits: nothing here guarantees a trade in every situation. A tier with no approved variant simply does not trade.
 
 ## Small vs large accounts

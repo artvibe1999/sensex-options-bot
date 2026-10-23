@@ -44,6 +44,7 @@ class StrategySpec:
     entry_after: dt.time = dt.time(9, 30)
     sl_frac: float = 0.6               # hard stop as a fraction of max loss
     tp_frac: float = 0.6               # take-profit as a fraction of max profit
+    max_cost_frac: float = 0.0         # >0: skip when round-trip costs exceed this share of the take-profit amount
     oi_rule: str = "none"              # none | walls | pcr_calm | gex_pos | gex_neg | flow  (needs live OI data)
 
     @property
@@ -169,6 +170,21 @@ def _bear_put_debit(chain: Chain, p: dict) -> Built:
     return _debit_spread(chain, p, "PE", -1)
 
 
+def _single_leg(chain: Chain, p: dict, kind: str) -> Built:
+    q = _otm_by_delta(chain, kind, p["delta"])
+    if not q:
+        return None
+    return (_leg(q, "BUY"),), q.ltp, q.ltp * p["tp_mult"], f"long {q.contract.strike:.0f}{kind[0]} premium {q.ltp:.1f}"
+
+
+def _long_call(chain: Chain, p: dict) -> Built:
+    return _single_leg(chain, p, "CE")
+
+
+def _long_put(chain: Chain, p: dict) -> Built:
+    return _single_leg(chain, p, "PE")
+
+
 def _long_straddle(chain: Chain, p: dict) -> Built:
     ce, pe = chain.get(chain.atm, "CE"), chain.get(chain.atm, "PE")
     if not ce or not pe:
@@ -190,17 +206,19 @@ _BUILDERS: dict[str, Callable[[Chain, dict], Built]] = {
     "bull_put_spread": _bull_put, "bear_call_spread": _bear_call,
     "bull_call_debit": _bull_call_debit, "bear_put_debit": _bear_put_debit,
     "long_straddle": _long_straddle, "long_strangle": _long_strangle,
+    "long_call": _long_call, "long_put": _long_put,
 }
-TEMPLATE_DIRECTION = {"bull_put_spread": 1, "bull_call_debit": 1,
-                      "bear_call_spread": -1, "bear_put_debit": -1}
+TEMPLATE_DIRECTION = {"bull_put_spread": 1, "bull_call_debit": 1, "long_call": 1,
+                      "bear_call_spread": -1, "bear_put_debit": -1, "long_put": -1}
 
 
 # ------------------------------------------------------------------ library
 def _make_id(template: str, params: tuple, regimes: tuple, band: tuple[int, int],
-             trend: str, sl: float, tp: float, oi: str = "none") -> str:
+             trend: str, sl: float, tp: float, oi: str = "none", cost: float = 0.0) -> str:
     ptxt = "_".join(f"{k}{v:g}" for k, v in params)
     rtxt = "".join(r[0] for r in regimes)
     base = f"{template}|{ptxt}|r{rtxt}|d{band[0]}-{band[1]}|t{trend}|x{sl:g}-{tp:g}"
+    base = base if cost <= 0 else f"{base}|c{round(cost * 100)}"
     return base if oi == "none" else f"{base}|oi={oi}"   # plain ids stay unchanged (approvals keep working)
 
 
@@ -208,11 +226,11 @@ def build_library() -> list[StrategySpec]:
     out: list[StrategySpec] = []
 
     def add(template: str, params: dict, regimes: tuple, band: tuple[int, int],
-            trend: str = "none", sl: float = 0.6, tp: float = 0.6, oi: str = "none") -> None:
+            trend: str = "none", sl: float = 0.6, tp: float = 0.6, oi: str = "none", cost: float = 0.0) -> None:
         pt = tuple(params.items())
-        out.append(StrategySpec(_make_id(template, pt, regimes, band, trend, sl, tp, oi),
+        out.append(StrategySpec(_make_id(template, pt, regimes, band, trend, sl, tp, oi, cost),
                                 template, pt, regimes, band[0], band[1], trend, sl_frac=sl, tp_frac=tp,
-                                oi_rule=oi))
+                                oi_rule=oi, max_cost_frac=cost))
 
     neutral_regimes = ((LOW,), (LOW, NORM))
     for band in DTE_BANDS:
@@ -303,6 +321,18 @@ def build_library() -> list[StrategySpec]:
                 for regimes in ((NORM, HIGH), (HIGH,)):
                     add("bull_call_debit", {"width": width}, regimes, band, mode, 0.5, 1.0)
                     add("bear_put_debit", {"width": width}, regimes, band, mode, 0.5, 1.0)
+    # ---- low-cost directional family for small accounts: fewer legs (less brokerage) and a cost-vs-target filter.
+    # Entered only on a valid trend or a trap; skipped when round-trip costs would eat > 20% of the target profit.
+    for band in DTE_BANDS:
+        for mode in ("dvalid", "dtrap", "ivalid", "itrap"):
+            for regimes in ((NORM, HIGH), (LOW, NORM, HIGH)):
+                for delta in (0.20, 0.30):
+                    for tp_mult in (1.0, 1.5):
+                        add("long_call", {"delta": delta, "tp_mult": tp_mult}, regimes, band, mode, 0.5, 1.0, cost=0.20)
+                        add("long_put", {"delta": delta, "tp_mult": tp_mult}, regimes, band, mode, 0.5, 1.0, cost=0.20)
+                for width in (200, 300):
+                    add("bull_call_debit", {"width": width}, regimes, band, mode, 0.5, 1.0, cost=0.20)
+                    add("bear_put_debit", {"width": width}, regimes, band, mode, 0.5, 1.0, cost=0.20)
     ids = [s.id for s in out]
     assert len(ids) == len(set(ids)), "duplicate strategy ids"
     return out
@@ -361,6 +391,15 @@ def _oi_ok(spec: StrategySpec, legs: tuple[Leg, ...], f: Optional[ChainFeatures]
     return False
 
 
+def _round_trip_cost(legs: tuple[Leg, ...]) -> float:
+    """Approximate charges for one lot: entry at the quoted price, exit at the same price."""
+    from costs import CostParams, trade_cost
+    q = legs[0].contract.lot_size
+    opp = {"BUY": "SELL", "SELL": "BUY"}
+    fills = [(l.side, l.ref_price, q) for l in legs] + [(opp[l.side], l.ref_price, q) for l in legs]
+    return trade_cost(fills, CostParams())
+
+
 def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Optional[int],
                today: dt.date, now: dt.datetime, features: Optional[ChainFeatures] = None,
                tinfo: Optional[TrendInfo] = None) -> Optional[TradePlan]:
@@ -381,6 +420,8 @@ def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Opt
         return None
     if not _oi_ok(spec, legs, features):
         return None
+    if spec.max_cost_frac > 0 and _round_trip_cost(legs) > spec.max_cost_frac * spec.tp_frac * max_profit * legs[0].contract.lot_size:
+        return None                                     # costs would eat too much of the target: not worth taking
     if spec.oi_rule != "none":
         why += f" [{spec.oi_rule}]"
     return TradePlan(
