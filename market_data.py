@@ -17,6 +17,7 @@ from typing import Optional
 
 from chain_features import ChainFeatures, FeatureTracker
 from config import IST, StrategyParams
+from trend_regime import TrendInfo, daily_state, intraday_state
 from strategy_engine import Chain, RegimeDetector, RegimeState, StrategyEngine, trend_direction
 from zerodha_client import ZerodhaClient
 
@@ -33,6 +34,7 @@ class Snapshot:
     trend_dir: Optional[int]
     fresh: bool          # True when the chain was rebuilt for this snapshot
     features: Optional[ChainFeatures] = None   # OI / gamma / skew features of the latest chain
+    tinfo: Optional[TrendInfo] = None          # valid-trend / trap classification (daily + intraday)
 
 
 class MarketData:
@@ -43,7 +45,9 @@ class MarketData:
         self._daily: list[dict] = []
         self._daily_day: Optional[dt.date] = None
         self._daily_retry_at = 0.0
-        self._hist5: list[float] = []
+        self._hist5: list[dict] = []
+        self._tinfo_day: Optional[dt.date] = None
+        self._tdaily = None
         self._hist5_at = -1e9
         self._bars: "OrderedDict[int, float]" = OrderedDict()
         self._chain: Optional[Chain] = None
@@ -104,11 +108,26 @@ class MarketData:
             self._hist5_at = time.monotonic()
             try:
                 c = self.client.historical(self.client.spot_token, now - dt.timedelta(days=5), now, "5minute")
-                self._hist5 = [x["close"] for x in c]
+                self._hist5 = [x for x in c]
             except Exception as exc:  # noqa: BLE001
                 log.warning("5-minute history unavailable (%s); using own bars", exc)
                 self._hist5 = []
-        return self._hist5 if self._hist5 else list(self._bars.values())
+        return [x["close"] for x in self._hist5] if self._hist5 else list(self._bars.values())
+
+    def trend_info(self, now: dt.datetime, spot: float, daily: list[dict]) -> TrendInfo:
+        """Daily (cached per day) and intraday valid-trend / trap state. Never raises."""
+        try:
+            if self._tinfo_day != now.date():
+                self._tdaily, self._tinfo_day = daily_state(daily), now.date()
+            today = [x for x in self._hist5 if x["date"].date() == now.date()]
+            if today and (now - today[-1]["date"]).total_seconds() < 300:
+                today = today[:-1]                         # drop the still-forming candle; spot stands in for it
+            ph = daily[-1]["high"] if daily else None
+            pl = daily[-1]["low"] if daily else None
+            return TrendInfo(self._tdaily, intraday_state(today, spot, ph, pl))
+        except Exception:  # noqa: BLE001
+            log.exception("Trend classification failed")
+            return TrendInfo()
 
     # ---------------------------------------------------------------- snapshot
     def snapshot(self, now: dt.datetime) -> Snapshot:
@@ -135,4 +154,5 @@ class MarketData:
                     self._feat = None
         trend = trend_direction(self.closes_5m(now), self.p)
         return Snapshot(now, spot, vix, rs, self._chain, trend, fresh,
-                        self._feat if self._chain is not None else None)
+                        self._feat if self._chain is not None else None,
+                        self.trend_info(now, spot, daily))

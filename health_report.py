@@ -42,6 +42,12 @@ def collect(cfg: Config, now: dt.datetime, day: Optional[str] = None) -> dict[st
         d = _approvals(path)
         info[key] = len(d.get("variants", [])) if d else 0
         info[key + "_until"] = d.get("valid_until") if d else None
+        tc = {"small": 0, "medium": 0, "large": 0}
+        for v in (d or {}).get("variants", []):
+            for t in v.get("tiers", ()):
+                if t in tc:
+                    tc[t] += 1
+        info[key + "_tiers"] = tc
         if d is None and key == "paper_approved":
             flags.append("No approved variants: data is recorded and shadow-traded but NO paper orders are placed. "
                          "Run: python backtest.py --fetch-kite 700 (then restart the bot).")
@@ -119,6 +125,8 @@ def main() -> int:
     print("Kite token      :", "fresh" if i["token_fresh"] else "MISSING/EXPIRED")
     print(f"paper approvals : {i['paper_approved']} variants (valid until {i['paper_approved_until']})")
     print(f"live approvals  : {i['live_approved']} variants (valid until {i['live_approved_until']})")
+    tc = i["paper_approved_tiers"]
+    print(f"paper by account size: small(~15k) {tc['small']} | medium(~1L) {tc['medium']} | large(~5L) {tc['large']}")
     print(f"market snapshots: {i['market_rows']}  last {i['last_ts']}")
     print(f"chain rows      : {i['chain_rows']}")
     if i["spot"] is not None:

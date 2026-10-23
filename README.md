@@ -59,6 +59,28 @@ a plain strategy: `walls` (OI walls sit between spot and the short strikes), `pc
 promotes one if it beats its plain twin (avg net per trade and profit factor) over 40+ forward trades.
 Nothing here is a proven edge; the filters are hypotheses the shadow book will confirm or reject.
 
+## Trends, traps and account-size tiers
+
+**Valid trend / trap detection** (`trend_regime.py`). A *valid* trend is a clean one-directional move (high
+efficiency ratio, fast EMA on the right side of the slow one). A *trap* is a failed breakout: price pushes past a recent
+high/low then closes back inside it. A failed upside breakout (bull trap) favours bearish trades; a failed downside
+breakout (bear trap) favours bullish trades. Four variant families use it (160 variants, all defined-risk spreads):
+
+| mode | data | validated by |
+|---|---|---|
+| `dvalid`, `dtrap` | daily bars | backtest + forward shadow |
+| `ivalid`, `itrap` | 5-minute bars | forward shadow only (stricter gates, must beat the no-filter twin when it has data) |
+
+The classification is recorded every 10 s in the `trend` table so you can review what it saw.
+
+**Account-size tiers.** Every backtest trade is re-sized and re-costed for a small (Rs 15,000), medium (Rs 1,00,000) and
+large (Rs 5,00,000) account using the real sizing rules, then walk-forward tested per tier. `approved_backtest.json`
+lists the tiers each variant passed; the bot loads only variants approved for its own account size
+(below Rs 30k small, below Rs 3L medium, otherwise large). `promote.py` applies the same split to forward evidence.
+`python health_report.py` shows approvals per tier.
+
+Limits: nothing here guarantees a trade in every situation. A tier with no approved variant simply does not trade.
+
 ## Small vs large accounts
 A SENSEX lot cannot be split. At 73,000 spot one lot of a defined-risk spread loses Rs 1,800-17,000 in the worst
 case, more than 2% of a small account, so the standard limits would place NO trades below about Rs 3.75 lakh.

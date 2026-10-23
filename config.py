@@ -102,6 +102,15 @@ ONE_LOT_MAX_PCT = 0.15
 ONE_LOT_MAX_RUPEES = 7_500.0
 
 
+# Capital tiers: backtests and approvals are evaluated at a representative account size per tier.
+TIER_CAPITAL = {"small": 15_000.0, "medium": 100_000.0, "large": 500_000.0}
+
+
+def capital_tier(capital: float) -> str:
+    """small below Rs 30k, medium below Rs 3L, otherwise large."""
+    return "small" if capital < 30_000 else ("medium" if capital < 300_000 else "large")
+
+
 def risk_for_capital(base: RiskParams, capital: float, profile: str = "auto") -> RiskParams:
     """Return the risk parameters to use for this account size. profile: auto | standard | small."""
     import dataclasses

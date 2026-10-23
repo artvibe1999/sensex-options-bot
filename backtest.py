@@ -35,10 +35,11 @@ import random
 from dataclasses import dataclass
 from typing import Optional
 
-from config import IST, BacktestParams, StrategyParams, load_config
+from config import IST, TIER_CAPITAL, BacktestParams, RiskParams, Schedule, StrategyParams, load_config
 from costs import CostParams, trade_cost
 from strategy_engine import (Chain, OptionQuote, RegimeDetector, bs_greeks, bs_price,
                              trend_direction)
+from trend_regime import TrendInfo, daily_state
 from strategy_library import StrategySpec, build_library, build_plan
 from zerodha_client import OptionContract
 
@@ -102,6 +103,8 @@ class Trade:
     net: float
     max_loss: float
     reason: str
+    gross: float = 0.0                  # per ONE lot, before costs
+    fills: tuple = ()                   # ((side, price, qty), ...) for one lot, to re-cost n lots
 
 
 def next_expiry(day: dt.date, weekday: int) -> dt.date:
@@ -151,7 +154,7 @@ def simulate_trade(plan, spec: StrategySpec, bar: dict, iv_entry: float, iv_exit
         else:
             gross, exits, reason = p_close, c_ex, "EOD"
     fills = [(l.side, entry[l.contract.symbol], qty) for l in plan.legs] + exits
-    return Trade(bar["date"], gross - trade_cost(fills, costs), ml, reason)
+    return Trade(bar["date"], gross - trade_cost(fills, costs), ml, reason, gross, tuple(fills))
 
 
 def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams,
@@ -168,16 +171,39 @@ def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams
                 now = dt.datetime.combine(bar["date"], dt.time(9, 30), tzinfo=IST)
                 iv0, iv1 = vix_prev / 100 * bp.iv_scale, bar["vix"] / 100 * bp.iv_scale
                 tdir = trend_direction([c["close"] for c in candles], sp)
+                tinfo = TrendInfo(daily_state(candles[-60:]))
                 chain = model_chain(bar["open"], iv0, expiry, now, bp, sp.risk_free_rate)
                 for spec in specs:
-                    if spec.needs_oi:
-                        continue                       # no historical OI: validated forward only
-                    plan = build_plan(spec, chain, rs, tdir, bar["date"], now)
+                    if spec.forward_only:
+                        continue                       # no historical OI / 5-minute data: validated forward only
+                    plan = build_plan(spec, chain, rs, tdir, bar["date"], now, None, tinfo)
                     if plan:
                         results[spec.id].append(
                             simulate_trade(plan, spec, bar, iv0, iv1, bp, costs, sp.risk_free_rate, now))
         candles.append(bar)
     return results
+
+
+def tier_results(results: dict[str, list[Trade]], capital: float, rp, schedule, costs: CostParams,
+                 profile: str = "auto") -> dict[str, list[Trade]]:
+    """Re-express one-lot results for an account of `capital`: lots come from the real RiskManager sizing rule, costs
+    are recomputed for n lots, and trades that do not fit the account are dropped."""
+    from types import SimpleNamespace
+    from risk_manager import RiskManager
+    rm = RiskManager(rp, schedule)
+    rm.apply_capital(capital, profile)
+    out: dict[str, list[Trade]] = {}
+    for vid, trades in results.items():
+        rows = []
+        for t in trades:
+            n = rm.size(SimpleNamespace(max_loss_per_lot=t.max_loss), capital)
+            if n < 1:
+                continue
+            fills = [(s, px, q * n) for s, px, q in t.fills]
+            rows.append(Trade(t.date, n * t.gross - trade_cost(fills, costs), n * t.max_loss, t.reason,
+                              n * t.gross, tuple(fills)))
+        out[vid] = rows
+    return out
 
 
 # ------------------------------------------------------------------ statistics
@@ -345,6 +371,26 @@ def main() -> int:
     c = Criteria()
     wf_rows, per_variant = walk_forward(results, dates, c)
     approved = sorted((v for v in per_variant.values() if v["approved"]), key=lambda v: -v["score"])
+    # ---- capital tiers: same trades, sized and costed for a small / medium / large account
+    rp = cfg.risk if cfg else RiskParams()
+    sched = cfg.schedule if cfg else Schedule()
+    tiers_ok: dict[str, dict[str, dict]] = {}
+    for tier, cap in TIER_CAPITAL.items():
+        _, pv = walk_forward(tier_results(results, cap, rp, sched, costs), dates, c)
+        tiers_ok[tier] = pv
+        print(f"Tier {tier:<6} (Rs {cap:>9,.0f}): approved {sum(1 for v in pv.values() if v['approved'])} variants")
+    for v in approved:
+        v["tiers"] = {t: {"approved": pv[v["id"]]["approved"], "full": pv[v["id"]]["full"],
+                          "oos": pv[v["id"]]["oos"]} for t, pv in tiers_ok.items()}
+    # a variant can fail the base (1-lot) gates yet pass for a tier, e.g. a wider spread sized to 2 lots: include it
+    base_ids = {v["id"] for v in approved}
+    for tier, pv in tiers_ok.items():
+        for vid, v in pv.items():
+            if v["approved"] and vid not in base_ids:
+                approved.append({**v, "tiers": {t: {"approved": p[vid]["approved"], "full": p[vid]["full"],
+                                                   "oos": p[vid]["oos"]} for t, p in tiers_ok.items()}})
+                base_ids.add(vid)
+    approved.sort(key=lambda v: -v["score"])
 
     print(f"\nWalk-forward windows: {len(wf_rows)}")
     if wf_rows:
@@ -363,7 +409,9 @@ def main() -> int:
     doc = {"generated_at": dt.datetime.now(IST).isoformat(), "source": "backtest" + ("-SYNTHETIC" if args.synthetic else ""),
            "data_range": [str(bars[0]["date"]), str(bars[-1]["date"])],
            "valid_until": str(dt.date.today() + dt.timedelta(days=args.valid_days)),
-           "variants": [{"id": v["id"], "score": v["score"], "full": v["full"], "oos": v["oos"]} for v in approved]}
+           "variants": [{"id": v["id"], "score": v["score"], "full": v["full"], "oos": v["oos"],
+                        "tiers": [t for t, r in v["tiers"].items() if r["approved"]],
+                        "tier_stats": v["tiers"]} for v in approved]}
     target = os.path.join(args.out_dir, f"{tag}approved_backtest.json")
     with open(target, "w", encoding="utf-8") as f:
         json.dump(doc, f, indent=1)

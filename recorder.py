@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS features(
   skew REAL, call_oi_chg REAL, put_oi_chg REAL, pcr_chg REAL, atm_spread_pct REAL, atm_volume REAL);
 CREATE TABLE IF NOT EXISTS flow(
   ts TEXT, symbol TEXT, strike REAL, kind TEXT, ltp REAL, oi REAL, volume REAL, bid REAL, ask REAL);
+CREATE TABLE IF NOT EXISTS trend(
+  ts TEXT, d_dir INTEGER, d_valid INTEGER, d_trap TEXT, d_er REAL,
+  i_dir INTEGER, i_valid INTEGER, i_trap TEXT, i_er REAL);
 CREATE INDEX IF NOT EXISTS ix_features_ts ON features(ts);
 CREATE INDEX IF NOT EXISTS ix_flow_ts ON flow(ts);
 CREATE INDEX IF NOT EXISTS ix_market_ts ON market(ts);
@@ -51,7 +54,7 @@ CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_shadow_variant ON shadow_trades(variant);
 """
 
-TABLES = ("market", "chain", "features", "flow", "events", "trades", "shadow_trades")
+TABLES = ("market", "chain", "features", "flow", "trend", "events", "trades", "shadow_trades")
 
 
 def _num(x: Optional[float]) -> Optional[float]:
@@ -92,6 +95,12 @@ class Recorder:
         self._write("INSERT INTO market VALUES (?,?,?,?,?,?,?,?,?)", [(
             ts, snap.spot, snap.vix, rs.regime.value, rs.score,
             _num(rs.atr_pct), _num(rs.realized_vol), int(rs.spike), snap.trend_dir)])
+        ti = getattr(snap, "tinfo", None)
+        if ti is not None and with_chain:
+            d, i = ti.daily, ti.intraday
+            self._write("INSERT INTO trend VALUES (?,?,?,?,?,?,?,?,?)", [(
+                ts, d.dir, int(d.valid), d.trap, d.er,
+                *((i.dir, int(i.valid), i.trap, i.er) if i else (None, None, None, None)))])
         if snap.chain is not None and with_chain:
             rows = []
             exp = snap.chain.expiry.isoformat()

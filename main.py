@@ -26,7 +26,7 @@ from typing import Optional
 from kiteconnect import exceptions as kex
 
 from alerts import Alerter
-from config import IST, Config, load_config
+from config import IST, Config, capital_tier, load_config
 from costs import trade_cost
 from market_data import MarketData, Snapshot
 from recorder import Recorder
@@ -354,7 +354,7 @@ class Bot:
         self._approved_stamp = stamp
         approved: dict[str, float] = {}
         for p in paths:
-            approved.update(load_approved(p, now.date()))
+            approved.update(load_approved(p, now.date(), capital_tier(getattr(self, "capital", 0.0) or self.cfg.paper_capital)))
         self.approved = approved
         if self.approved:
             log.info("%d approved variants loaded from %s", len(self.approved), ", ".join(paths))
@@ -398,7 +398,9 @@ class Bot:
             self.client.subscribe_tokens({l.contract.token: l.contract.key for l in self.position.legs})
         self.capital = self.client.available_cash() if self.live else self.cfg.paper_capital
         self.risk.apply_capital(self.capital, self.cfg.capital_profile)
-        log.info("Session ready: mode=%s capital=%.0f", self.mode, self.capital)
+        log.info("Session ready: mode=%s capital=%.0f tier=%s", self.mode, self.capital, capital_tier(self.capital))
+        self._approved_stamp = None            # approvals are per account-size tier: reload now capital is known
+        self._refresh_approvals(now)
         if self.live:
             self._reconcile()
         self.session_ready = True
@@ -470,7 +472,7 @@ class Bot:
         candidates: list[tuple[float, TradePlan]] = []
         for vid, score in self.approved.items():
             spec = self.spec_by_id.get(vid)
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features) if spec else None
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features, snap.tinfo) if spec else None
             if plan:
                 candidates.append((score, plan))
         candidates.sort(key=lambda c: c[0], reverse=True)

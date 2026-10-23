@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 from chain_features import ChainFeatures
 from strategy_engine import Chain, Leg, OptionQuote, RegimeState, TradePlan
+from trend_regime import TrendInfo
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class StrategySpec:
     regimes: tuple
     dte_min: int
     dte_max: int
-    trend: str = "none"                # none | with | flat
+    trend: str = "none"                # none | with | flat | dvalid | dtrap (daily, backtestable) | ivalid | itrap (intraday)
     entry_after: dt.time = dt.time(9, 30)
     sl_frac: float = 0.6               # hard stop as a fraction of max loss
     tp_frac: float = 0.6               # take-profit as a fraction of max profit
@@ -55,9 +56,19 @@ class StrategySpec:
         return self.oi_rule != "none"
 
     @property
+    def intraday_trend(self) -> bool:
+        """Intraday valid-trend / trap variants need 5-minute data: validated forward only."""
+        return self.trend in ("ivalid", "itrap")
+
+    @property
+    def forward_only(self) -> bool:
+        return self.needs_oi or self.intraday_trend
+
+    @property
     def base_id(self) -> str:
-        """Id of the plain twin (same trade, no OI filter) used as the benchmark."""
-        return self.id.split("|oi=")[0]
+        """Id of the plain twin (same trade without the OI / intraday-trend filter) used as the benchmark."""
+        b = self.id.split("|oi=")[0]
+        return b.replace(f"|t{self.trend}|", "|tnone|") if self.intraday_trend else b
 
 
 # ------------------------------------------------------------------ helpers
@@ -279,15 +290,34 @@ def build_library() -> list[StrategySpec]:
             add_new("bear_call_spread", {"delta": 0.35, "width": width}, (LOW, NORM), band, "with", 0.6, 0.6)
     SMALL_FAMILY_SIZE = len(out) - before
     assert SMALL_FAMILY_SIZE == 200, f"small-account family should be 200 variants, got {SMALL_FAMILY_SIZE}"
+    # ---- trend / trap family: trade WITH a clean one-directional move ("valid") or AGAINST a failed breakout
+    # ("trap"). d* use daily bars (backtestable); i* use 5-minute bars (forward-validated only). Widths 200-500 keep
+    # them affordable for small accounts; capital tiers are evaluated separately.
+    for band in DTE_BANDS:
+        for mode in ("dvalid", "dtrap", "ivalid", "itrap"):
+            for delta in (0.25, 0.35):
+                for width in (200, 500):
+                    add("bull_put_spread", {"delta": delta, "width": width}, (LOW, NORM), band, mode)
+                    add("bear_call_spread", {"delta": delta, "width": width}, (LOW, NORM), band, mode)
+            for width in (200, 300, 500):
+                for regimes in ((NORM, HIGH), (HIGH,)):
+                    add("bull_call_debit", {"width": width}, regimes, band, mode, 0.5, 1.0)
+                    add("bear_put_debit", {"width": width}, regimes, band, mode, 0.5, 1.0)
     ids = [s.id for s in out]
     assert len(ids) == len(set(ids)), "duplicate strategy ids"
     return out
 
 
 # ------------------------------------------------------------------ planning
-def _trend_ok(spec: StrategySpec, trend_dir: Optional[int]) -> bool:
+def _trend_ok(spec: StrategySpec, trend_dir: Optional[int], tinfo: Optional[TrendInfo] = None) -> bool:
     if spec.trend == "none":
         return True
+    if spec.trend in ("dvalid", "dtrap", "ivalid", "itrap"):
+        st = None if tinfo is None else (tinfo.daily if spec.trend[0] == "d" else tinfo.intraday)
+        want = TEMPLATE_DIRECTION.get(spec.template, 0)
+        if st is None or want == 0:
+            return False                                   # fail closed without data
+        return (st.valid and st.dir == want) if spec.trend.endswith("valid") else st.trap_dir == want
     if trend_dir is None:
         return False
     if spec.trend == "flat":
@@ -332,7 +362,8 @@ def _oi_ok(spec: StrategySpec, legs: tuple[Leg, ...], f: Optional[ChainFeatures]
 
 
 def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Optional[int],
-               today: dt.date, now: dt.datetime, features: Optional[ChainFeatures] = None) -> Optional[TradePlan]:
+               today: dt.date, now: dt.datetime, features: Optional[ChainFeatures] = None,
+               tinfo: Optional[TrendInfo] = None) -> Optional[TradePlan]:
     """Return a concrete trade for this variant right now, or None."""
     if rs.spike or rs.regime.value not in spec.regimes:
         return None
@@ -340,7 +371,7 @@ def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Opt
         return None
     if not (spec.dte_min <= (chain.expiry - today).days <= spec.dte_max):
         return None
-    if not _trend_ok(spec, trend_dir):
+    if not _trend_ok(spec, trend_dir, tinfo):
         return None
     built = _BUILDERS[spec.template](chain, spec.p)
     if not built:
@@ -359,14 +390,18 @@ def build_plan(spec: StrategySpec, chain: Chain, rs: RegimeState, trend_dir: Opt
 
 
 # ------------------------------------------------------------------ approvals
-def load_approved(path: str, today: dt.date) -> dict[str, float]:
-    """Variant id -> score. Missing, malformed or expired approvals return {} (fail closed)."""
+def load_approved(path: str, today: dt.date, tier: Optional[str] = None) -> dict[str, float]:
+    """Variant id -> score. Missing, malformed or expired approvals return {} (fail closed).
+
+    With `tier` ("small" | "medium" | "large") only variants approved for that account size are returned. Entries
+    that carry no `tiers` key (older files, forward promotions) stay eligible."""
     try:
         with open(path, encoding="utf-8") as f:
             doc = json.load(f)
         if dt.date.fromisoformat(doc["valid_until"]) < today:
             log.warning("Approvals in %s expired on %s", path, doc["valid_until"])
             return {}
-        return {v["id"]: float(v.get("score", 0.0)) for v in doc["variants"]}
+        return {v["id"]: float(v.get("score", 0.0)) for v in doc["variants"]
+                if tier is None or "tiers" not in v or tier in v["tiers"]}
     except (OSError, ValueError, KeyError, TypeError):
         return {}

@@ -22,13 +22,28 @@ import json
 import os
 import sqlite3
 
-from config import IST
+from config import IST, TIER_CAPITAL, RiskParams, Schedule
 from strategy_library import build_library
 
 
 def _pf(nets: list[float]) -> float:
     wins, losses = sum(x for x in nets if x > 0), -sum(x for x in nets if x < 0)
     return 99.0 if losses == 0 and wins > 0 else (wins / losses if losses else 0.0)
+
+
+def _tier_nets(rows: list[tuple[float, float]], capital: float) -> list[float]:
+    """Forward one-lot results (net, max_loss) re-expressed for an account size: n lots from the real sizing rule,
+    trades that do not fit are skipped. Costs are scaled with n too, which slightly OVERstates them (conservative)."""
+    from types import SimpleNamespace
+    from risk_manager import RiskManager
+    rm = RiskManager(RiskParams(), Schedule())
+    rm.apply_capital(capital, "auto")
+    out = []
+    for net, ml in rows:
+        n = rm.size(SimpleNamespace(max_loss_per_lot=ml), capital) if ml and ml > 0 else 0
+        if n >= 1:
+            out.append(net * n)
+    return out
 
 
 def main() -> int:
@@ -52,9 +67,19 @@ def main() -> int:
     since = (dt.date.today() - dt.timedelta(days=args.lookback_days)).isoformat()
     db = sqlite3.connect(os.path.join(args.data_dir, "sxbot.db"))
     fwd: dict[str, list[float]] = {}
-    for vid, net in db.execute("SELECT variant, net FROM shadow_trades WHERE entry_ts >= ?", (since,)):
+    fwd_rows: dict[str, list[tuple[float, float]]] = {}
+    for vid, net, ml in db.execute("SELECT variant, net, max_loss FROM shadow_trades WHERE entry_ts >= ?", (since,)):
         fwd.setdefault(vid, []).append(net)
+        fwd_rows.setdefault(vid, []).append((net, ml))
     db.close()
+
+    def fwd_tiers(vid: str, min_n: int, min_pf: float) -> list[str]:
+        out = []
+        for tier, cap in TIER_CAPITAL.items():
+            nets = _tier_nets(fwd_rows.get(vid, []), cap)
+            if len(nets) >= min_n and sum(nets) > 0 and _pf(nets) >= min_pf:
+                out.append(tier)
+        return out
 
     live, rows = [], []
     for v in bt["variants"]:
@@ -63,21 +88,26 @@ def main() -> int:
         ok = n >= args.min_trades and total > 0 and pf >= args.min_pf
         rows.append((v["id"], n, total, pf, ok))
         if ok:
-            live.append({"id": v["id"], "score": v["score"], "forward": {"n": n, "net": total, "pf": pf}})
+            ft = fwd_tiers(v["id"], args.min_trades, args.min_pf)
+            tiers = [t for t in ft if "tiers" not in v or t in v["tiers"]]
+            if tiers:
+                live.append({"id": v["id"], "score": v["score"], "tiers": tiers,
+                             "forward": {"n": n, "net": total, "pf": pf}})
 
     oi_rows = []
     for spec in build_library():
-        if not spec.needs_oi:
+        if not spec.forward_only:
             continue
         nets, base = fwd.get(spec.id, []), fwd.get(spec.base_id, [])
         n, total, pf = len(nets), sum(nets), _pf(nets)
         bn = len(base)
         avg, bavg, bpf = (total / n if n else 0.0), (sum(base) / bn if bn else 0.0), (_pf(base) if bn else 0.0)
-        ok = (n >= args.min_trades_oi and total > 0 and pf >= args.min_pf_oi
-              and bn >= 20 and avg > bavg and pf > bpf)
+        twin_ok = (bn >= 20 and avg > bavg and pf > bpf) if bn >= 20 else spec.intraday_trend
+        ok = n >= args.min_trades_oi and total > 0 and pf >= args.min_pf_oi and twin_ok
         oi_rows.append((spec.id, n, total, pf, bn, bavg, ok))
-        if ok:
-            live.append({"id": spec.id, "score": pf, "evidence": "forward_only",
+        tiers = fwd_tiers(spec.id, args.min_trades_oi, args.min_pf_oi) if ok else []
+        if ok and tiers:
+            live.append({"id": spec.id, "score": pf, "evidence": "forward_only", "tiers": tiers,
                          "forward": {"n": n, "net": total, "pf": pf},
                          "plain_twin": {"n": bn, "avg": bavg, "pf": bpf}})
 

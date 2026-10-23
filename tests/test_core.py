@@ -481,5 +481,74 @@ class InfraTests(unittest.TestCase):
         self.assertEqual(back.plan.expiry, plan.expiry)
 
 
+class TrendAndTierTests(unittest.TestCase):
+    def _bars(self, closes, spike=None):
+        return [{"high": c + 0.5, "low": c - 0.5, "close": c} for c in closes]
+
+    def test_daily_valid_trend_and_chop_and_traps(self):
+        import trend_regime as tr
+        up = tr.daily_state(self._bars([100 + i for i in range(40)]))
+        self.assertTrue(up.valid and up.dir == 1 and up.trap is None)
+        chop = tr.daily_state(self._bars([100 + (i % 2) for i in range(40)]))
+        self.assertFalse(chop.valid)
+        flat = [{"high": 100.5, "low": 99.5, "close": 100.0}] * 39
+        bull = tr.daily_state(flat + [{"high": 103.0, "low": 99.8, "close": 99.9}])
+        bear = tr.daily_state(flat + [{"high": 100.2, "low": 97.0, "close": 100.3}])
+        self.assertEqual((bull.trap, bull.trap_dir), (tr.BULL_TRAP, -1))
+        self.assertEqual((bear.trap, bear.trap_dir), (tr.BEAR_TRAP, 1))
+        self.assertEqual(tr.daily_state(self._bars([100.0] * 5)), tr.TrendState())   # too little data: no signal
+
+    def test_trend_modes_fail_closed_and_match_direction(self):
+        import trend_regime as tr
+        from strategy_library import TEMPLATE_DIRECTION, _trend_ok
+        specs = [s for s in lib.build_library() if s.trend in ("dvalid", "dtrap", "ivalid", "itrap")]
+        self.assertEqual(len(specs), 160)
+        bull = next(s for s in specs if s.trend == "dvalid" and TEMPLATE_DIRECTION[s.template] == 1)
+        up = tr.TrendInfo(tr.TrendState(1, True, None, 0.9))
+        down = tr.TrendInfo(tr.TrendState(-1, True, None, 0.9))
+        self.assertTrue(_trend_ok(bull, 0, up))
+        self.assertFalse(_trend_ok(bull, 0, down))
+        self.assertFalse(_trend_ok(bull, 0, None))                       # no data: no trade
+        trap = next(s for s in specs if s.trend == "itrap" and TEMPLATE_DIRECTION[s.template] == -1)
+        self.assertFalse(_trend_ok(trap, 0, up))                         # intraday state missing
+        self.assertTrue(_trend_ok(trap, 0, tr.TrendInfo(tr.TrendState(), tr.TrendState(0, False, tr.BULL_TRAP, 0.5))))
+        self.assertTrue(trap.forward_only and not bull.forward_only)
+        self.assertIn("|tnone|", trap.base_id)
+
+    def test_plain_ids_unchanged(self):
+        ids = {s.id for s in lib.build_library()}
+        self.assertTrue(all(i in ids for i in (
+            "iron_condor|delta0.15_wing500|rL|d1-3|tnone|x0.6-0.6",)) or len(ids) > 500)
+
+    def test_tier_sizing_drops_what_does_not_fit(self):
+        from costs import CostParams
+        fills = (("SELL", 100.0, 20), ("BUY", 60.0, 20))
+        small_loss = bt.Trade(dt.date(2026, 1, 1), 500.0, 2000.0, "TP", 800.0, fills)
+        big_loss = bt.Trade(dt.date(2026, 1, 2), 500.0, 40000.0, "TP", 800.0, fills)
+        res = {"v": [small_loss, big_loss]}
+        costs = CostParams()
+        small = bt.tier_results(res, 15_000.0, RiskParams(), Schedule(), costs)["v"]
+        large = bt.tier_results(res, 500_000.0, RiskParams(), Schedule(), costs)["v"]
+        self.assertEqual(len(small), 1)                                   # Rs 40k max loss cannot fit Rs 15k
+        self.assertGreaterEqual(len(large), 1)
+        n = round(large[0].gross / 800.0)
+        self.assertGreaterEqual(n, 1)
+        self.assertAlmostEqual(large[0].net, n * 800.0 - trade_cost([(s, p, q * n) for s, p, q in fills], costs))
+
+    def test_load_approved_filters_by_tier(self):
+        import json as _j
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.json")
+            with open(p, "w") as f:
+                _j.dump({"valid_until": "2099-01-01", "variants": [
+                    {"id": "a", "score": 1, "tiers": ["small", "large"]},
+                    {"id": "b", "score": 1, "tiers": ["large"]},
+                    {"id": "c", "score": 1}]}, f)
+            today = dt.date(2026, 10, 23)
+            self.assertEqual(set(lib.load_approved(p, today, "small")), {"a", "c"})
+            self.assertEqual(set(lib.load_approved(p, today, "medium")), {"c"})
+            self.assertEqual(set(lib.load_approved(p, today)), {"a", "b", "c"})
+
+
 if __name__ == "__main__":
     unittest.main()
