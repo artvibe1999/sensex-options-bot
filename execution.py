@@ -163,19 +163,57 @@ class LiveBroker:
 
     def __init__(self, client, cfg, sleep: Callable[[float], None] = time.sleep) -> None:
         self.client, self.x, self._sleep = client, cfg.execution, sleep
+        self.unresolved: list[str] = []        # symbols an unwind could not confirm closed: caller must halt
+        self._seq = 0
+        self._epoch = int(time.time()) % 100000
+
+    def _next_tag(self) -> str:
+        """Unique per order (Kite tag, max 20 chars), so a timed-out placement can be found again by tag."""
+        self._seq += 1
+        return f"{self.x.tag}{self._epoch:05d}{self._seq:04d}"[:20]
 
     def _limit(self, l: OrderLeg, mult: float = 1.0) -> float:
         b = min(self.x.limit_buffer_pct * mult, self.x.max_exit_buffer_pct)
         return round_tick(l.ref_price * (1 + b if l.side == BUY else 1 - b), l.contract.tick_size)
 
     def _place(self, l: OrderLeg, product: str, mult: float, market: bool) -> str:
-        return self.client.place_order(l.contract, l.side, l.qty, product, self._limit(l, mult), self.x.tag,
-                                       market=market)
+        """Place one order. A network error does not prove the order was NOT placed, so on any exception the order
+        book is searched for our unique tag; an order found there is adopted instead of being treated as missing."""
+        tag = self._next_tag()
+        try:
+            return self.client.place_order(l.contract, l.side, l.qty, product, self._limit(l, mult), tag,
+                                           market=market)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                oid = self.client.order_by_tag(tag)
+            except Exception:  # noqa: BLE001
+                log.error("Could not search the order book after a failed placement of %s", l.contract.symbol,
+                          exc_info=True)
+                oid = None
+            if oid:
+                log.warning("Placement of %s raised (%s) but the order exists (%s): adopting it",
+                            l.contract.symbol, exc, oid)
+                return oid
+            raise
 
     def _state(self, order_id: str) -> tuple[str, float, int, str]:
         h = self.client.order_history(order_id)[-1]
         return (h["status"], float(h.get("average_price") or 0), int(h.get("filled_quantity") or 0),
                 str(h.get("status_message") or ""))
+
+    def _final_state(self, order_id: str, last: tuple[str, float, int, str]) -> tuple[str, float, int, str]:
+        """After a cancel request the exchange may still be filling: wait (briefly) for a final status so a late
+        partial fill is not missed."""
+        state = last
+        for _ in range(6):
+            try:
+                state = self._state(order_id)
+            except Exception:  # noqa: BLE001
+                log.warning("Could not re-read order %s after cancel", order_id, exc_info=True)
+            if state[0] in ("COMPLETE", "REJECTED", "CANCELLED"):
+                break
+            self._sleep(0.5)
+        return state
 
     def _settle(self, orders: dict[str, OrderLeg]) -> dict[str, tuple[str, float, int, str]]:
         """Poll until every order is final (COMPLETE/REJECTED/CANCELLED) or the fill timeout passes."""
@@ -221,10 +259,7 @@ class LiveBroker:
                         self.client.cancel_order(oid)
                     except Exception:  # noqa: BLE001
                         log.exception("Cancel failed for %s", oid)
-                    try:
-                        status, avg, filled, msg = self._state(oid)     # a partial fill may have landed
-                    except Exception:  # noqa: BLE001
-                        log.exception("Could not re-read order %s after cancel", oid)
+                    status, avg, filled, msg = self._final_state(oid, (status, avg, filled, msg))
                 log.error("Leg %s %s not filled: status=%s filled=%d/%d %s", l.side, l.contract.symbol,
                           status, filled, l.qty, msg)
             if filled:
@@ -237,6 +272,7 @@ class LiveBroker:
                 market: bool = False) -> Optional[dict[str, float]]:
         """Two-phase placement. Returns {symbol: fill price} when every leg filled completely, else None
         (after unwinding anything that did fill)."""
+        self.unresolved = []
         buys = [l for l in legs if l.side == BUY]
         sells = [l for l in legs if l.side != BUY]
         done: list[tuple[OrderLeg, float, int]] = []
@@ -253,6 +289,7 @@ class LiveBroker:
         """Close a structure. Unlike entry there is NO unwind: whatever closed stays closed and the caller retries
         the remainder. Shorts are bought back first; the longs are only sold once every buy-back is confirmed, so the
         hedge is never removed while a short is still open. Returns {symbol: (avg price, filled qty)}."""
+        self.unresolved = []
         buys = [l for l in legs if l.side == BUY]
         sells = [l for l in legs if l.side != BUY]
         done: list[tuple[OrderLeg, float, int]] = []
@@ -268,12 +305,26 @@ class LiveBroker:
         return out
 
     def _unwind(self, done: list[tuple[OrderLeg, float, int]], product: str) -> None:
-        """Reverse what filled: buy back shorts first, then sell longs. Marketable limit with a wide buffer."""
-        rev = reverse_legs([OrderLeg(l.contract, l.side, q, l.ref_price) for l, _a, q in done])
-        for r in sorted(rev, key=lambda x: x.side != BUY):
-            try:
-                oid = self.client.place_order(r.contract, r.side, r.qty, product, self._limit(r, 3.0),
-                                              self.x.tag, market=False)
-                log.warning("Unwind order %s: %s %s x%d", oid, r.side, r.contract.symbol, r.qty)
-            except Exception:  # noqa: BLE001
-                log.critical("UNWIND FAILED for %s: close manually!", r.contract.symbol, exc_info=True)
+        """Reverse what filled (shorts bought back first, then longs sold) and VERIFY it: marketable limit first, then
+        MARKET. Anything still open is recorded in `self.unresolved` so the caller halts trading and alerts."""
+        pending = sorted(reverse_legs([OrderLeg(l.contract, l.side, q, l.ref_price) for l, _a, q in done]),
+                         key=lambda x: x.side != BUY)
+        for attempt, (mult, market) in enumerate(((3.0, False), (1.0, True))):
+            if not pending:
+                break
+            still: list[OrderLeg] = []
+            for r in pending:                       # BUY (cover shorts) strictly before SELL (drop longs)
+                if r.side != BUY and still:
+                    still.append(r)                 # a short is still open: keep its hedge, retry later
+                    continue
+                d: list[tuple[OrderLeg, float, int]] = []
+                ok = self._phase([r], product, mult, market, d)
+                if not ok:
+                    got = sum(q for _l, _a, q in d)
+                    still.append(OrderLeg(r.contract, r.side, r.qty - got, r.ref_price) if got else r)
+            pending = still
+            if pending:
+                log.warning("Unwind attempt %d left %s open", attempt + 1, [p.contract.symbol for p in pending])
+        for r in pending:
+            self.unresolved.append(r.contract.symbol)
+            log.critical("UNWIND NOT CONFIRMED for %s %s x%d: close manually!", r.side, r.contract.symbol, r.qty)

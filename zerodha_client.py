@@ -245,14 +245,17 @@ class ZerodhaClient:
     def _on_ticks(self, _ws, ticks: list[dict]) -> None:
         now = time.monotonic()
         for t in ticks:
-            tok = t["instrument_token"]
-            self._ticks[tok] = (t["last_price"], now)
-            if tok in self._full_subs and ("oi" in t or "volume_traded" in t):
-                depth = t.get("depth") or {}
-                buy, sell = depth.get("buy") or [], depth.get("sell") or []
-                self._flow[tok] = {
-                    "mono": now, "ltp": t["last_price"], "oi": t.get("oi"), "volume": t.get("volume_traded"),
-                    "bid": buy[0].get("price") if buy else None, "ask": sell[0].get("price") if sell else None}
+            try:                                   # one malformed tick must never kill the stream thread
+                tok = t["instrument_token"]
+                self._ticks[tok] = (t["last_price"], now)
+                if tok in self._full_subs and ("oi" in t or "volume_traded" in t):
+                    depth = t.get("depth") or {}
+                    buy, sell = depth.get("buy") or [], depth.get("sell") or []
+                    self._flow[tok] = {
+                        "mono": now, "ltp": t["last_price"], "oi": t.get("oi"), "volume": t.get("volume_traded"),
+                        "bid": buy[0].get("price") if buy else None, "ask": sell[0].get("price") if sell else None}
+            except Exception:  # noqa: BLE001
+                log.warning("Bad tick ignored: %r", t, exc_info=True)
 
     def subscribe_tokens(self, mapping: dict[int, str]) -> None:
         self._keys.update(mapping)
@@ -311,7 +314,13 @@ class ZerodhaClient:
             kw.update(order_type=KiteConnect.ORDER_TYPE_MARKET, market_protection=-1)
         else:
             kw.update(order_type=KiteConnect.ORDER_TYPE_LIMIT, price=price)
-        return self._call(self.kite.place_order, retries=0, limiter=self._order_limit, **kw)
+        try:
+            return self._call(self.kite.place_order, retries=0, limiter=self._order_limit, **kw)
+        except TypeError:               # older kiteconnect without market_protection: retry once without it
+            if "market_protection" not in kw:
+                raise
+            kw.pop("market_protection")
+            return self._call(self.kite.place_order, retries=0, limiter=self._order_limit, **kw)
 
     def modify_order(self, order_id: str, price: float) -> str:
         return self._call(self.kite.modify_order, variety=KiteConnect.VARIETY_REGULAR,
@@ -320,6 +329,13 @@ class ZerodhaClient:
     def cancel_order(self, order_id: str) -> str:
         return self._call(self.kite.cancel_order, variety=KiteConnect.VARIETY_REGULAR,
                           order_id=order_id, limiter=self._order_limit)
+
+    def order_by_tag(self, tag: str) -> Optional[str]:
+        """Order id of today's order carrying this unique tag (used to resolve a timed-out placement), else None."""
+        for o in self._call(self.kite.orders):
+            if o.get("tag") == tag[:20] or tag[:20] in (o.get("tags") or []):
+                return str(o["order_id"])
+        return None
 
     def order_history(self, order_id: str) -> list[dict]:
         return self._call(self.kite.order_history, order_id)

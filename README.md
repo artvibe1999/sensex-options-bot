@@ -87,6 +87,16 @@ the remainder is retried (wider limit, then MARKET), and the longs are never sol
 `tests/test_execution.py` script a mock Kite client (fill, partial, reject, hang, network error) and assert the order
 sequence.
 
+### Live-readiness hardening (audit)
+- Every order carries a unique tag; if a placement raises (timeout) the order book is searched by tag and a found order is adopted, never re-sent.
+- After a cancel the order is polled to a final status so a late partial fill is not missed.
+- Unwinds are verified (marketable limit, then MARKET); anything unconfirmed is reported, trading halts and a CRITICAL alert fires.
+- Failed entries cool down (2 min x failures), halt the day after 3, and the broker position book must be flat afterwards.
+- Persistently incomplete exits halt new entries; partial exits verify the remaining legs.
+- An open position is still managed at square-off time if the tick feed looks stalled (REST prices).
+- A malformed tick can no longer kill the WebSocket callback; `market_protection` falls back for older kiteconnect.
+- Not testable without a live broker: real Kite status strings/latency, market-protection semantics, margin API shape. Stay in paper until forward evidence.
+
 ## Trends, traps and account-size tiers
 
 **Valid trend / trap detection** (`trend_regime.py`). A *valid* trend is a clean one-directional move (high

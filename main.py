@@ -117,6 +117,9 @@ class Bot:
         self._auth_alerted = False
         self._halt_alerted = False
         self._exit_failures = 0
+        self._entry_failures = 0
+        self._entry_block_until = 0.0
+        self._stall_alerted = False
         self._last_state_save = 0.0
         self._last_heartbeat = 0.0
         self._last_flow = 0.0
@@ -210,7 +213,14 @@ class Bot:
         if not self.session_ready and not self._ensure_session(now):
             return
         if not self.client.market_is_live():
+            if self.position and now.time() >= self.cfg.schedule.square_off:
+                if not self._stall_alerted:           # never leave a position unmanaged at square-off time
+                    self._stall_alerted = True
+                    self.alerts.send("Market feed looks stalled but a position is open at square-off time: "
+                                     "trying to exit using REST prices.", level="CRITICAL", key="feed-stall")
+                self._manage(now)
             return                                    # pre-open, holiday or stalled feed
+        self._stall_alerted = False
         snap = self.md.snapshot(now)
         if snap.fresh:
             full = time.monotonic() - self._last_chain_rec >= self.cfg.chain_record_every_s
@@ -384,7 +394,7 @@ class Bot:
         if not snap.fresh or snap.chain is None or not self.approved:
             return
         ok, why = self.risk.entry_allowed(now, self.trades_today)
-        if not ok:
+        if not ok or time.monotonic() < self._entry_block_until:
             return
         candidates: list[tuple[float, TradePlan]] = []
         for vid, score in self.approved.items():
@@ -424,9 +434,9 @@ class Bot:
                 return
         fills = self.broker.execute(legs, self.cfg.execution.product)
         if not fills:
-            self.alerts.send(f"Entry failed for {plan.variant_id}", level="ERROR", key="entry-fail")
-            self.rec.event(ts, "entry_failed", plan.variant_id, {"lots": lots})
+            self._entry_failed(ts, plan, lots, legs)
             return
+        self._entry_failures = 0
         self.client.subscribe_tokens({l.contract.token: l.contract.key for l in plan.legs})
         self.position = ManagedPosition(
             plan, lots, [OpenLeg(l.contract, l.side, l.qty, fills[l.contract.symbol]) for l in legs],
@@ -443,6 +453,23 @@ class Bot:
              round(l.ref_price, 2), round(fills[l.contract.symbol], 2), plan.rationale[:120]] for l in legs])
         self.alerts.send(f"ENTRY {plan.name} x{lots} [{plan.variant_id}] {plan.rationale}")
         self._verify_positions({l.contract.symbol: (l.qty if l.side == "BUY" else -l.qty) for l in legs}, "entry")
+
+    def _entry_failed(self, ts: str, plan: TradePlan, lots: int, legs: list[OrderLeg]) -> None:
+        """A failed entry was cancelled/unwound by the broker. Never retry immediately (a rejected order would be
+        re-sent every loop): cool down, count failures, and halt the day after repeated ones or an unconfirmed unwind."""
+        self._entry_failures += 1
+        self._entry_block_until = time.monotonic() + 120.0 * self._entry_failures
+        self.alerts.send(f"Entry failed for {plan.variant_id} (failure {self._entry_failures} today)",
+                         level="ERROR", key="entry-fail")
+        self.rec.event(ts, "entry_failed", plan.variant_id, {"lots": lots})
+        unresolved = list(getattr(self.broker, "unresolved", []) or [])
+        if unresolved:
+            self.risk.halt("UNWIND_UNCONFIRMED")
+            self.alerts.send(f"UNWIND NOT CONFIRMED for {unresolved}: a partial entry may still be open. "
+                             "Trading halted: check and close in Kite NOW.", level="CRITICAL", key="unwind")
+        elif self._entry_failures >= 3:
+            self.risk.halt("REPEATED_ENTRY_FAILURES")
+        self._verify_positions({l.contract.symbol: 0 for l in legs}, "failed entry")   # must be flat
 
     def _verify_positions(self, expected: dict[str, int], what: str) -> None:
         """Live only: compare the broker's net positions with what the bot believes it holds for these symbols.
@@ -488,12 +515,16 @@ class Bot:
             for o in closed])
         if remaining:
             pos.legs = remaining
+            if self._exit_failures >= 2:               # persistent: stop new risk while it is sorted out
+                self.risk.halt("EXIT_NOT_COMPLETING")
             self._exit_failures += 1
             self._save_state()
             left = ", ".join(f"{l.side} {l.contract.symbol} x{l.qty}" for l in remaining)
             self.alerts.send(f"EXIT INCOMPLETE ({reason}), attempt {self._exit_failures}; still open: {left}. "
                              "Retrying with a wider limit, then market orders. Check Kite if this repeats.",
                              level="CRITICAL", key=f"exit-fail-{self._exit_failures}")
+            self._verify_positions({l.contract.symbol: (l.qty if l.side == "BUY" else -l.qty) for l in remaining},
+                                   "partial exit")
             return
         self.position, self._exit_failures = None, 0
         log.info("EXIT %s reason=%s net=%.0f day=%.0f", pos.plan.variant_id, reason, net, self.realized)

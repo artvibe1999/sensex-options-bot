@@ -45,9 +45,19 @@ class MockKite:
             raise TimeoutError("simulated network timeout")
         self._n += 1
         oid = f"OID{self._n}"
-        self._orders[oid] = {"c": c, "side": side, "qty": qty, "price": price, "mode": mode, "cancelled": False}
+        self._orders[oid] = {"c": c, "side": side, "qty": qty, "price": price, "mode": mode, "cancelled": False,
+                             "tag": tag}
+        if mode == "raise_placed":              # order reached the exchange but the reply was lost
+            self.log.append(("place", side, c.symbol, qty, market))
+            raise TimeoutError("simulated lost reply")
         self.log.append(("place", side, c.symbol, qty, market))
         return oid
+
+    def order_by_tag(self, tag):
+        for oid, o in self._orders.items():
+            if o.get("tag") == tag:
+                return oid
+        return None
 
     def order_history(self, oid):
         o = self._orders[oid]

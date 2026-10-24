@@ -124,7 +124,7 @@ class ExecutionTests(unittest.TestCase):
         kite = sh.MockKite()
         legs = self.legs("bull_call_spread")
         buy = next(l for l in legs if l.side == "BUY")
-        kite.behaviour[buy.contract.symbol] = "partial"
+        kite.behaviour[(buy.contract.symbol, "BUY")] = "partial"
         self.assertIsNone(self.broker(kite).execute(legs, "MIS"))
         unwind = [(s, q) for k, s, sym, q, _m in kite.log if k == "place" and sym == buy.contract.symbol][-1]
         self.assertEqual(unwind, ("SELL", buy.qty // 2))
@@ -250,6 +250,50 @@ class SessionTests(unittest.TestCase):
                     self.assertIn(r.reason, {"HARD_STOP", "TAKE_PROFIT", "TRAILING_STOP", "SQUARE_OFF_TIME"})
                     self.assertLessEqual(r.exit_time, dt.time(15, 16))     # never held past the square-off time
                     self.assertGreaterEqual(r.pnl, -1.25 * r.max_loss)     # stop slippage allowance only
+
+
+class HardeningTests(unittest.TestCase):
+    def broker(self, kite):
+        return LiveBroker(kite, sh.fast_cfg(), sleep=lambda _s: None)
+
+    def legs(self, key="bull_call_spread", lots=1):
+        return sh.order_legs(sh.plan_from_strategy(STRATEGY_CLASSES[key](), CHAIN), lots)
+
+    def test_lost_reply_order_is_adopted_not_duplicated(self):
+        kite = sh.MockKite()
+        legs = self.legs()
+        buy = next(l for l in legs if l.side == "BUY")
+        kite.behaviour[(buy.contract.symbol, "BUY")] = "raise_placed"
+        fills = self.broker(kite).execute(legs, "MIS")
+        self.assertIsNotNone(fills)
+        placed = [(s, sym) for k, s, sym, *_ in kite.log if k == "place" and sym == buy.contract.symbol and s == "BUY"]
+        self.assertEqual(len(placed), 1)                            # never sent twice
+
+    def test_tags_are_unique_and_within_kite_limit(self):
+        b = self.broker(sh.MockKite())
+        tags = {b._next_tag() for _ in range(50)}
+        self.assertEqual(len(tags), 50)
+        self.assertTrue(all(len(t) <= 20 for t in tags))
+
+    def test_unconfirmed_unwind_is_reported(self):
+        kite = sh.MockKite()
+        legs = self.legs()
+        sell = next(l for l in legs if l.side == "SELL")
+        buy = next(l for l in legs if l.side == "BUY")
+        kite.behaviour[(sell.contract.symbol, "SELL")] = "reject"       # entry fails at the SELL leg
+        kite.behaviour[(buy.contract.symbol, "SELL")] = "hang"          # and the long can never be sold back
+        b = self.broker(kite)
+        self.assertIsNone(b.execute(legs, "MIS"))
+        self.assertIn(buy.contract.symbol, b.unresolved)
+
+    def test_clean_unwind_leaves_nothing_unresolved(self):
+        kite = sh.MockKite()
+        legs = self.legs()
+        sell = next(l for l in legs if l.side == "SELL")
+        kite.behaviour[(sell.contract.symbol, "SELL")] = "reject"
+        b = self.broker(kite)
+        self.assertIsNone(b.execute(legs, "MIS"))
+        self.assertEqual(b.unresolved, [])
 
 
 if __name__ == "__main__":
