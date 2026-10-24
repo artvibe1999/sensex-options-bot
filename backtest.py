@@ -118,6 +118,36 @@ def expiry_weekday_on(day: dt.date, bp: BacktestParams) -> int:
     return wd
 
 
+def exchange_expiries(db_path: str, listed: Optional[list[dt.date]] = None) -> tuple[list[dt.date], Optional[dt.date]]:
+    """Expiry dates the exchange actually listed, as observed by this bot: every expiry in the recorded `chain` table
+    plus today's instruments listing. Returns (sorted dates, first recorded day). Kite does not serve expired
+    contracts, so before the first recorded day the dated schedule in BacktestParams is used instead."""
+    import sqlite3
+    found: set[dt.date] = set(listed or [])
+    first: Optional[dt.date] = None
+    if db_path and os.path.exists(db_path):
+        try:
+            con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            found |= {dt.date.fromisoformat(e) for (e,) in con.execute("SELECT DISTINCT expiry FROM chain")}
+            r = con.execute("SELECT MIN(substr(ts,1,10)) FROM chain").fetchone()
+            first = dt.date.fromisoformat(r[0]) if r and r[0] else None
+            con.close()
+        except (sqlite3.Error, ValueError):
+            log.warning("Could not read recorded expiries from %s", db_path, exc_info=True)
+    return sorted(found), first
+
+
+def expiry_for(day: dt.date, bp: BacktestParams, known: Optional[list[dt.date]] = None,
+               known_from: Optional[dt.date] = None) -> dt.date:
+    """Expiry the bot would have traded on `day`: the exchange's own listed date where recorded, else the weekday
+    schedule. 0-DTE is excluded, like the live bot."""
+    if known and known_from and day >= known_from:
+        nxt = [e for e in known if 1 <= (e - day).days <= 8]
+        if nxt:
+            return min(nxt)
+    return next_expiry(day, expiry_weekday_on(day, bp))
+
+
 def next_expiry(day: dt.date, weekday: int) -> dt.date:
     delta = (weekday - day.weekday()) % 7
     return day + dt.timedelta(days=delta or 7)          # 0-DTE excluded, like the live bot
@@ -171,7 +201,8 @@ def simulate_trade(plan, spec: StrategySpec, bar: dict, iv_entry: float, iv_exit
 
 
 def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams,
-                 bp: BacktestParams, costs: CostParams, warmup: int = 30) -> dict[str, list[Trade]]:
+                 bp: BacktestParams, costs: CostParams, warmup: int = 30,
+                 known: Optional[list[dt.date]] = None, known_from: Optional[dt.date] = None) -> dict[str, list[Trade]]:
     results: dict[str, list[Trade]] = {s.id: [] for s in specs}
     det = RegimeDetector(sp)
     candles: list[dict] = []
@@ -179,7 +210,7 @@ def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams
         if i >= warmup:
             vix_prev = bars[i - 1]["vix"]
             rs = det.update(vix_prev, candles[-60:], t=i * 86400.0)
-            expiry = next_expiry(bar["date"], expiry_weekday_on(bar["date"], bp))
+            expiry = expiry_for(bar["date"], bp, known, known_from)
             if sp.min_dte <= (expiry - bar["date"]).days <= sp.max_dte:
                 now = dt.datetime.combine(bar["date"], dt.time(9, 30), tzinfo=IST)
                 iv0, iv1 = vix_prev / 100 * bp.iv_scale, bar["vix"] / 100 * bp.iv_scale
@@ -317,12 +348,16 @@ def load_csv(index_csv: str, vix_csv: str) -> list[dict]:
     return bars
 
 
+_LISTED: list[dt.date] = []          # expiries in today's instruments dump (filled by fetch_kite)
+
+
 def fetch_kite(days: int, out_dir: str) -> tuple[str, str]:
     from zerodha_client import ZerodhaClient     # imported lazily: needs kiteconnect + a valid token
     cfg = load_config()
     client = ZerodhaClient(cfg.credentials, cfg.paths.token_file)
     client.authenticate()
     client.load_instruments()
+    _LISTED[:] = client.expiries()
     end = dt.datetime.now(IST)
     start = end - dt.timedelta(days=days)
     os.makedirs(out_dir, exist_ok=True)
@@ -392,13 +427,25 @@ def main() -> int:
     specs = build_library()
     log.info("Backtesting %d variants over %d days (%s to %s)", len(specs), len(bars),
              bars[0]["date"], bars[-1]["date"])
-    results = run_backtest(bars, specs, sp, bp, costs)
+    known, known_from = exchange_expiries(os.path.join(args.out_dir, "sxbot.db"), _LISTED)
+    if known_from:
+        log.info("Using the exchange's own expiry dates from %s (%d recorded/listed); the dated schedule before that",
+                 known_from, len(known))
+    else:
+        log.info("No recorded expiries yet: using the dated weekday schedule (Fri -> Tue 2025-01-01 -> Thu 2025-09-01)")
+    for e in known:
+        if e >= dt.date.today() and bp.expiry_weekday < 0 and e.weekday() != expiry_weekday_on(e, bp):
+            log.warning("Listed expiry %s is a %s but the schedule says weekday %d: the weekly expiry day may have "
+                        "changed again", e, e.strftime("%A"), expiry_weekday_on(e, bp))
+            break
+    results = run_backtest(bars, specs, sp, bp, costs, known=known, known_from=known_from)
     dates = [b["date"] for b in bars[30:]]
     c = Criteria()
     wf_rows, per_variant = walk_forward(results, dates, c)
     # Stress gate: the model's fills are the weakest assumption, so an approval must also survive DOUBLE slippage.
     import dataclasses
-    stress = run_backtest(bars, specs, sp, dataclasses.replace(bp, slippage_pct=2 * bp.slippage_pct), costs)
+    stress = run_backtest(bars, specs, sp, dataclasses.replace(bp, slippage_pct=2 * bp.slippage_pct), costs,
+                          known=known, known_from=known_from)
     stress_ok = {vid: (lambda s: s["net"] > 0 and s["pf"] >= 1.0)(stats(tr)) for vid, tr in stress.items()}
     dropped = [vid for vid, v in per_variant.items() if v["approved"] and not stress_ok.get(vid, False)]
     for vid in dropped:

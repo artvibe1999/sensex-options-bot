@@ -29,6 +29,26 @@ class BacktestAuditTests(unittest.TestCase):
         forced = BacktestParams(expiry_weekday=2)
         self.assertEqual(bt.expiry_weekday_on(dt.date(2024, 6, 3), forced), 2)
 
+    def test_listed_expiries_override_the_schedule(self):
+        known = [dt.date(2026, 10, 21), dt.date(2026, 10, 28)]          # a Wednesday series: not in the schedule
+        first = dt.date(2026, 10, 15)
+        self.assertEqual(bt.expiry_for(dt.date(2026, 10, 22), BP, known, first), dt.date(2026, 10, 28))
+        self.assertEqual(bt.expiry_for(dt.date(2026, 10, 20), BP, known, first), dt.date(2026, 10, 21))
+        self.assertEqual(bt.expiry_for(dt.date(2026, 10, 21), BP, known, first), dt.date(2026, 10, 28))   # no 0-DTE
+        # before the first recorded day the dated schedule applies (Thursday era)
+        self.assertEqual(bt.expiry_for(dt.date(2025, 10, 1), BP, known, first), dt.date(2025, 10, 2))
+        self.assertEqual(bt.expiry_for(dt.date(2025, 10, 1), BP), dt.date(2025, 10, 2))
+
+    def test_recorded_expiries_are_read_from_the_database(self):
+        with tempfile.TemporaryDirectory() as d:
+            rec = recorder.Recorder(os.path.join(d, "x.db"))
+            rec._write("INSERT INTO chain VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       [("2026-10-20T10:00:00+05:30", "2026-10-21", 80000.0, "CE", 100.0, 0, 0.1, 0, 0, 0, 0)])
+            rec.close()
+            known, first = bt.exchange_expiries(os.path.join(d, "x.db"), [dt.date(2026, 11, 4)])
+            self.assertEqual(known, [dt.date(2026, 10, 21), dt.date(2026, 11, 4)])
+            self.assertEqual(first, dt.date(2026, 10, 20))
+
     def test_bad_input_bars_are_dropped(self):
         with tempfile.TemporaryDirectory() as d:
             day, rows = dt.date(2023, 1, 2), []
