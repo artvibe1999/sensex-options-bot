@@ -296,10 +296,13 @@ class ZerodhaClient:
     def get_ltp(self, token: int, max_age_s: float = 5.0) -> float:
         """Streamed LTP if fresh, else REST fallback."""
         tick = self._ticks.get(token)
-        if tick and time.monotonic() - tick[1] <= max_age_s:
+        if tick and tick[0] > 0 and time.monotonic() - tick[1] <= max_age_s:
             return tick[0]
         key = self._keys[token]
-        return float(self.quote([key])[key]["last_price"])
+        px = float(self.quote([key])[key]["last_price"])
+        if not px > 0:                          # a zero/NaN price must never reach sizing, stops or the chain
+            raise ValueError(f"No valid price for {key}: {px}")
+        return px
 
     # ---------------------------------------------------------------- orders
     def place_order(self, c: OptionContract, side: str, qty: int, product: str,

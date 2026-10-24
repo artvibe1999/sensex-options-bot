@@ -22,6 +22,26 @@ from config import load_config
 from strategy_engine import implied_vol
 
 
+def spread_report(con, cfg) -> None:
+    """Real half-spread of tradable-priced options from the recorded depth (table `flow`), vs the slippage the
+    backtest charges per fill. Executable prices (buy at ask, sell at bid) are what the live bot actually gets."""
+    try:
+        rows = con.execute("SELECT bid, ask FROM flow WHERE bid>0 AND ask>=bid AND ltp BETWEEN 15 AND 600 "
+                           "AND ts>=?", ("0000",)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    if len(rows) < 500:
+        print("spread data    : not enough depth rows yet (table `flow`)")
+        return
+    half = sorted((a - b) / (a + b) for b, a in rows)            # half-spread as a fraction of mid
+    med, p90 = half[len(half) // 2], half[int(0.9 * (len(half) - 1))]
+    used = cfg.backtest.slippage_pct
+    print(f"half-spread of 15-600 Rs options: median {med:.2%}   90th pct {p90:.2%}   (rows {len(half)})")
+    print(f"BT_SLIPPAGE_PCT in use: {used:.2%}   suggested >= {max(med, 0.005):.2%}")
+    if med > used:
+        print("-> The backtest charges LESS per fill than the real half-spread: it is optimistic. Raise BT_SLIPPAGE_PCT.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--since", default="0000", help="only rows with ts >= this (e.g. 2026-10-22)")
@@ -54,6 +74,7 @@ def main() -> int:
         if len(ivs) < 2 or not 0.02 < statistics.mean(ivs) < 2.0:
             continue
         ratios.append(statistics.mean(ivs) * 100.0 / vix)
+    spread_report(con, cfg)
     used = cfg.backtest.iv_scale
     print(f"snapshots used: {len(ratios)} of {len(rows)} (since {args.since})")
     if len(ratios) < 100:

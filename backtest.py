@@ -396,6 +396,14 @@ def main() -> int:
     dates = [b["date"] for b in bars[30:]]
     c = Criteria()
     wf_rows, per_variant = walk_forward(results, dates, c)
+    # Stress gate: the model's fills are the weakest assumption, so an approval must also survive DOUBLE slippage.
+    import dataclasses
+    stress = run_backtest(bars, specs, sp, dataclasses.replace(bp, slippage_pct=2 * bp.slippage_pct), costs)
+    stress_ok = {vid: (lambda s: s["net"] > 0 and s["pf"] >= 1.0)(stats(tr)) for vid, tr in stress.items()}
+    dropped = [vid for vid, v in per_variant.items() if v["approved"] and not stress_ok.get(vid, False)]
+    for vid in dropped:
+        per_variant[vid]["approved"], per_variant[vid]["score"] = False, 0.0
+    print(f"Stress test (2x slippage): {len(dropped)} otherwise-approved variants dropped")
     approved = sorted((v for v in per_variant.values() if v["approved"]), key=lambda v: -v["score"])
     # ---- capital tiers: same trades, sized and costed for a small / medium / large account
     rp = cfg.risk if cfg else RiskParams()
@@ -403,6 +411,9 @@ def main() -> int:
     tiers_ok: dict[str, dict[str, dict]] = {}
     for tier, cap in TIER_CAPITAL.items():
         _, pv = walk_forward(tier_results(results, cap, rp, sched, costs), dates, c)
+        for vid in dropped:
+            if vid in pv:
+                pv[vid]["approved"], pv[vid]["score"] = False, 0.0
         tiers_ok[tier] = pv
         print(f"Tier {tier:<6} (Rs {cap:>9,.0f}): approved {sum(1 for v in pv.values() if v['approved'])} variants")
     for v in approved:

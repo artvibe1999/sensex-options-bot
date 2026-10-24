@@ -105,6 +105,8 @@ sequence.
 - Shadow book fills at the ask (buys) / bid (sells), skips structures the live bot would refuse (`validate_plan_quotes`), squares off at 15:15 even if the feed is stale, and no longer re-enters a variant after a restart. Earlier shadow results (e.g. day 1) were optimistic: treat them as discarded.
 - `promote.py` also requires the mean net per trade to be >= 1.0 standard error above zero (`--min-t`).
 - Daily-history cache older than 7 days is ignored (fail closed).
+- Backtest approvals must also survive DOUBLE slippage (stress gate); `BT_SLIPPAGE_PCT` is configurable and `calibrate.py` now compares it with the real recorded half-spread.
+- `get_ltp` rejects zero/NaN prices instead of passing them to sizing, stops or the chain.
 
 ## Trends, traps and account-size tiers
 

@@ -129,5 +129,18 @@ class ShadowAuditTests(unittest.TestCase):
         self.assertFalse(book.open)
 
 
+class PriceGuardTests(unittest.TestCase):
+    def test_zero_price_never_reaches_the_bot(self):
+        import time
+        from zerodha_client import ZerodhaClient
+        c = object.__new__(ZerodhaClient)
+        c._ticks, c._keys = {1: (0.0, time.monotonic())}, {1: "BSE:SENSEX"}
+        c.quote = lambda keys: {keys[0]: {"last_price": 0}}
+        with self.assertRaises(ValueError):
+            c.get_ltp(1)
+        c.quote = lambda keys: {keys[0]: {"last_price": 80123.5}}
+        self.assertEqual(c.get_ltp(1), 80123.5)             # a bad stream tick falls back to REST
+
+
 if __name__ == "__main__":
     unittest.main()
