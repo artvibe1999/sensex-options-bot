@@ -31,6 +31,18 @@ def _pf(nets: list[float]) -> float:
     return 99.0 if losses == 0 and wins > 0 else (wins / losses if losses else 0.0)
 
 
+def _tstat(nets: list[float]) -> float:
+    """t-statistic of the mean net P&L per trade (how many standard errors above zero the edge is)."""
+    n = len(nets)
+    if n < 2:
+        return 0.0
+    mean = sum(nets) / n
+    var = sum((x - mean) ** 2 for x in nets) / (n - 1)
+    if var <= 0:
+        return 99.0 if mean > 0 else 0.0
+    return mean / (var / n) ** 0.5
+
+
 def _tier_nets(rows: list[tuple[float, float]], capital: float) -> list[float]:
     """Forward one-lot results (net, max_loss) re-expressed for an account size: n lots from the real sizing rule,
     trades that do not fit are skipped. Costs are scaled with n too, which slightly OVERstates them (conservative)."""
@@ -54,6 +66,9 @@ def main() -> int:
     ap.add_argument("--min-pf", type=float, default=1.2)
     ap.add_argument("--min-trades-oi", type=int, default=40, help="forward trades needed by OI-rule variants")
     ap.add_argument("--min-pf-oi", type=float, default=1.3)
+    ap.add_argument("--min-t", type=float, default=1.0,
+                    help="mean net per trade must be this many standard errors above zero (guards against luck: "
+                         "with ~1000 variants some always look good on 20 trades). 0 disables.")
     ap.add_argument("--lookback-days", type=int, default=90, help="forward window considered")
     ap.add_argument("--valid-days", type=int, default=30)
     args = ap.parse_args()
@@ -77,7 +92,7 @@ def main() -> int:
         out = []
         for tier, cap in TIER_CAPITAL.items():
             nets = _tier_nets(fwd_rows.get(vid, []), cap)
-            if len(nets) >= min_n and sum(nets) > 0 and _pf(nets) >= min_pf:
+            if len(nets) >= min_n and sum(nets) > 0 and _pf(nets) >= min_pf and _tstat(nets) >= args.min_t:
                 out.append(tier)
         return out
 
@@ -85,7 +100,7 @@ def main() -> int:
     for v in bt["variants"]:
         nets = fwd.get(v["id"], [])
         n, total, pf = len(nets), sum(nets), _pf(nets)
-        ok = n >= args.min_trades and total > 0 and pf >= args.min_pf
+        ok = n >= args.min_trades and total > 0 and pf >= args.min_pf and _tstat(nets) >= args.min_t
         rows.append((v["id"], n, total, pf, ok))
         if ok:
             ft = fwd_tiers(v["id"], args.min_trades, args.min_pf)
@@ -103,7 +118,8 @@ def main() -> int:
         bn = len(base)
         avg, bavg, bpf = (total / n if n else 0.0), (sum(base) / bn if bn else 0.0), (_pf(base) if bn else 0.0)
         twin_ok = (bn >= 20 and avg > bavg and pf > bpf) if bn >= 20 else spec.intraday_trend
-        ok = n >= args.min_trades_oi and total > 0 and pf >= args.min_pf_oi and twin_ok
+        ok = (n >= args.min_trades_oi and total > 0 and pf >= args.min_pf_oi and twin_ok
+              and _tstat(nets) >= args.min_t)
         oi_rows.append((spec.id, n, total, pf, bn, bavg, ok))
         tiers = fwd_tiers(spec.id, args.min_trades_oi, args.min_pf_oi) if ok else []
         if ok and tiers:

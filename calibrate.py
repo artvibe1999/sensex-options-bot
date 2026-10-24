@@ -13,10 +13,13 @@ Needs a few full trading days of data to mean anything.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import sqlite3
 import statistics
 
+from backtest import _years
 from config import load_config
+from strategy_engine import implied_vol
 
 
 def main() -> int:
@@ -31,11 +34,23 @@ def main() -> int:
     for i, (ts, spot, vix) in enumerate(rows):
         if i % args.every:
             continue
-        ch = con.execute("SELECT strike, kind, iv FROM chain WHERE ts=? AND iv IS NOT NULL AND iv>0", (ts,)).fetchall()
+        ch = con.execute("SELECT expiry, strike, kind, ltp FROM chain WHERE ts=? AND ltp>0", (ts,)).fetchall()
         if not ch:
             continue
-        atm = min({c[0] for c in ch}, key=lambda k: abs(k - spot))
-        ivs = [c[2] for c in ch if c[0] == atm]
+        when = dt.datetime.fromisoformat(ts)
+        atm = min({c[1] for c in ch}, key=lambda k: abs(k - spot))
+        ivs = []
+        for expiry, strike, kind, ltp in ch:
+            if strike != atm:
+                continue
+            exp = dt.date.fromisoformat(expiry)
+            if (exp - when.date()).days < 1:
+                continue                                   # the backtest never trades 0-DTE
+            # SAME clock as the backtest's pricing (trading time, 252 days): the bot's stored IV uses calendar time,
+            # which differs by a DTE-dependent factor (weekends, overnight) and would bias the suggestion.
+            iv = implied_vol(ltp, spot, strike, _years(exp, when), cfg.strategy.risk_free_rate, kind)
+            if iv:
+                ivs.append(iv)
         if len(ivs) < 2 or not 0.02 < statistics.mean(ivs) < 2.0:
             continue
         ratios.append(statistics.mean(ivs) * 100.0 / vix)

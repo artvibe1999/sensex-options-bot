@@ -6,6 +6,8 @@ until validated by ``backtest.py`` and forward-tested in paper mode.
 """
 from __future__ import annotations
 
+import datetime as dt
+
 import os
 from dataclasses import dataclass, field
 from datetime import time
@@ -158,7 +160,11 @@ class BacktestParams:
     """
     strike_step: float = 100.0      # VERIFY against the instruments dump
     lot_size: int = 20              # VERIFY (the live bot reads it from instruments)
-    expiry_weekday: int = 3         # 0=Mon. Thursday is ASSUMED for SENSEX weekly: VERIFY
+    expiry_weekday: int = -1        # -1 = follow `expiry_schedule` (the real history); 0-6 forces one weekday (0=Mon)
+    # SENSEX weekly expiry weekday by effective date: Friday from May 2023, Tuesday from 1 Jan 2025,
+    # Thursday from 1 Sep 2025 (BSE circulars / press reports). VERIFY against the instruments dump.
+    expiry_schedule: tuple = ((dt.date(2023, 5, 1), 4), (dt.date(2025, 1, 1), 1), (dt.date(2025, 9, 1), 3))
+    stop_overshoot: float = 0.10    # a stop fills this fraction worse than its trigger (capped at max loss)
     iv_scale: float = 0.95          # option ATM IV ~= India VIX * scale. This sets the variance risk
                                     # premium the model assumes (VIX is NIFTY-based): CALIBRATE it from
                                     # recorded chain data (table `chain`) before trusting results

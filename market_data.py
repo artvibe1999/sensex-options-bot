@@ -35,6 +35,7 @@ class Snapshot:
     fresh: bool          # True when the chain was rebuilt for this snapshot
     features: Optional[ChainFeatures] = None   # OI / gamma / skew features of the latest chain
     tinfo: Optional[TrendInfo] = None          # valid-trend / trap classification (daily + intraday)
+    trend_daily: Optional[int] = None          # EMA trend of COMPLETED daily closes: the definition the backtest uses
 
 
 class MarketData:
@@ -90,7 +91,11 @@ class MarketData:
                 return c
         except Exception as exc:  # noqa: BLE001
             log.warning("Daily history fetch failed (%s); using cache", exc)
-        self._daily, self._daily_day = self._load_cache(), now.date()
+        cached = self._load_cache()
+        if cached and (now.date() - cached[-1]["date"].date()).days > 7:
+            log.error("Cached daily history is stale (last bar %s): ignoring it", cached[-1]["date"].date())
+            cached = []
+        self._daily, self._daily_day = cached, now.date()
         self._daily_retry_at = time.monotonic() + 600
         if not self._daily:
             log.error("No daily history available: trading disabled until it is")
@@ -155,4 +160,5 @@ class MarketData:
         trend = trend_direction(self.closes_5m(now), self.p)
         return Snapshot(now, spot, vix, rs, self._chain, trend, fresh,
                         self._feat if self._chain is not None else None,
-                        self.trend_info(now, spot, daily))
+                        self.trend_info(now, spot, daily),
+                        trend_direction([c["close"] for c in daily[-60:]], self.p))

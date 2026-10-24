@@ -148,6 +148,16 @@ class Recorder:
         self._write("INSERT INTO shadow_trades VALUES (?,?,?,?,?,?,?,?,?)", [(
             variant, entry_ts, exit_ts, reason, regime, gross, cost, net, max_loss)])
 
+    def entered_on(self, day: str) -> set[str]:
+        """Variants the shadow book already entered on `day` (closed trades or entries lost to a restart)."""
+        lo, hi = day, day + "~"
+        with self._lock:
+            a = self._db.execute("SELECT DISTINCT variant FROM shadow_trades WHERE entry_ts>=? AND entry_ts<?",
+                                 (lo, hi)).fetchall()
+            b = self._db.execute("SELECT DISTINCT variant FROM events WHERE kind='shadow_entry' AND ts>=? AND ts<?",
+                                 (lo, hi)).fetchall()
+        return {v for (v,) in a} | {v for (v,) in b}
+
     def prune_flow(self, keep_days: int, today: str) -> int:
         """Delete flow rows older than keep_days (the 1 s capture is the bulky table). 0 = keep everything."""
         if keep_days <= 0:

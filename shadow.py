@@ -13,8 +13,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-from config import RiskParams, Schedule
+from config import IST, RiskParams, Schedule
 from costs import CostParams, trade_cost
+from execution import validate_plan_quotes
 from market_data import Snapshot
 from recorder import Recorder
 from strategy_engine import Leg, TradePlan
@@ -29,6 +30,7 @@ class _ShadowLeg:
     side: str
     entry: float
     last: float
+    exit_px: float = 0.0            # executable price to close right now (bid for longs, ask for shorts)
 
 
 @dataclass
@@ -53,10 +55,31 @@ class ShadowBook:
         self.costs, self.slip = costs, slippage_pct
         self.open: dict[str, _ShadowPos] = {}
         self.done_today: set[str] = set()
+        try:                        # a restart must not let a variant trade the same day twice
+            self.done_today = set(recorder.entered_on(dt.datetime.now(IST).date().isoformat()))
+        except Exception:  # noqa: BLE001 - e.g. a recorder stub without the method
+            log.warning("Could not restore today's shadow entries", exc_info=True)
+
+    def _entry_px(self, leg: Leg, chain) -> float:
+        """Executable entry price: the ask for a BUY, the bid for a SELL (LTP +/- slippage if depth is missing)."""
+        q = chain.get(leg.contract.strike, leg.contract.kind)
+        if q is not None and q.bid and q.ask and q.ask >= q.bid > 0:
+            px = q.ask if leg.side == "BUY" else q.bid
+        else:
+            px = leg.ref_price * (1 + self.slip if leg.side == "BUY" else 1 - self.slip)
+        return _round(px, leg.contract.tick_size)
+
+    def flatten_if_due(self, now: dt.datetime) -> None:
+        """Called when no fresh chain exists (stalled feed): positions are still closed at square-off time, on their
+        last marks, instead of lingering until the next day's rollover."""
+        if self.open and now.time() >= self.sched.square_off:
+            ts = now.isoformat(timespec="seconds")
+            for vid in list(self.open):
+                self._close(vid, "SQUARE_OFF_STALE", ts)
 
     def reset_day(self) -> None:
         for vid in list(self.open):
-            self._close(vid, "DAY_ROLLOVER", dt.datetime.now().isoformat(timespec="seconds"))
+            self._close(vid, "DAY_ROLLOVER", dt.datetime.now(IST).isoformat(timespec="seconds"))
         self.done_today.clear()
 
     # ---------------------------------------------------------------- stepping
@@ -75,13 +98,15 @@ class ShadowBook:
             plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features, snap.tinfo)
             if plan is None:
                 continue
+            if not validate_plan_quotes(plan, snap.chain).ok:
+                continue            # the live bot would refuse an unquoted / illiquid structure: so does the shadow
             legs = []
             for leg in plan.legs:
-                px = leg.ref_price * (1 + self.slip if leg.side == "BUY" else 1 - self.slip)
-                legs.append(_ShadowLeg(leg, leg.side, _round(px, leg.contract.tick_size), leg.ref_price))
+                legs.append(_ShadowLeg(leg, leg.side, self._entry_px(leg, snap.chain), leg.ref_price, leg.ref_price))
             self.open[spec.id] = _ShadowPos(spec, plan, ts, legs, plan.max_loss_per_lot,
                                             plan.max_profit_per_lot)
             self.done_today.add(spec.id)
+            self.rec.event(ts, "shadow_entry", spec.id, {})
 
     def _mark(self, pos: _ShadowPos, snap: Snapshot) -> float:
         total = 0.0
@@ -90,6 +115,10 @@ class ShadowBook:
                 if snap.chain and snap.chain.expiry == pos.plan.expiry else None
             if q is not None:
                 sl.last = q.ltp
+                if q.bid and q.ask and q.ask >= q.bid > 0:
+                    sl.exit_px = q.bid if sl.side == "BUY" else q.ask
+                else:
+                    sl.exit_px = q.ltp * (1 - self.slip if sl.side == "BUY" else 1 + self.slip)
             sign = 1 if sl.side == "BUY" else -1
             total += sign * (sl.last - sl.entry) * pos.plan.lot_size * sl.leg.ratio
         return total
@@ -119,8 +148,8 @@ class ShadowBook:
         for sl in pos.legs:
             qty = pos.plan.lot_size * sl.leg.ratio
             exit_side = "SELL" if sl.side == "BUY" else "BUY"
-            px = _round(sl.last * (1 - self.slip if exit_side == "SELL" else 1 + self.slip),
-                        sl.leg.contract.tick_size)
+            raw = sl.exit_px or sl.last * (1 - self.slip if exit_side == "SELL" else 1 + self.slip)
+            px = _round(raw, sl.leg.contract.tick_size)
             sign = 1 if sl.side == "BUY" else -1
             gross += sign * (px - sl.entry) * qty
             fills += [(sl.side, sl.entry, qty), (exit_side, px, qty)]

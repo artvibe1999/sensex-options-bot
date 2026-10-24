@@ -229,6 +229,8 @@ class Bot:
             self.rec.record_snapshot(snap, with_chain=full)
             self.shadow.step(snap, now)
             self._record_flow(now, snap)
+        else:
+            self.shadow.flatten_if_due(now)           # stale feed must not leave virtual positions open past square-off
         if self.position:
             self._manage(now)
         elif not self.risk.halted:
@@ -399,7 +401,7 @@ class Bot:
         candidates: list[tuple[float, TradePlan]] = []
         for vid, score in self.approved.items():
             spec = self.spec_by_id.get(vid)
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features, snap.tinfo) if spec else None
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo) if spec else None
             if plan:
                 candidates.append((score, plan))
         candidates.sort(key=lambda c: c[0], reverse=True)

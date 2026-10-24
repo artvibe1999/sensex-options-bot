@@ -107,6 +107,17 @@ class Trade:
     fills: tuple = ()                   # ((side, price, qty), ...) for one lot, to re-cost n lots
 
 
+def expiry_weekday_on(day: dt.date, bp: BacktestParams) -> int:
+    """Weekly-expiry weekday in force on `day`: a forced weekday if configured, else the dated schedule."""
+    if bp.expiry_weekday >= 0:
+        return bp.expiry_weekday
+    wd = bp.expiry_schedule[0][1]
+    for start, weekday in bp.expiry_schedule:
+        if day >= start:
+            wd = weekday
+    return wd
+
+
 def next_expiry(day: dt.date, weekday: int) -> dt.date:
     delta = (weekday - day.weekday()) % 7
     return day + dt.timedelta(days=delta or 7)          # 0-DTE excluded, like the live bot
@@ -148,7 +159,7 @@ def simulate_trade(plan, spec: StrategySpec, bar: dict, iv_entry: float, iv_exit
     p_lo, ex_lo = pnl_at(bar["low"], iv_exit, 3.0)
     worst, w_ex = (p_hi, ex_hi) if p_hi <= p_lo else (p_lo, ex_lo)
     if worst <= -sl:
-        gross, exits, reason = -sl, w_ex, "SL"
+        gross, exits, reason = -min(sl * (1.0 + bp.stop_overshoot), ml), w_ex, "SL"   # stops fill worse than the trigger
     else:
         p_close, c_ex = pnl_at(bar["close"], iv_exit, 5.75)
         if p_close >= tp:
@@ -168,11 +179,11 @@ def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams
         if i >= warmup:
             vix_prev = bars[i - 1]["vix"]
             rs = det.update(vix_prev, candles[-60:], t=i * 86400.0)
-            expiry = next_expiry(bar["date"], bp.expiry_weekday)
+            expiry = next_expiry(bar["date"], expiry_weekday_on(bar["date"], bp))
             if sp.min_dte <= (expiry - bar["date"]).days <= sp.max_dte:
                 now = dt.datetime.combine(bar["date"], dt.time(9, 30), tzinfo=IST)
                 iv0, iv1 = vix_prev / 100 * bp.iv_scale, bar["vix"] / 100 * bp.iv_scale
-                tdir = trend_direction([c["close"] for c in candles], sp)
+                tdir = trend_direction([c["close"] for c in candles[-60:]], sp)   # same input as the live bot
                 tinfo = TrendInfo(daily_state(candles[-60:]))
                 chain = model_chain(bar["open"], iv0, expiry, now, bp, sp.risk_free_rate)
                 for spec in specs:
@@ -286,8 +297,21 @@ def load_csv(index_csv: str, vix_csv: str) -> list[dict]:
                 out[dt.date.fromisoformat(r["date"][:10])] = {k: float(v) for k, v in r.items() if k != "date"}
         return out
     idx, vix = read(index_csv), read(vix_csv)
-    bars = [{"date": d, "open": r["open"], "high": r["high"], "low": r["low"], "close": r["close"],
-             "vix": vix[d]["close"]} for d, r in sorted(idx.items()) if d in vix]
+    bars, bad = [], 0
+    for d, r in sorted(idx.items()):
+        if d not in vix:
+            continue
+        o, h, l, c, v = r["open"], r["high"], r["low"], r["close"], vix[d]["close"]
+        vals = (o, h, l, c, v)
+        if any(x != x or x <= 0 for x in vals) or h < l or not (l <= o <= h) or not (l <= c <= h) or v > 150:
+            bad += 1                                  # zero/NaN/inconsistent bars would corrupt prices and IV
+            continue
+        bars.append({"date": d, "open": o, "high": h, "low": l, "close": c, "vix": v})
+    if bad:
+        log.warning("Dropped %d invalid bar(s) from the input data", bad)
+    jumps = [bars[i]["date"] for i in range(1, len(bars)) if abs(bars[i]["open"] / bars[i - 1]["close"] - 1) > 0.10]
+    if jumps:
+        log.warning("Gaps > 10%% between close and next open on %s: check for splits or bad data", jumps[:5])
     if len(bars) < 300:
         raise SystemExit(f"Only {len(bars)} aligned days; need at least ~300 for a meaningful walk-forward")
     return bars

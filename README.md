@@ -97,6 +97,15 @@ sequence.
 - A malformed tick can no longer kill the WebSocket callback; `market_protection` falls back for older kiteconnect.
 - Not testable without a live broker: real Kite status strings/latency, market-protection semantics, margin API shape. Stay in paper until forward evidence.
 
+### Testing / promotion audit (backtest, shadow book, calibrate, promote)
+- The backtest's trend filter used EMA on **daily** closes while the live bot used 5-minute closes, so `with`/`flat` approvals were validated on a different signal than the one traded. Live plan-building now uses `Snapshot.trend_daily` (same input as the backtest); the 5-minute trend is still recorded.
+- Weekly-expiry weekday follows the real history (Friday -> Tuesday from 1 Jan 2025 -> Thursday from 1 Sep 2025) instead of a fixed Thursday; set `expiry_weekday` to force one. Verify against your instruments dump.
+- Stops in the backtest fill 10% worse than the trigger (capped at max loss); CSV bars with zero/NaN/inconsistent prices are dropped.
+- `calibrate.py` now solves ATM IV on the backtest's own trading-time clock. The stored calendar-time IV differs by a DTE/weekend-dependent factor, so earlier suggestions (e.g. 1.00) were not comparable with `BT_IV_SCALE`. Re-run it before changing the scale.
+- Shadow book fills at the ask (buys) / bid (sells), skips structures the live bot would refuse (`validate_plan_quotes`), squares off at 15:15 even if the feed is stale, and no longer re-enters a variant after a restart. Earlier shadow results (e.g. day 1) were optimistic: treat them as discarded.
+- `promote.py` also requires the mean net per trade to be >= 1.0 standard error above zero (`--min-t`).
+- Daily-history cache older than 7 days is ignored (fail closed).
+
 ## Trends, traps and account-size tiers
 
 **Valid trend / trap detection** (`trend_regime.py`). A *valid* trend is a clean one-directional move (high
