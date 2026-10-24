@@ -243,6 +243,8 @@ def load_config() -> Config:
             max_lots=int(_env_float("MAX_LOTS", 10)),
         ),
         backtest=BacktestParams(iv_scale=_env_float("BT_IV_SCALE", 0.95),
+                                lot_size=int(_env_float("BT_LOT_SIZE", 20)),
+                                strike_step=_env_float("BT_STRIKE_STEP", 100.0),
                                 slippage_pct=_env_float("BT_SLIPPAGE_PCT", 0.01)),
         execution=ExecutionParams(product=product),
         paper_capital=_env_float("PAPER_CAPITAL", 500_000.0),

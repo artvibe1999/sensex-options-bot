@@ -349,6 +349,7 @@ def load_csv(index_csv: str, vix_csv: str) -> list[dict]:
 
 
 _LISTED: list[dt.date] = []          # expiries in today's instruments dump (filled by fetch_kite)
+_LISTED_SPEC: dict = {}              # {"lot_size": int, "strike_step": float} from today's instruments dump
 
 
 def fetch_kite(days: int, out_dir: str) -> tuple[str, str]:
@@ -358,6 +359,11 @@ def fetch_kite(days: int, out_dir: str) -> tuple[str, str]:
     client.authenticate()
     client.load_instruments()
     _LISTED[:] = client.expiries()
+    near = client.contracts_for(_LISTED[0]) if _LISTED else []
+    if near:                                    # the live contract specification, never an assumed one
+        strikes = sorted({c.strike for c in near})
+        _LISTED_SPEC.update(lot_size=near[0].lot_size,
+                            strike_step=min(b - a for a, b in zip(strikes, strikes[1:])) if len(strikes) > 1 else 0)
     end = dt.datetime.now(IST)
     start = end - dt.timedelta(days=days)
     os.makedirs(out_dir, exist_ok=True)
@@ -427,6 +433,16 @@ def main() -> int:
     specs = build_library()
     log.info("Backtesting %d variants over %d days (%s to %s)", len(specs), len(bars),
              bars[0]["date"], bars[-1]["date"])
+    if _LISTED_SPEC.get("lot_size"):
+        import dataclasses as _dc
+        bp = _dc.replace(bp, lot_size=int(_LISTED_SPEC["lot_size"]),
+                         strike_step=float(_LISTED_SPEC["strike_step"] or bp.strike_step))
+        log.info("Contract spec taken from the live instruments dump: lot size %d, strike step %.0f",
+                 bp.lot_size, bp.strike_step)
+    else:
+        log.warning("Lot size %d / strike step %.0f are the configured defaults, NOT the live contract spec: "
+                    "use --fetch-kite (or BT_LOT_SIZE / BT_STRIKE_STEP) so tier results match what you will trade",
+                    bp.lot_size, bp.strike_step)
     known, known_from = exchange_expiries(os.path.join(args.out_dir, "sxbot.db"), _LISTED)
     if known_from:
         log.info("Using the exchange's own expiry dates from %s (%d recorded/listed); the dated schedule before that",
@@ -491,6 +507,7 @@ def main() -> int:
     with open(os.path.join(args.out_dir, f"{tag}backtest_report.json"), "w", encoding="utf-8") as f:
         json.dump({"windows": wf_rows, "variants": list(per_variant.values())}, f, default=str, indent=1)
     doc = {"generated_at": dt.datetime.now(IST).isoformat(), "source": "backtest" + ("-SYNTHETIC" if args.synthetic else ""),
+           "contract_spec": {"lot_size": bp.lot_size, "strike_step": bp.strike_step},
            "data_range": [str(bars[0]["date"]), str(bars[-1]["date"])],
            "valid_until": str(dt.date.today() + dt.timedelta(days=args.valid_days)),
            "variants": [{"id": v["id"], "score": v["score"], "full": v["full"], "oos": v["oos"],
