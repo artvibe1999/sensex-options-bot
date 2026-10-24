@@ -36,8 +36,8 @@ def analyse(spot: float, capitals: list[float]) -> dict:
         rs = RegimeState(Regime(regime), 15.0, 1.0, 12.0, False, 0)
         plan = lib.build_plan(spec, chain, rs, lib.TEMPLATE_DIRECTION.get(spec.template, 0), today, now)
         if plan:
-            fills = [(l.side, l.ref_price, plan.lot_size) for l in plan.legs]
-            fills += [("SELL" if l.side == "BUY" else "BUY", l.ref_price, plan.lot_size) for l in plan.legs]
+            fills = [(l.side, l.ref_price, plan.qty_for(l)) for l in plan.legs]
+            fills += [("SELL" if l.side == "BUY" else "BUY", l.ref_price, plan.qty_for(l)) for l in plan.legs]
             plans.append((spec, plan, trade_cost(fills, cp)))
     out = {"n": len(plans), "caps": {}}
     for cap in capitals:

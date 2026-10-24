@@ -173,6 +173,7 @@ class ExecutionParams:
     limit_buffer_pct: float = 0.01            # marketable-limit offset from LTP
     max_exit_buffer_pct: float = 0.08         # cap when escalating failed exits
     fill_timeout_s: float = 15.0
+    market_exit_after_failures: int = 3       # exits switch to MARKET orders after this many failed attempts
     tag: str = "SXALGO"                       # Kite tag, max 20 chars
     paper_slippage_pct: float = 0.005
 

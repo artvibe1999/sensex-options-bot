@@ -114,7 +114,8 @@ def next_expiry(day: dt.date, weekday: int) -> dt.date:
 
 def simulate_trade(plan, spec: StrategySpec, bar: dict, iv_entry: float, iv_exit: float,
                    bp: BacktestParams, costs: CostParams, rf: float, entry_dt: dt.datetime) -> Trade:
-    qty, slip = plan.lot_size, bp.slippage_pct
+    slip = bp.slippage_pct
+    qtys = {l.contract.symbol: plan.lot_size * l.ratio for l in plan.legs}
     entry = {}
     for leg in plan.legs:
         px = leg.ref_price * (1 + slip if leg.side == "BUY" else 1 - slip)
@@ -132,6 +133,7 @@ def simulate_trade(plan, spec: StrategySpec, bar: dict, iv_entry: float, iv_exit
             px = leg_px(leg, spot, iv, hours)
             px *= (1 - slip) if side_exit == "SELL" else (1 + slip)
             sign = 1 if leg.side == "BUY" else -1
+            qty = qtys[leg.contract.symbol]
             total += sign * (px - entry[leg.contract.symbol]) * qty
             exits.append((side_exit, px, qty))
         return total, exits
@@ -153,7 +155,7 @@ def simulate_trade(plan, spec: StrategySpec, bar: dict, iv_entry: float, iv_exit
             gross, exits, reason = tp, c_ex, "TP"
         else:
             gross, exits, reason = p_close, c_ex, "EOD"
-    fills = [(l.side, entry[l.contract.symbol], qty) for l in plan.legs] + exits
+    fills = [(l.side, entry[l.contract.symbol], qtys[l.contract.symbol]) for l in plan.legs] + exits
     return Trade(bar["date"], gross - trade_cost(fills, costs), ml, reason, gross, tuple(fills))
 
 

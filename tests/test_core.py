@@ -504,7 +504,7 @@ class TrendAndTierTests(unittest.TestCase):
         import trend_regime as tr
         from strategy_library import TEMPLATE_DIRECTION, _trend_ok
         specs = [s for s in lib.build_library() if s.trend in ("dvalid", "dtrap", "ivalid", "itrap")
-                 and s.max_cost_frac == 0]
+                 and s.max_cost_frac == 0 and not s.template.startswith("os_")]
         self.assertEqual(len(specs), 160)
         bull = next(s for s in specs if s.trend == "dvalid" and TEMPLATE_DIRECTION[s.template] == 1)
         up = tr.TrendInfo(tr.TrendState(1, True, None, 0.9))

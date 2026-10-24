@@ -108,6 +108,7 @@ class Leg:
     contract: OptionContract
     side: str  # BUY / SELL
     ref_price: float
+    ratio: int = 1     # multiples of the lot quantity (ratio spreads sell 2x the lots they buy)
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,9 @@ class TradePlan:
     variant_id: str = ""
     sl_frac: Optional[float] = None   # hard stop as a fraction of max loss (None: RiskParams default)
     tp_frac: Optional[float] = None   # take-profit as a fraction of max profit
+
+    def qty_for(self, leg: "Leg", lots: int = 1) -> int:
+        return lots * self.lot_size * leg.ratio
 
     @property
     def max_loss_per_lot(self) -> float:

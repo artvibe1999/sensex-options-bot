@@ -28,6 +28,7 @@ from kiteconnect import exceptions as kex
 from alerts import Alerter
 from config import IST, Config, capital_tier, load_config
 from costs import trade_cost
+from execution import LiveBroker, OrderLeg, PaperBroker, round_tick as _round_tick, validate_margin  # noqa: F401
 from market_data import MarketData, Snapshot
 from recorder import Recorder
 from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
@@ -39,92 +40,6 @@ from strategy_library import build_library, build_plan, load_approved
 from zerodha_client import AuthError, OptionContract, ZerodhaClient
 
 log = logging.getLogger("bot")
-
-
-@dataclass(frozen=True)
-class OrderLeg:
-    contract: OptionContract
-    side: str
-    qty: int
-    ref_price: float
-
-
-def _round_tick(price: float, tick: float) -> float:
-    return round(round(price / tick) * tick, 2)
-
-
-# ------------------------------------------------------------------ brokers
-class PaperBroker:
-    """Simulated fills at LTP +/- slippage; no API orders are placed."""
-
-    def __init__(self, slippage_pct: float) -> None:
-        self.slip = slippage_pct
-
-    def execute(self, legs: list[OrderLeg], product: str, buffer_mult: float = 1.0) -> Optional[dict[str, float]]:
-        fills = {}
-        for l in legs:
-            f = l.ref_price * (1 + self.slip if l.side == "BUY" else 1 - self.slip)
-            fills[l.contract.symbol] = _round_tick(f, l.contract.tick_size)
-            log.info("[PAPER] %s %s x%d @ %.2f", l.side, l.contract.symbol, l.qty, fills[l.contract.symbol])
-        return fills
-
-
-class LiveBroker:
-    """Real orders: marketable LIMITs, BUY legs first, unwind on partial failure."""
-
-    def __init__(self, client: ZerodhaClient, cfg: Config) -> None:
-        self.client, self.x = client, cfg.execution
-
-    def _limit(self, l: OrderLeg, mult: float = 1.0) -> float:
-        b = min(self.x.limit_buffer_pct * mult, self.x.max_exit_buffer_pct)
-        return _round_tick(l.ref_price * (1 + b if l.side == "BUY" else 1 - b), l.contract.tick_size)
-
-    def _wait(self, order_id: str) -> tuple[str, float, int]:
-        deadline = time.monotonic() + self.x.fill_timeout_s
-        status, avg, filled = "OPEN", 0.0, 0
-        while time.monotonic() < deadline:
-            h = self.client.order_history(order_id)[-1]
-            status, avg, filled = h["status"], float(h.get("average_price") or 0), int(h.get("filled_quantity") or 0)
-            if status in ("COMPLETE", "REJECTED", "CANCELLED"):
-                break
-            time.sleep(0.5)
-        return status, avg, filled
-
-    def execute(self, legs: list[OrderLeg], product: str, buffer_mult: float = 1.0) -> Optional[dict[str, float]]:
-        done: list[tuple[OrderLeg, float, int]] = []
-        for l in sorted(legs, key=lambda x: x.side != "BUY"):  # BUY first limits margin/risk
-            try:
-                oid = self.client.place_order(l.contract, l.side, l.qty, product,
-                                              self._limit(l, buffer_mult), self.x.tag)
-            except Exception:  # noqa: BLE001
-                log.exception("Order placement failed for %s", l.contract.symbol)
-                self._unwind(done, product)
-                return None
-            status, avg, filled = self._wait(oid)
-            if status != "COMPLETE":
-                try:
-                    self.client.cancel_order(oid)
-                except Exception:  # noqa: BLE001
-                    log.exception("Cancel failed for %s", oid)
-                status, avg, filled = self._wait(oid)
-                if filled:
-                    done.append((l, avg, filled))
-                log.error("Leg %s not filled (%s); unwinding", l.contract.symbol, status)
-                self._unwind(done, product)
-                return None
-            done.append((l, avg, filled))
-            log.info("[LIVE] %s %s x%d @ %.2f (order %s)", l.side, l.contract.symbol, l.qty, avg, oid)
-        return {l.contract.symbol: avg for l, avg, _ in done}
-
-    def _unwind(self, done: list[tuple[OrderLeg, float, int]], product: str) -> None:
-        for l, _avg, qty in done:
-            side = "SELL" if l.side == "BUY" else "BUY"
-            rev = OrderLeg(l.contract, side, qty, l.ref_price)
-            try:
-                oid = self.client.place_order(l.contract, side, qty, product, self._limit(rev, 3.0), self.x.tag)
-                log.warning("Unwind order %s for %s", oid, l.contract.symbol)
-            except Exception:  # noqa: BLE001
-                log.critical("UNWIND FAILED for %s: close manually!", l.contract.symbol, exc_info=True)
 
 
 # --------------------------------------------------------- state persistence
@@ -144,8 +59,8 @@ def _position_to_dict(pos: ManagedPosition) -> dict:
     p = pos.plan
     return {
         "plan": {"name": p.name, "regime": p.regime, "expiry": p.expiry.isoformat(),
-                 "legs": [{"contract": _contract_to_dict(l.contract), "side": l.side, "ref_price": l.ref_price}
-                          for l in p.legs],
+                 "legs": [{"contract": _contract_to_dict(l.contract), "side": l.side, "ref_price": l.ref_price,
+                           "ratio": l.ratio} for l in p.legs],
                  "lot_size": p.lot_size, "max_loss_unit": p.max_loss_unit,
                  "max_profit_unit": p.max_profit_unit, "rationale": p.rationale,
                  "variant_id": p.variant_id, "sl_frac": p.sl_frac, "tp_frac": p.tp_frac},
@@ -161,7 +76,8 @@ def _position_from_dict(d: dict) -> ManagedPosition:
     p = d["plan"]
     plan = TradePlan(
         name=p["name"], regime=p["regime"], expiry=dt.date.fromisoformat(p["expiry"]),
-        legs=tuple(Leg(_contract_from_dict(l["contract"]), l["side"], l["ref_price"]) for l in p["legs"]),
+        legs=tuple(Leg(_contract_from_dict(l["contract"]), l["side"], l["ref_price"], l.get("ratio", 1))
+                   for l in p["legs"]),
         lot_size=p["lot_size"], max_loss_unit=p["max_loss_unit"], max_profit_unit=p["max_profit_unit"],
         rationale=p["rationale"], variant_id=p.get("variant_id", ""),
         sl_frac=p.get("sl_frac"), tp_frac=p.get("tp_frac"))
@@ -481,7 +397,7 @@ class Bot:
             margin_fn = None
             if self.live:
                 margin_fn = lambda n, plan=plan: self.client.required_margin(
-                    [(l.contract, l.side, n * plan.lot_size) for l in plan.legs], product)
+                    [(l.contract, l.side, plan.qty_for(l, n)) for l in plan.legs], product)
             lots = self.risk.size(plan, self.capital, margin_fn)
             if lots < 1:
                 continue
@@ -491,9 +407,17 @@ class Bot:
     def _enter(self, now: dt.datetime, snap: Snapshot, plan: TradePlan, lots: int,
                score: float, n_candidates: int) -> None:
         log.info("ENTRY %s lots=%d | %s", plan.variant_id, lots, plan.rationale)
-        legs = [OrderLeg(l.contract, l.side, lots * plan.lot_size, l.ref_price) for l in plan.legs]
-        fills = self.broker.execute(legs, self.cfg.execution.product)
+        legs = [OrderLeg(l.contract, l.side, plan.qty_for(l, lots), l.ref_price) for l in plan.legs]
         ts = now.isoformat(timespec="seconds")
+        if self.live:                                   # final pre-trade check on the exact structure to be sent
+            chk = validate_margin(self.client, legs, self.cfg.execution.product, self.client.available_cash(),
+                                  self.risk.p.margin_utilisation)
+            if not chk.ok:
+                self.alerts.send(f"Entry blocked by margin check for {plan.variant_id}: {chk.reason}",
+                                 level="ERROR", key="entry-margin")
+                self.rec.event(ts, "entry_blocked_margin", plan.variant_id, {"lots": lots, "reason": chk.reason})
+                return
+        fills = self.broker.execute(legs, self.cfg.execution.product)
         if not fills:
             self.alerts.send(f"Entry failed for {plan.variant_id}", level="ERROR", key="entry-fail")
             self.rec.event(ts, "entry_failed", plan.variant_id, {"lots": lots})
@@ -521,7 +445,8 @@ class Bot:
         legs = [OrderLeg(l.contract, "SELL" if l.side == "BUY" else "BUY", l.qty, ltps[l.contract.token])
                 for l in pos.legs]
         mult = min(1 + self._exit_failures, 8)          # widen the limit buffer after each failure
-        fills = self.broker.execute(legs, self.cfg.execution.product, mult)
+        fills = self.broker.execute(legs, self.cfg.execution.product, mult,
+                                    market=self._exit_failures >= self.cfg.execution.market_exit_after_failures)
         if not fills:
             self._exit_failures += 1
             self.alerts.send(f"EXIT FAILED ({reason}), attempt {self._exit_failures}; retrying with a "

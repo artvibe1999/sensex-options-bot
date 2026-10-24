@@ -91,7 +91,7 @@ class ShadowBook:
             if q is not None:
                 sl.last = q.ltp
             sign = 1 if sl.side == "BUY" else -1
-            total += sign * (sl.last - sl.entry) * pos.plan.lot_size
+            total += sign * (sl.last - sl.entry) * pos.plan.lot_size * sl.leg.ratio
         return total
 
     def _manage(self, vid: str, snap: Snapshot, now: dt.datetime, ts: str) -> None:
@@ -116,8 +116,8 @@ class ShadowBook:
         pos = self.open.pop(vid)
         gross = 0.0
         fills: list[tuple[str, float, int]] = []
-        qty = pos.plan.lot_size
         for sl in pos.legs:
+            qty = pos.plan.lot_size * sl.leg.ratio
             exit_side = "SELL" if sl.side == "BUY" else "BUY"
             px = _round(sl.last * (1 - self.slip if exit_side == "SELL" else 1 + self.slip),
                         sl.leg.contract.tick_size)

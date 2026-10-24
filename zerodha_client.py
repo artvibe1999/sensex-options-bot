@@ -300,16 +300,18 @@ class ZerodhaClient:
 
     # ---------------------------------------------------------------- orders
     def place_order(self, c: OptionContract, side: str, qty: int, product: str,
-                    price: float, tag: str) -> str:
+                    price: float, tag: str, market: bool = False) -> str:
         """No automatic retry: a network error may still have placed the order.
         Callers reconcile via order_history/positions() using the tag."""
-        return self._call(
-            self.kite.place_order, retries=0, limiter=self._order_limit,
+        kw: dict = dict(
             variety=KiteConnect.VARIETY_REGULAR, exchange=c.exchange, tradingsymbol=c.symbol,
             transaction_type=side, quantity=qty, product=product,
-            order_type=KiteConnect.ORDER_TYPE_LIMIT, price=price,
-            validity=KiteConnect.VALIDITY_DAY, tag=tag[:20],
-        )
+            validity=KiteConnect.VALIDITY_DAY, tag=tag[:20])
+        if market:                      # last-resort exits: MARKET with the exchange's automatic market protection
+            kw.update(order_type=KiteConnect.ORDER_TYPE_MARKET, market_protection=-1)
+        else:
+            kw.update(order_type=KiteConnect.ORDER_TYPE_LIMIT, price=price)
+        return self._call(self.kite.place_order, retries=0, limiter=self._order_limit, **kw)
 
     def modify_order(self, order_id: str, price: float) -> str:
         return self._call(self.kite.modify_order, variety=KiteConnect.VARIETY_REGULAR,

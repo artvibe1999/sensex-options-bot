@@ -59,6 +59,28 @@ a plain strategy: `walls` (OI walls sit between spot and the short strikes), `pc
 promotes one if it beats its plain twin (avg net per trade and profit factor) over 40+ forward trades.
 Nothing here is a proven edge; the filters are hypotheses the shadow book will confirm or reject.
 
+## The ten structures, execution and the mocked-market harness
+
+`option_strategies.py` holds an `OptionStrategy` base class and ten concrete strategies: bull call spread, bear put
+spread, bull put spread, bear call spread, bear put ladder (4-leg, protective wing), iron condor, iron butterfly, bull
+call ratio spread (long 1, short 2, long 1 far-OTM wing) and the two pure-debit ITM spreads. Each picks its strikes
+from the chain using offsets in index points and works out its own max risk, max profit and breakevens from the exact
+expiry payoff (a structure with unbounded loss is rejected). They are registered in the library as templates `os_*`
+(about 190 variants), so they are backtested, shadow-tested and approved per account size like everything else, with
+widths from 200 points for small accounts up to 1000 for larger ones.
+
+`execution.py` places a structure in two verified phases: all BUY legs first, wait until each is confirmed filled,
+only then the SELL legs. Any rejection, timeout, partial fill or network error cancels what is open and unwinds what
+filled. Exits clone the structure with sides flipped and buy back shorts first; they start as marketable limit orders
+with a widening buffer and switch to MARKET orders after `ExecutionParams.market_exit_after_failures` (3) failed
+attempts. In live mode the exact structure is checked with `basket_order_margins` against cash before any order is sent.
+Stops, profit targets (50% of max profit for debits, 80% for credits), the trailing stop and the square-off time are
+enforced by the existing risk manager.
+
+`python sim_harness.py` runs every strategy through mocked 1-minute ticks and prints how each exited. The tests in
+`tests/test_execution.py` script a mock Kite client (fill, partial, reject, hang, network error) and assert the order
+sequence.
+
 ## Trends, traps and account-size tiers
 
 **Valid trend / trap detection** (`trend_regime.py`). A *valid* trend is a clean one-directional move (high

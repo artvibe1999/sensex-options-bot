@@ -22,6 +22,7 @@ from typing import Callable, Optional
 
 from chain_features import ChainFeatures
 from strategy_engine import Chain, Leg, OptionQuote, RegimeState, TradePlan
+from option_strategies import STRATEGY_BUILDERS, STRATEGY_DIRECTION
 from trend_regime import TrendInfo
 
 log = logging.getLogger(__name__)
@@ -208,8 +209,9 @@ _BUILDERS: dict[str, Callable[[Chain, dict], Built]] = {
     "long_straddle": _long_straddle, "long_strangle": _long_strangle,
     "long_call": _long_call, "long_put": _long_put,
 }
+_BUILDERS.update(STRATEGY_BUILDERS)               # the ten OptionStrategy classes, templates prefixed "os_"
 TEMPLATE_DIRECTION = {"bull_put_spread": 1, "bull_call_debit": 1, "long_call": 1,
-                      "bear_call_spread": -1, "bear_put_debit": -1, "long_put": -1}
+                      "bear_call_spread": -1, "bear_put_debit": -1, "long_put": -1, **STRATEGY_DIRECTION}
 
 
 # ------------------------------------------------------------------ library
@@ -333,6 +335,38 @@ def build_library() -> list[StrategySpec]:
                 for width in (200, 300):
                     add("bull_call_debit", {"width": width}, regimes, band, mode, 0.5, 1.0, cost=0.20)
                     add("bear_put_debit", {"width": width}, regimes, band, mode, 0.5, 1.0, cost=0.20)
+    # ---- the ten OptionStrategy classes (option_strategies.py): offsets/widths in index points. Directional ones
+    # trade only with the trend ("with") or a valid daily trend ("dvalid"); neutral ones when the market is calm.
+    NH, H = (NORM, HIGH), (HIGH,)
+    for band in DTE_BANDS:
+        for width in (200, 300, 500):
+            for regimes in (NH, H):
+                for trend in ("with", "dvalid"):
+                    add("os_bull_call_spread", {"long_offset": 0, "width": width}, regimes, band, trend, 0.5, 0.5)
+                    add("os_bear_put_spread", {"long_offset": 0, "width": width}, regimes, band, trend, 0.5, 0.5)
+        for off in (200, 400):
+            for width in (200, 500):
+                for trend in ("with", "none"):
+                    add("os_bull_put_spread", {"short_offset": off, "width": width}, (LOW, NORM), band, trend, 0.6, 0.8)
+                    add("os_bear_call_spread", {"short_offset": off, "width": width}, (LOW, NORM), band, trend, 0.6, 0.8)
+        for w1, w2, w3 in ((200, 200, 100), (300, 200, 200), (300, 300, 200), (500, 300, 300)):
+            for trend in ("with", "dvalid"):
+                add("os_bear_put_ladder", {"long_offset": 0, "w1": w1, "w2": w2, "w3": w3}, NH, band, trend, 0.5, 0.5)
+        for w1, w2 in ((200, 300), (300, 400), (500, 500)):
+            for trend in ("with", "dvalid"):
+                add("os_bull_call_ratio", {"long_offset": 0, "w1": w1, "w2": w2}, (LOW, NORM), band, trend, 0.6, 0.5)
+        for off in (600, 900):
+            for wing in (300, 500, 1000):
+                for regimes in ((LOW,), (LOW, NORM)):
+                    add("os_iron_condor", {"short_offset": off, "wing": wing}, regimes, band, "none", 0.6, 0.8)
+        for wing in (300, 500, 1000):
+            for regimes in ((LOW,), (LOW, NORM)):
+                add("os_iron_butterfly", {"wing": wing}, regimes, band, "none", 0.6, 0.8)
+        for itm in (100, 200):
+            for width in (400, 600):
+                for regimes in (NH, H):
+                    add("os_bull_call_spread_itm", {"itm_offset": itm, "width": width}, regimes, band, "with", 0.5, 0.5)
+                    add("os_bear_put_spread_itm", {"itm_offset": itm, "width": width}, regimes, band, "with", 0.5, 0.5)
     ids = [s.id for s in out]
     assert len(ids) == len(set(ids)), "duplicate strategy ids"
     return out
@@ -396,7 +430,7 @@ def _round_trip_cost(legs: tuple[Leg, ...]) -> float:
     from costs import CostParams, trade_cost
     q = legs[0].contract.lot_size
     opp = {"BUY": "SELL", "SELL": "BUY"}
-    fills = [(l.side, l.ref_price, q) for l in legs] + [(opp[l.side], l.ref_price, q) for l in legs]
+    fills = [(l.side, l.ref_price, q * l.ratio) for l in legs] + [(opp[l.side], l.ref_price, q * l.ratio) for l in legs]
     return trade_cost(fills, CostParams())
 
 
