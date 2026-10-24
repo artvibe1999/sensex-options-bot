@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import queue
+import re
+import threading
 import time
 from typing import Optional
 
@@ -11,10 +14,19 @@ log = logging.getLogger(__name__)
 
 
 class Alerter:
-    def __init__(self, token: Optional[str], chat_id: Optional[str], dedupe_s: float = 300.0) -> None:
+    def __init__(self, token: Optional[str], chat_id: Optional[str], dedupe_s: float = 300.0,
+                 background: bool = False) -> None:
         self._token, self._chat = token, chat_id
         self._dedupe_s = dedupe_s
         self._last: dict[str, float] = {}
+        self._q: Optional["queue.Queue[str]"] = None
+        if background and self.enabled:          # the trading loop must never wait on Telegram
+            self._q = queue.Queue(maxsize=200)
+            threading.Thread(target=self._worker, daemon=True, name="alerts").start()
+
+    def _worker(self) -> None:
+        while True:
+            self._post(self._q.get())
 
     @property
     def enabled(self) -> bool:
@@ -22,7 +34,8 @@ class Alerter:
 
     def send(self, text: str, level: str = "INFO", key: Optional[str] = None) -> None:
         """Send a message. ``key`` suppresses repeats of the same alert for dedupe_s."""
-        log.log(logging.CRITICAL if level == "CRITICAL" else logging.INFO, "ALERT[%s] %s", level, text)
+        log.log(logging.CRITICAL if level == "CRITICAL" else logging.INFO, "ALERT[%s] %s", level,
+                re.sub(r"state(?:=|%3[dD])\S+", "state=<redacted>", text))     # login links carry a short-lived state
         if not self.enabled:
             return
         if key:
@@ -30,11 +43,20 @@ class Alerter:
             if now - self._last.get(key, -1e9) < self._dedupe_s:
                 return
             self._last[key] = now
+        body = f"[{level}] {text}"[:4000]
+        if self._q is not None:
+            try:
+                self._q.put_nowait(body)
+            except queue.Full:
+                log.warning("Alert queue full: message dropped")
+            return
+        self._post(body)
+
+    def _post(self, body: str) -> None:
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{self._token}/sendMessage",
-                json={"chat_id": self._chat, "text": f"[{level}] {text}"[:4000],
-                      "disable_web_page_preview": True},
+                json={"chat_id": self._chat, "text": body, "disable_web_page_preview": True},
                 timeout=5,
             )
             if not r.ok:   # e.g. 401 bad token, 400/403 wrong chat id or bot never started

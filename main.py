@@ -99,7 +99,7 @@ class Bot:
                              cfg.paths.daily_cache, cfg.chain_interval_s)
         self.risk = RiskManager(cfg.risk, cfg.schedule)
         self.broker = LiveBroker(self.client, cfg) if live else PaperBroker(cfg.execution.paper_slippage_pct)
-        self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id)
+        self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id, background=True)
         self.rec = Recorder(cfg.paths.db)
         self.sheets = SheetsSink(cfg.sheets_url, cfg.sheets_secret)
         self.specs = build_library()
@@ -120,6 +120,7 @@ class Bot:
         self._entry_failures = 0
         self._entry_block_until = 0.0
         self._stall_alerted = False
+        self._last_px: dict[int, float] = {}
         self._last_state_save = 0.0
         self._last_heartbeat = 0.0
         self._last_flow = 0.0
@@ -130,12 +131,20 @@ class Bot:
         self._load_state()
 
     # ------------------------------------------------------------ persistence
+    def _state_path(self) -> str:
+        """One state file per mode, so a paper restart can never overwrite a live position's state."""
+        base = self.cfg.paths.state
+        if not self.live:
+            return base
+        root, ext = os.path.splitext(base)
+        return f"{root}.live{ext}"
+
     def _save_state(self) -> None:
         doc = {"date": (self.day or dt.date.today()).isoformat(), "mode": self.mode,
                "realized": self.realized, "trades_today": self.trades_today,
                "risk": self.risk.export(),
                "position": _position_to_dict(self.position) if self.position else None}
-        path = self.cfg.paths.state
+        path = self._state_path()
         try:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".state-")
@@ -150,7 +159,7 @@ class Bot:
 
     def _load_state(self) -> None:
         try:
-            with open(self.cfg.paths.state, encoding="utf-8") as f:
+            with open(self._state_path(), encoding="utf-8") as f:
                 doc = json.load(f)
         except (OSError, ValueError):
             return
@@ -218,27 +227,40 @@ class Bot:
         if not self.session_ready and not self._ensure_session(now):
             return
         if not self.client.market_is_live():
-            if self.position and now.time() >= self.cfg.schedule.square_off:
-                if not self._stall_alerted:           # never leave a position unmanaged at square-off time
+            if self.position and now.time() >= dt.time(9, 20):
+                if not self._stall_alerted:           # never leave an open position unmanaged because the feed looks stalled
                     self._stall_alerted = True
-                    self.alerts.send("Market feed looks stalled but a position is open at square-off time: "
-                                     "trying to exit using REST prices.", level="CRITICAL", key="feed-stall")
+                    self.alerts.send("Market feed looks stalled while a position is open: managing it with REST prices.",
+                                     level="CRITICAL", key="feed-stall")
                 self._manage(now)
             return                                    # pre-open, holiday or stalled feed
         self._stall_alerted = False
-        snap = self.md.snapshot(now)
-        if snap.fresh:
-            full = time.monotonic() - self._last_chain_rec >= self.cfg.chain_record_every_s
-            if full:
-                self._last_chain_rec = time.monotonic()
-            self.rec.record_snapshot(snap, with_chain=full)
-            self.shadow.step(snap, now)
-            self._record_flow(now, snap)
-        else:
-            self.shadow.flatten_if_due(now)           # stale feed must not leave virtual positions open past square-off
+        snap: Optional[Snapshot] = None
+        try:
+            snap = self.md.snapshot(now)
+        except (kex.TokenException, AuthError):
+            raise
+        except Exception:  # noqa: BLE001 - a data problem must not stop an open position being managed
+            log.exception("Snapshot failed")
+            self.alerts.send("Market snapshot failing; see logs", level="ERROR", key="snapshot-error")
+        if snap is not None:
+            try:
+                if snap.fresh:
+                    full = time.monotonic() - self._last_chain_rec >= self.cfg.chain_record_every_s
+                    if full:
+                        self._last_chain_rec = time.monotonic()
+                    self.rec.record_snapshot(snap, with_chain=full)
+                    self.shadow.step(snap, now)
+                    self._record_flow(now, snap)
+                else:
+                    self.shadow.flatten_if_due(now)   # stale feed must not leave virtual positions open past square-off
+            except (kex.TokenException, AuthError):
+                raise
+            except Exception:  # noqa: BLE001 - recording / shadow bugs must never skip position management
+                log.exception("Recording / shadow step failed")
         if self.position:
             self._manage(now)
-        elif not self.risk.halted:
+        elif not self.risk.halted and snap is not None:
             self._try_entry(now, snap)
         if self.risk.halted and not self._halt_alerted:
             self._halt_alerted = True
@@ -331,11 +353,19 @@ class Bot:
                 self.alerts.send(f"Not logged in to Kite: {exc}", level="CRITICAL", key="auth")
             self.stop.wait(30)
             return False
-        self.client.load_instruments()
-        self.client.start_stream()
-        if self.position:
-            self.client.subscribe_tokens({l.contract.token: l.contract.key for l in self.position.legs})
-        self.capital = self.client.available_cash() if self.live else self.cfg.paper_capital
+        try:
+            self.client.load_instruments()
+            self.client.start_stream()               # replaces any earlier stream (no leaked sockets on retries)
+            if self.position:
+                self.client.subscribe_tokens({l.contract.token: l.contract.key for l in self.position.legs})
+            self.capital = self.client.available_cash() if self.live else self.cfg.paper_capital
+        except kex.TokenException:
+            raise
+        except Exception:  # noqa: BLE001 - network blip while starting the session: back off and retry
+            log.exception("Session start failed; retrying")
+            self.alerts.send("Session start failed; retrying shortly (see logs)", level="ERROR", key="session-fail")
+            self.stop.wait(10)
+            return False
         self.risk.apply_capital(self.capital, self.cfg.capital_profile)
         log.info("Session ready: mode=%s capital=%.0f tier=%s", self.mode, self.capital, capital_tier(self.capital))
         self._approved_stamp = None            # approvals are per account-size tier: reload now capital is known
@@ -386,7 +416,21 @@ class Bot:
 
     # ---------------------------------------------------------------- trading
     def _ltps(self, pos: ManagedPosition) -> dict[int, float]:
-        return {l.contract.token: self.client.get_ltp(l.contract.token) for l in pos.legs}
+        """Leg prices for stops and exits. A leg with no valid price right now (no trades, API blip) uses its last good
+        price, else its entry price, so one dead quote can never block a stop or square-off."""
+        out: dict[int, float] = {}
+        for l in pos.legs:
+            tok = l.contract.token
+            try:
+                px = self.client.get_ltp(tok)
+                self._last_px[tok] = px
+            except kex.TokenException:
+                raise
+            except Exception:  # noqa: BLE001
+                px = self._last_px.get(tok) or l.entry_price
+                log.warning("No valid price for %s: using %.2f", l.contract.symbol, px)
+            out[tok] = px
+        return out
 
     def _manage(self, now: dt.datetime) -> None:
         pos = self.position
@@ -502,6 +546,28 @@ class Bot:
         self.alerts.send(f"POSITION MISMATCH after {what}: broker {actual} vs expected {expected}. "
                          "New entries halted: check positions in Kite.", level="CRITICAL", key="pos-mismatch")
 
+    def _clamp_to_broker(self, legs: list[OrderLeg]) -> list[OrderLeg]:
+        """Live only: never close more than the broker really holds (e.g. after a POSITION_MISMATCH), or an exit
+        would open a naked opposite position."""
+        if not self.live:
+            return legs
+        try:
+            book = self.client.net_positions()
+        except Exception:  # noqa: BLE001
+            log.warning("Could not read broker positions before exit; using the bot's own quantities", exc_info=True)
+            return legs
+        out = []
+        for l in legs:
+            held = book.get(l.contract.symbol, 0)
+            want = -held if l.side == "BUY" else held            # closing a short = BUY; closing a long = SELL
+            qty = min(l.qty, max(want, 0))
+            if qty != l.qty:
+                log.warning("Exit quantity for %s clamped from %d to %d (broker holds %d)",
+                            l.contract.symbol, l.qty, qty, held)
+            if qty > 0:
+                out.append(OrderLeg(l.contract, l.side, qty, l.ref_price))
+        return out
+
     def _exit(self, reason: str) -> None:
         pos = self.position
         assert pos
@@ -509,8 +575,18 @@ class Bot:
         legs = [OrderLeg(l.contract, "SELL" if l.side == "BUY" else "BUY", l.qty, ltps[l.contract.token])
                 for l in pos.legs]
         mult = min(1 + self._exit_failures, 8)          # widen the limit buffer after each failure
-        res = self.broker.close(legs, self.cfg.execution.product, mult,
-                                market=self._exit_failures >= self.cfg.execution.market_exit_after_failures)
+        legs = self._clamp_to_broker(legs)
+        try:
+            res = self.broker.close(legs, self.cfg.execution.product, mult,
+                                    market=self._exit_failures >= self.cfg.execution.market_exit_after_failures)
+        except kex.TokenException:
+            raise
+        except Exception:  # noqa: BLE001 - an exception must escalate the next attempt (wider limit, then MARKET)
+            log.exception("Exit order flow raised")
+            self._exit_failures += 1
+            self.alerts.send(f"EXIT FAILED ({reason}), attempt {self._exit_failures}: check Kite positions.",
+                             level="CRITICAL", key=f"exit-exc-{self._exit_failures}")
+            return
         gross, cash = apply_exit_fills(pos.legs, res)   # reduces each leg by what really closed
         cost = trade_cost(cash, self.cfg.costs)
         net = gross - cost

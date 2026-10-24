@@ -21,7 +21,7 @@ def read_token(path: str) -> Optional[dict]:
     try:
         with open(path, encoding="utf-8") as f:
             rec = json.load(f)
-        return rec if rec.get("access_token") else None
+        return rec if isinstance(rec, dict) and rec.get("access_token") else None
     except (OSError, ValueError):
         return None
 

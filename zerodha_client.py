@@ -201,6 +201,8 @@ class ZerodhaClient:
 
     # ------------------------------------------------------------- streaming
     def start_stream(self) -> None:
+        if self._ticker is not None:
+            self.stop_stream()                       # never leave an orphaned socket reconnecting in the background
         t = KiteTicker(self._creds.api_key, self._creds.access_token)
         t.on_ticks = self._on_ticks
         t.on_connect = self._on_connect

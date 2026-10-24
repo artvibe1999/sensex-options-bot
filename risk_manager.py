@@ -40,6 +40,9 @@ class ManagedPosition:
         return total
 
 
+FLATTEN_HALTS = {"DAILY_LOSS_LIMIT", "PORTFOLIO_TRAILING_STOP", "EXIT_NOT_COMPLETING", "SHUTDOWN"}
+
+
 class RiskManager:
     def __init__(self, params: RiskParams, schedule: Schedule) -> None:
         self.p, self._base, self.sched = params, params, schedule
@@ -95,7 +98,8 @@ class RiskManager:
     def update_portfolio(self, capital: float, day_pnl: float) -> Optional[str]:
         """Daily loss limit and portfolio trailing stop. Returns a reason to flatten."""
         if self.halted:
-            return self.halt_reason
+            # only loss-control halts flatten the book; a mismatch / unconfirmed unwind needs a human, not a blind exit
+            return self.halt_reason if self.halt_reason in FLATTEN_HALTS else None
         if day_pnl <= -capital * self.p.max_daily_loss_pct:
             return self._halt("DAILY_LOSS_LIMIT")
         self._day_peak = max(self._day_peak, day_pnl)

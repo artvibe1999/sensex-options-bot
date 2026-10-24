@@ -57,6 +57,7 @@ class TokenService:
         self._lock = threading.Lock()
         self._last_rt: Optional[str] = None      # request_token already exchanged (guards browser reloads)
         self._last_user = ""
+        self._used_nonces: set[str] = set()      # a login link works once
 
     # Login "state": stateless and self-verifying (HMAC with the API secret + timestamp), so a link
     # made by `token_service.py url` (another process) is accepted by the running server without
@@ -90,15 +91,26 @@ class TokenService:
         return is_fresh(read_token(self.cfg.paths.token_file))
 
     def exchange(self, request_token: str, state: Optional[str], check_state: bool = True) -> str:
+        with self._lock:                                 # concurrent callbacks must not double-exchange
+            return self._exchange(request_token, state, check_state)
+
+    def _exchange(self, request_token: str, state: Optional[str], check_state: bool) -> str:
         if not _TOKEN_RE.match(request_token):
             raise ValueError("malformed request_token")
         if check_state:
             if not self.check_state(state):
                 raise PermissionError("login state invalid or older than 30 minutes: "
                                       "generate a fresh link and open it")
+            if state in self._used_nonces:
+                raise PermissionError("this login link was already used: generate a fresh one")
         if request_token == self._last_rt and self.fresh():
             return self._last_user                      # reload/replay of a login that already worked
         data = self.kite.generate_session(request_token, api_secret=self.cfg.credentials.api_secret)
+        expected = os.getenv("KITE_USER_ID", "").strip()
+        if expected and data.get("user_id", "") != expected:
+            raise PermissionError("this login belongs to a different Zerodha account than KITE_USER_ID")
+        if state:
+            self._used_nonces.add(state)
         self._last_rt, self._last_user = request_token, data.get("user_id", "")
         write_token(self.cfg.paths.token_file, data["access_token"], data.get("user_id", ""))
         self.alerts.send("Kite login complete: the bot will start its session shortly.")

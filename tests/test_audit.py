@@ -188,5 +188,90 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(len(ids), len(set(ids)))
 
 
+class IndependentReviewTests(unittest.TestCase):
+    def test_mismatch_halt_does_not_trigger_a_blind_flatten(self):
+        from risk_manager import RiskManager
+        rm = RiskManager(RiskParams(), Schedule())
+        rm.halt("POSITION_MISMATCH")
+        self.assertIsNone(rm.update_portfolio(100000.0, 0.0))
+        rm.halt("DAILY_LOSS_LIMIT")
+        self.assertEqual(rm.update_portfolio(100000.0, 0.0), "DAILY_LOSS_LIMIT")
+
+    def _bot(self, live=True):
+        import types
+        import main
+        from execution import OrderLeg
+        b = object.__new__(main.Bot)
+        b.live, b._last_px = live, {}
+        return b, OrderLeg, types
+
+    def test_exit_quantity_is_clamped_to_what_the_broker_holds(self):
+        import sim_harness as sh
+        from option_strategies import STRATEGY_CLASSES
+        import types
+        b, OrderLeg, _ = self._bot()
+        legs = sh.order_legs(sh.plan_from_strategy(STRATEGY_CLASSES["bull_call_spread"](), CHAIN_FOR_REVIEW), 1)
+        closing = [OrderLeg(l.contract, "SELL" if l.side == "BUY" else "BUY", l.qty, l.ref_price) for l in legs]
+        long_sym = next(l.contract.symbol for l in legs if l.side == "BUY")
+        short_sym = next(l.contract.symbol for l in legs if l.side == "SELL")
+        qty = legs[0].qty
+        b.client = types.SimpleNamespace(net_positions=lambda: {long_sym: qty // 2, short_sym: -qty})
+        out = {l.contract.symbol: (l.side, l.qty) for l in b._clamp_to_broker(closing)}
+        self.assertEqual(out[long_sym], ("SELL", qty // 2))              # broker holds only half the long
+        self.assertEqual(out[short_sym], ("BUY", qty))
+        b.client = types.SimpleNamespace(net_positions=lambda: {})        # flat at the broker: send nothing
+        self.assertEqual(b._clamp_to_broker(closing), [])
+
+    def test_dead_quote_does_not_block_stops(self):
+        import types
+        import main
+        from risk_manager import ManagedPosition, OpenLeg
+        import sim_harness as sh
+        from option_strategies import STRATEGY_CLASSES
+        b, _, _ = self._bot()
+        plan = sh.plan_from_strategy(STRATEGY_CLASSES["bull_call_spread"](), CHAIN_FOR_REVIEW)
+        pos = ManagedPosition(plan, 1, [OpenLeg(l.contract, l.side, 20, l.ref_price) for l in plan.legs],
+                              dt.datetime.now(IST), 1000.0, 1000.0)
+        def ltp(tok):
+            raise ValueError("no valid price")
+        b.client = types.SimpleNamespace(get_ltp=ltp)
+        got = b._ltps(pos)
+        self.assertEqual(set(got), {l.contract.token for l in plan.legs})
+        self.assertTrue(all(v > 0 for v in got.values()))
+
+    def test_login_link_is_single_use_and_account_checked(self):
+        import types
+        import token_service as ts
+        svc = object.__new__(ts.TokenService)
+        import threading
+        svc._lock, svc._used_nonces, svc._last_rt, svc._last_user = threading.Lock(), set(), None, ""
+        svc.cfg = types.SimpleNamespace(credentials=types.SimpleNamespace(api_secret="s3cret"),
+                                        paths=types.SimpleNamespace(token_file=os.path.join(tempfile.mkdtemp(), "t.json")))
+        svc.alerts = types.SimpleNamespace(send=lambda *a, **k: None)
+        svc.kite = types.SimpleNamespace(generate_session=lambda rt, api_secret: {"access_token": "AT", "user_id": "AB1234"})
+        state = svc.make_state()
+        os.environ["KITE_USER_ID"] = "ZZ9999"
+        try:
+            with self.assertRaises(PermissionError):
+                svc.exchange("abcdefghij12", state)                       # wrong Zerodha account
+            os.environ["KITE_USER_ID"] = "AB1234"
+            self.assertEqual(svc.exchange("abcdefghij12", state), "AB1234")
+            with self.assertRaises(PermissionError):
+                svc.exchange("klmnopqrst34", state)                       # same link, different request token
+        finally:
+            os.environ.pop("KITE_USER_ID", None)
+
+    def test_alert_log_redacts_login_state(self):
+        import logging
+        from alerts import Alerter
+        with self.assertLogs("alerts", level="INFO") as cm:
+            Alerter(None, None).send("Tap: https://kite.zerodha.com/connect/login?v=3&redirect_params=state%3D123xabcxdeadbeef")
+        self.assertNotIn("deadbeef", "\n".join(cm.output))
+
+
+import sim_harness as _sh
+CHAIN_FOR_REVIEW = _sh.sample_chain()[0]
+
+
 if __name__ == "__main__":
     unittest.main()

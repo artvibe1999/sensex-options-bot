@@ -80,7 +80,7 @@ def _explain(r: "requests.Response") -> None:
     from urllib.parse import urlparse
     for h in list(r.history) + [r]:
         u = urlparse(h.url)
-        print(f"  hop: HTTP {h.status_code} {u.netloc}{u.path[:40]} type={h.headers.get('Content-Type', '?')[:40]}")
+        print(f"  hop: HTTP {h.status_code} {u.netloc} type={h.headers.get('Content-Type', '?')[:40]}")
     text = re.sub(r"(?is)<(script|style).*?</\1>", " ", r.text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text).strip()

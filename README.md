@@ -110,6 +110,15 @@ sequence.
 - Backtest approvals must also survive DOUBLE slippage (stress gate); `BT_SLIPPAGE_PCT` is configurable and `calibrate.py` now compares it with the real recorded half-spread.
 - `get_ltp` rejects zero/NaN prices instead of passing them to sizing, stops or the chain.
 
+### Independent review fixes
+- Position management no longer depends on data/recording/shadow code: a failing snapshot, recorder or shadow step is logged and the open position is still stop/target/square-off managed (also when the feed looks stalled, using REST prices).
+- A leg with no valid price uses its last good (or entry) price, so one dead quote cannot block a stop.
+- Exit exceptions escalate (wider limit, then MARKET); exit quantities are clamped to what the broker actually holds; a POSITION_MISMATCH halt no longer triggers a blind full-size exit (only loss-control halts flatten).
+- Live state is kept in its own file (`state.live.json`), so a paper restart cannot overwrite a live position's state. `start_stream` replaces any earlier socket; session start retries with back-off.
+- Login link is single-use; set `KITE_USER_ID` in `.env` so a token for another Zerodha account is refused; callbacks are serialised; the `state` is redacted from logs.
+- Telegram alerts are sent from a background thread, so an outage never stalls the trading loop.
+- `promote.py`: a variant whose plain twin exists in the library can no longer pass the twin test without twin evidence.
+
 ## Trends, traps and account-size tiers
 
 **Valid trend / trap detection** (`trend_regime.py`). A *valid* trend is a clean one-directional move (high

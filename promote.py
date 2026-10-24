@@ -110,6 +110,7 @@ def main() -> int:
                              "forward": {"n": n, "net": total, "pf": pf}})
 
     oi_rows = []
+    lib_ids = {s.id for s in build_library()}
     for spec in build_library():
         if not spec.forward_only:
             continue
@@ -117,7 +118,9 @@ def main() -> int:
         n, total, pf = len(nets), sum(nets), _pf(nets)
         bn = len(base)
         avg, bavg, bpf = (total / n if n else 0.0), (sum(base) / bn if bn else 0.0), (_pf(base) if bn else 0.0)
-        twin_ok = (bn >= 20 and avg > bavg and pf > bpf) if bn >= 20 else spec.intraday_trend
+        # No evidence from the plain twin must never pass by default: if a twin exists in the library, wait for it;
+        # only variants that have no twin at all rely on the stricter absolute forward bar.
+        twin_ok = (avg > bavg and pf > bpf) if bn >= 20 else (spec.base_id not in lib_ids and spec.intraday_trend)
         ok = (n >= args.min_trades_oi and total > 0 and pf >= args.min_pf_oi and twin_ok
               and _tstat(nets) >= args.min_t)
         oi_rows.append((spec.id, n, total, pf, bn, bavg, ok))
