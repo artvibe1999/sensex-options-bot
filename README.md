@@ -77,6 +77,12 @@ attempts. In live mode the exact structure is checked with `basket_order_margins
 Stops, profit targets (50% of max profit for debits, 80% for credits), the trailing stop and the square-off time are
 enforced by the existing risk manager.
 
+Before sizing, every planned structure is re-validated against the current chain (`validate_plan_quotes`): each leg must be a
+listed, quoted contract of the right expiry, with a two-sided and tight bid/ask where depth exists, and the structure must
+still be defined-risk at executable prices (BUY at the ask, SELL at the bid). Live entries then pass a margin check, run in
+two verified phases, and are confirmed against the broker's positions. Exits never unwind: whatever closed stays closed,
+the remainder is retried (wider limit, then MARKET), and the longs are never sold while a short buy-back is unconfirmed.
+
 `python sim_harness.py` runs every strategy through mocked 1-minute ticks and prints how each exited. The tests in
 `tests/test_execution.py` script a mock Kite client (fill, partial, reject, hang, network error) and assert the order
 sequence.

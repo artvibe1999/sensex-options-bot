@@ -28,7 +28,8 @@ from kiteconnect import exceptions as kex
 from alerts import Alerter
 from config import IST, Config, capital_tier, load_config
 from costs import trade_cost
-from execution import LiveBroker, OrderLeg, PaperBroker, round_tick as _round_tick, validate_margin  # noqa: F401
+from execution import (LiveBroker, OrderLeg, PaperBroker, apply_exit_fills, round_tick as _round_tick,  # noqa: F401
+                       validate_margin, validate_plan_quotes)
 from market_data import MarketData, Snapshot
 from recorder import Recorder
 from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
@@ -394,6 +395,10 @@ class Bot:
         candidates.sort(key=lambda c: c[0], reverse=True)
         product = self.cfg.execution.product
         for score, plan in candidates:
+            qc = validate_plan_quotes(plan, snap.chain)         # strikes still listed, quoted, liquid and defined-risk
+            if not qc.ok:
+                log.info("Skip %s: %s", plan.variant_id, qc.reason)
+                continue
             margin_fn = None
             if self.live:
                 margin_fn = lambda n, plan=plan: self.client.required_margin(
@@ -437,6 +442,26 @@ class Bot:
             [ts, self.mode, plan.variant_id, "ENTRY", l.contract.symbol, l.side, l.qty,
              round(l.ref_price, 2), round(fills[l.contract.symbol], 2), plan.rationale[:120]] for l in legs])
         self.alerts.send(f"ENTRY {plan.name} x{lots} [{plan.variant_id}] {plan.rationale}")
+        self._verify_positions({l.contract.symbol: (l.qty if l.side == "BUY" else -l.qty) for l in legs}, "entry")
+
+    def _verify_positions(self, expected: dict[str, int], what: str) -> None:
+        """Live only: compare the broker's net positions with what the bot believes it holds for these symbols.
+        Retries briefly (the positions API can lag a fill). A mismatch halts new entries and raises a CRITICAL alert."""
+        if not self.live:
+            return
+        actual: dict[str, int] = {}
+        for attempt in range(3):
+            try:
+                book = self.client.net_positions()
+                actual = {s: book.get(s, 0) for s in expected}
+                if actual == expected:
+                    return
+            except Exception:  # noqa: BLE001 - verification must never break trading
+                log.warning("Position verification query failed", exc_info=True)
+            time.sleep(1.0)
+        self.risk.halt("POSITION_MISMATCH")
+        self.alerts.send(f"POSITION MISMATCH after {what}: broker {actual} vs expected {expected}. "
+                         "New entries halted: check positions in Kite.", level="CRITICAL", key="pos-mismatch")
 
     def _exit(self, reason: str) -> None:
         pos = self.position
@@ -445,36 +470,39 @@ class Bot:
         legs = [OrderLeg(l.contract, "SELL" if l.side == "BUY" else "BUY", l.qty, ltps[l.contract.token])
                 for l in pos.legs]
         mult = min(1 + self._exit_failures, 8)          # widen the limit buffer after each failure
-        fills = self.broker.execute(legs, self.cfg.execution.product, mult,
-                                    market=self._exit_failures >= self.cfg.execution.market_exit_after_failures)
-        if not fills:
-            self._exit_failures += 1
-            self.alerts.send(f"EXIT FAILED ({reason}), attempt {self._exit_failures}; retrying with a "
-                             "wider limit. Check positions manually if this repeats.",
-                             level="CRITICAL", key=f"exit-fail-{self._exit_failures}")
-            return
-        gross, cash = 0.0, []
-        for l in pos.legs:
-            px = fills[l.contract.symbol]
-            gross += (px - l.entry_price) * l.qty * (1 if l.side == "BUY" else -1)
-            cash += [(l.side, l.entry_price, l.qty),
-                     ("SELL" if l.side == "BUY" else "BUY", px, l.qty)]
+        res = self.broker.close(legs, self.cfg.execution.product, mult,
+                                market=self._exit_failures >= self.cfg.execution.market_exit_after_failures)
+        gross, cash = apply_exit_fills(pos.legs, res)   # reduces each leg by what really closed
         cost = trade_cost(cash, self.cfg.costs)
         net = gross - cost
         self.realized += net
-        self.position, self._exit_failures = None, 0
         ts = dt.datetime.now(IST).isoformat(timespec="seconds")
-        log.info("EXIT %s reason=%s net=%.0f day=%.0f", pos.plan.variant_id, reason, net, self.realized)
-        self.rec.trade(ts, self.mode, pos.plan.variant_id, "exit", reason, gross, cost, net,
-                       {"lots": pos.lots, "day_pnl": self.realized})
+        closed = [o for o in legs if o.contract.symbol in res]
+        remaining = [l for l in pos.legs if l.qty > 0]
+        tag = "exit" if not remaining else "exit_partial"
+        self.rec.trade(ts, self.mode, pos.plan.variant_id, tag, reason, gross, cost, net,
+                       {"lots": pos.lots, "day_pnl": self.realized, "remaining": [l.contract.symbol for l in remaining]})
         self.sheets.append("Orders", ORDERS_HEADER, [
-            [ts, self.mode, pos.plan.variant_id, "EXIT", o.contract.symbol, o.side, o.qty,
-             round(o.ref_price, 2), round(fills[o.contract.symbol], 2), reason] for o in legs])
+            [ts, self.mode, pos.plan.variant_id, "EXIT" if not remaining else "EXIT-PARTIAL", o.contract.symbol,
+             o.side, res[o.contract.symbol][1], round(o.ref_price, 2), round(res[o.contract.symbol][0], 2), reason]
+            for o in closed])
+        if remaining:
+            pos.legs = remaining
+            self._exit_failures += 1
+            self._save_state()
+            left = ", ".join(f"{l.side} {l.contract.symbol} x{l.qty}" for l in remaining)
+            self.alerts.send(f"EXIT INCOMPLETE ({reason}), attempt {self._exit_failures}; still open: {left}. "
+                             "Retrying with a wider limit, then market orders. Check Kite if this repeats.",
+                             level="CRITICAL", key=f"exit-fail-{self._exit_failures}")
+            return
+        self.position, self._exit_failures = None, 0
+        log.info("EXIT %s reason=%s net=%.0f day=%.0f", pos.plan.variant_id, reason, net, self.realized)
         self.sheets.append("Trades", TRADES_HEADER, [[ts, self.mode, pos.plan.variant_id, reason, pos.lots,
                                                       round(gross, 2), round(cost, 2), round(net, 2),
                                                       round(self.realized, 2)]])
         self._save_state()
         self.alerts.send(f"EXIT {pos.plan.name} [{reason}] net {net:,.0f}; day {self.realized:,.0f}")
+        self._verify_positions({o.contract.symbol: 0 for o in legs}, "exit")
 
 
 def setup_logging(log_dir: str) -> None:

@@ -162,6 +162,84 @@ class ExecutionTests(unittest.TestCase):
         self.assertFalse(bad.ok)                                           # a failed margin query blocks the trade
 
 
+class ValidationAndExitTests(unittest.TestCase):
+    def setUp(self):
+        import copy
+        self.chain = copy.copy(CHAIN)
+        self.chain.quotes = dict(CHAIN.quotes)
+        self.plan = sh.plan_from_strategy(STRATEGY_CLASSES["iron_condor"](), self.chain)
+
+    def _depth(self, bid_f=0.99, ask_f=1.01, only=None):
+        import dataclasses
+        for l in self.plan.legs:
+            k = (l.contract.strike, l.contract.kind)
+            q = self.chain.quotes[k]
+            if only is None or l.contract.symbol == only:
+                self.chain.quotes[k] = dataclasses.replace(q, bid=q.ltp * bid_f, ask=q.ltp * ask_f)
+
+    def test_valid_structure_passes_with_and_without_depth(self):
+        from execution import validate_plan_quotes
+        self.assertTrue(validate_plan_quotes(self.plan, self.chain).ok)
+        self._depth()
+        self.assertTrue(validate_plan_quotes(self.plan, self.chain).ok)
+
+    def test_missing_wide_or_one_sided_quotes_are_rejected(self):
+        from execution import validate_plan_quotes
+        sell = next(l for l in self.plan.legs if l.side == "SELL")
+        del self.chain.quotes[(sell.contract.strike, sell.contract.kind)]
+        self.assertFalse(validate_plan_quotes(self.plan, self.chain).ok)
+        self.setUp()
+        self._depth(0.80, 1.20)                                            # 40% wide spread
+        qc = validate_plan_quotes(self.plan, self.chain)
+        self.assertFalse(qc.ok)
+        self.assertIn("spread", qc.reason)
+        self.setUp()
+        self._depth(0.0, 1.01, only=sell.contract.symbol)                  # SELL leg with no bid cannot be exited
+        self.assertFalse(validate_plan_quotes(self.plan, self.chain).ok)
+
+    def test_executable_prices_that_break_the_risk_budget_are_rejected(self):
+        from execution import validate_plan_quotes
+        self._depth(0.90, 1.10, only=None)                                 # 20% spread but within 8%? no: rejected
+        self.assertFalse(validate_plan_quotes(self.plan, self.chain, max_spread_pct=50.0, max_loss_slack=1.0).ok)
+
+    def test_exit_never_sells_longs_while_a_buyback_is_unconfirmed(self):
+        kite = sh.MockKite()
+        legs = reverse_legs(sh.order_legs(sh.plan_from_strategy(STRATEGY_CLASSES["iron_condor"](), CHAIN)))
+        buy = next(l for l in legs if l.side == "BUY")
+        kite.behaviour[buy.contract.symbol] = "hang"
+        res = LiveBroker(kite, sh.fast_cfg(), sleep=lambda _s: None).close(legs, "MIS")
+        placed = [(s, sym) for k, s, sym, *_ in kite.log if k == "place"]
+        self.assertFalse(any(s == "SELL" for s, _ in placed))              # longs untouched: hedge stays on
+        self.assertNotIn(buy.contract.symbol, res)
+
+    def test_partial_exit_keeps_closed_legs_closed_and_reports_the_rest(self):
+        from execution import apply_exit_fills
+        from risk_manager import OpenLeg
+        kite = sh.MockKite()
+        plan = sh.plan_from_strategy(STRATEGY_CLASSES["iron_condor"](), CHAIN)
+        entry = sh.order_legs(plan)
+        open_legs = [OpenLeg(l.contract, l.side, l.qty, l.ref_price) for l in entry]
+        closing = reverse_legs(entry)
+        stuck = next(l for l in closing if l.side == "SELL")
+        kite.behaviour[(stuck.contract.symbol, "SELL")] = "hang"
+        res = LiveBroker(kite, sh.fast_cfg(), sleep=lambda _s: None).close(closing, "MIS")
+        gross, cash = apply_exit_fills(open_legs, res)
+        left = [l for l in open_legs if l.qty > 0]
+        self.assertEqual([l.contract.symbol for l in left], [stuck.contract.symbol])
+        self.assertEqual(left[0].side, "BUY")                              # only a long (limited-risk) leg remains
+        self.assertEqual(len(cash), 2 * (len(entry) - 1))
+
+    def test_complete_with_fewer_lots_than_ordered_is_not_trusted(self):
+        kite = sh.MockKite()
+        legs = sh.order_legs(sh.plan_from_strategy(STRATEGY_CLASSES["bull_call_spread"](), CHAIN))
+        orig = kite.order_history
+        def short(oid):
+            h = orig(oid)
+            return [{**h[0], "filled_quantity": h[0]["filled_quantity"] - 1}] if h[0]["status"] == "COMPLETE" else h
+        kite.order_history = short
+        self.assertIsNone(LiveBroker(kite, sh.fast_cfg(), sleep=lambda _s: None).execute(legs, "MIS"))
+
+
 class SessionTests(unittest.TestCase):
     def test_every_strategy_exits_with_a_rule_and_loss_stays_bounded(self):
         for key, cls in STRATEGY_CLASSES.items():

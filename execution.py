@@ -47,6 +47,72 @@ def reverse_legs(legs: Sequence[OrderLeg], marks: Optional[dict[int, float]] = N
                      (marks or {}).get(l.contract.token, l.ref_price)) for l in legs]
 
 
+# ------------------------------------------------- pre-trade structure validation
+@dataclass(frozen=True)
+class QuoteCheck:
+    ok: bool
+    reason: str = ""
+
+
+def validate_plan_quotes(plan, chain, max_spread_pct: float = 8.0, max_loss_slack: float = 1.15) -> QuoteCheck:
+    """Re-validate a planned structure against the CURRENT chain right before sizing/ordering.
+
+    Every leg must be a listed, quoted contract of the plan's expiry; where depth is available the bid/ask must be
+    two-sided and tight (a SELL leg with no bid, or a wide spread, cannot be exited); and the structure must still be
+    defined-risk with positive reward when priced at EXECUTABLE prices (BUY at the ask, SELL at the bid) with a
+    maximum loss no worse than `max_loss_slack` x the planned one. Fails closed."""
+    from option_strategies import analyse
+    priced = []
+    seen = set()
+    for l in plan.legs:
+        c = l.contract
+        key = (c.kind, c.strike, l.side)
+        if key in seen:
+            return QuoteCheck(False, f"duplicate leg {c.symbol}")
+        seen.add(key)
+        q = chain.get(c.strike, c.kind)
+        if q is None or q.contract.symbol != c.symbol:
+            return QuoteCheck(False, f"{c.symbol} is not currently quoted")
+        if c.expiry != plan.expiry or chain.expiry != plan.expiry:
+            return QuoteCheck(False, f"{c.symbol} expiry mismatch")
+        px = q.ltp
+        if q.bid is not None and q.ask is not None:
+            if q.ask <= 0 or (l.side != BUY and q.bid <= 0):
+                return QuoteCheck(False, f"{c.symbol} has no {'bid' if l.side != BUY else 'ask'}")
+            if q.bid > 0:
+                mid = (q.bid + q.ask) / 2
+                spread = (q.ask - q.bid) / mid * 100
+                if spread > max_spread_pct:
+                    return QuoteCheck(False, f"{c.symbol} spread {spread:.1f}% > {max_spread_pct:.0f}%")
+            px = q.ask if l.side == BUY else q.bid
+        priced.append((c.kind, c.strike, l.side, l.ratio, px))
+    eco = analyse(priced)
+    if eco is None:
+        return QuoteCheck(False, "structure has unbounded loss at executable prices")
+    if eco.max_profit <= 0 or eco.max_loss <= 0:
+        return QuoteCheck(False, "no positive reward at executable prices")
+    if eco.max_loss > plan.max_loss_unit * max_loss_slack:
+        return QuoteCheck(False, f"max loss {eco.max_loss:.1f} at executable prices exceeds plan {plan.max_loss_unit:.1f}")
+    return QuoteCheck(True)
+
+
+def apply_exit_fills(open_legs: list, fills: dict[str, tuple[float, int]]) -> tuple[float, list]:
+    """Book exit fills against open legs: reduces each leg's qty by what actually closed.
+    fills: symbol -> (avg exit price, filled qty). Returns (gross P&L of the closed part, fills for costing)."""
+    gross, cash = 0.0, []
+    for l in open_legs:
+        r = fills.get(l.contract.symbol)
+        if not r:
+            continue
+        px, q = r[0], min(int(r[1]), l.qty)
+        if q <= 0:
+            continue
+        gross += (px - l.entry_price) * q * (1 if l.side == BUY else -1)
+        cash += [(l.side, l.entry_price, q), (SELL if l.side == BUY else BUY, px, q)]
+        l.qty -= q
+    return gross, cash
+
+
 # ------------------------------------------------------------------ margin
 @dataclass(frozen=True)
 class MarginCheck:
@@ -84,6 +150,11 @@ class PaperBroker:
             fills[l.contract.symbol] = round_tick(f, l.contract.tick_size)
             log.info("[PAPER] %s %s x%d @ %.2f", l.side, l.contract.symbol, l.qty, fills[l.contract.symbol])
         return fills
+
+    def close(self, legs: list[OrderLeg], product: str, buffer_mult: float = 1.0,
+              market: bool = False) -> dict[str, tuple[float, int]]:
+        fills = self.execute(legs, product, buffer_mult, market) or {}
+        return {l.contract.symbol: (fills[l.contract.symbol], l.qty) for l in legs if l.contract.symbol in fills}
 
 
 # ------------------------------------------------------------------- live
@@ -141,6 +212,8 @@ class LiveBroker:
         all_complete = placed_ok
         for oid, l in orders.items():
             status, avg, filled, msg = res.get(oid, ("UNKNOWN", 0.0, 0, ""))
+            if status == "COMPLETE" and filled < l.qty:
+                status = "SHORT_FILL"                          # never trust COMPLETE with fewer lots than ordered
             if status != "COMPLETE":
                 all_complete = False
                 if status not in ("REJECTED", "CANCELLED"):
@@ -174,6 +247,25 @@ class LiveBroker:
             self._unwind(done, product)
             return None
         return {l.contract.symbol: avg for l, avg, _ in done}
+
+    def close(self, legs: list[OrderLeg], product: str, buffer_mult: float = 1.0,
+              market: bool = False) -> dict[str, tuple[float, int]]:
+        """Close a structure. Unlike entry there is NO unwind: whatever closed stays closed and the caller retries
+        the remainder. Shorts are bought back first; the longs are only sold once every buy-back is confirmed, so the
+        hedge is never removed while a short is still open. Returns {symbol: (avg price, filled qty)}."""
+        buys = [l for l in legs if l.side == BUY]
+        sells = [l for l in legs if l.side != BUY]
+        done: list[tuple[OrderLeg, float, int]] = []
+        if self._phase(buys, product, buffer_mult, market, done) and sells:
+            self._phase(sells, product, buffer_mult, market, done)
+        out: dict[str, tuple[float, int]] = {}
+        for l, avg, q in done:
+            if l.contract.symbol in out:                      # defensive: combine repeated fills of one symbol
+                a0, q0 = out[l.contract.symbol]
+                out[l.contract.symbol] = ((a0 * q0 + avg * q) / (q0 + q), q0 + q)
+            else:
+                out[l.contract.symbol] = (avg, q)
+        return out
 
     def _unwind(self, done: list[tuple[OrderLeg, float, int]], product: str) -> None:
         """Reverse what filled: buy back shorts first, then sell longs. Marketable limit with a wide buffer."""
