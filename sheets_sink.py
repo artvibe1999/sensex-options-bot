@@ -66,6 +66,9 @@ class SheetsSink:
                                 r.status_code, body[:60])
                 except requests.RequestException as exc:
                     log.warning("Sheets post failed: %s", exc.__class__.__name__)
+                except Exception as exc:  # noqa: BLE001 - e.g. an unserialisable value: drop the batch, keep the worker alive
+                    log.error("Sheets batch for %s could not be sent (%s): dropped", tab, exc.__class__.__name__)
+                    break
                 time.sleep(2 ** attempt)
             else:
                 log.error("Dropped %d rows for tab %s after 4 failures", len(rows), tab)

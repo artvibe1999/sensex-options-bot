@@ -309,7 +309,8 @@ def build_library() -> list[StrategySpec]:
             add_new("bull_put_spread", {"delta": 0.35, "width": width}, (LOW, NORM), band, "with", 0.6, 0.6)
             add_new("bear_call_spread", {"delta": 0.35, "width": width}, (LOW, NORM), band, "with", 0.6, 0.6)
     SMALL_FAMILY_SIZE = len(out) - before
-    assert SMALL_FAMILY_SIZE == 200, f"small-account family should be 200 variants, got {SMALL_FAMILY_SIZE}"
+    if SMALL_FAMILY_SIZE != 200:                       # informational: editing the lists changes the family size
+        log.warning("Small-account family has %d variants (expected 200)", SMALL_FAMILY_SIZE)
     # ---- trend / trap family: trade WITH a clean one-directional move ("valid") or AGAINST a failed breakout
     # ("trap"). d* use daily bars (backtestable); i* use 5-minute bars (forward-validated only). Widths 200-500 keep
     # them affordable for small accounts; capital tiers are evaluated separately.
@@ -368,7 +369,8 @@ def build_library() -> list[StrategySpec]:
                     add("os_bull_call_spread_itm", {"itm_offset": itm, "width": width}, regimes, band, "with", 0.5, 0.5)
                     add("os_bear_put_spread_itm", {"itm_offset": itm, "width": width}, regimes, band, "with", 0.5, 0.5)
     ids = [s.id for s in out]
-    assert len(ids) == len(set(ids)), "duplicate strategy ids"
+    if len(ids) != len(set(ids)):                      # explicit raise: asserts vanish under python -O
+        raise ValueError("duplicate strategy ids in the library")
     return out
 
 

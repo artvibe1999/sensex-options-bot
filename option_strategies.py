@@ -60,7 +60,7 @@ class Economics:
 @dataclass(frozen=True)
 class EntryContext:
     regime: str                  # LOW_VOL / NORMAL / HIGH_VOL
-    trend_dir: Optional[int]     # +1 / -1 / 0 / None (EMA trend on 5-minute closes)
+    trend_dir: Optional[int]     # +1 / -1 / 0 / None (EMA trend on completed daily closes, as in the backtest)
     spike: bool = False
 
 

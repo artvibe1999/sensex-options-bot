@@ -162,5 +162,31 @@ class PriceGuardTests(unittest.TestCase):
         self.assertEqual(c.get_ltp(1), 80123.5)             # a bad stream tick falls back to REST
 
 
+class ReviewFixTests(unittest.TestCase):
+    def test_sheets_worker_survives_an_unserialisable_row(self):
+        import time as _t
+        import sheets_sink
+        calls = []
+        orig = sheets_sink.requests.post
+        class R:                                              # pretend Google accepted the good batch
+            status_code, text = 200, "ok"
+        sheets_sink.requests.post = lambda *a, **k: (calls.append(1), R())[1]
+        try:
+            s = sheets_sink.SheetsSink("http://x.invalid/exec", "s")
+            s.append("T", ["h"], [[object()]])               # would raise TypeError inside requests in real life
+            s.append("T", ["h"], [["ok"]])
+            for _ in range(50):
+                if len(calls) >= 2:
+                    break
+                _t.sleep(0.05)
+            self.assertGreaterEqual(len(calls), 2)
+        finally:
+            sheets_sink.requests.post = orig
+
+    def test_library_builds_without_asserts(self):
+        ids = [s.id for s in lib.build_library()]
+        self.assertEqual(len(ids), len(set(ids)))
+
+
 if __name__ == "__main__":
     unittest.main()

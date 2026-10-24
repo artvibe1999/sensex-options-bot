@@ -136,11 +136,16 @@ class Bot:
                "risk": self.risk.export(),
                "position": _position_to_dict(self.position) if self.position else None}
         path = self.cfg.paths.state
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".state-")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(doc, f)
-        os.replace(tmp, path)
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".state-")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            os.replace(tmp, path)
+        except OSError:              # e.g. disk full: the in-memory position is still managed; do not abort the trade flow
+            log.critical("Could not write the state file: a restart now would lose track of the position", exc_info=True)
+            self.alerts.send("State file write FAILED (disk full?). Free space on the VM.", level="CRITICAL",
+                             key="state-write")
         self._last_state_save = time.monotonic()
 
     def _load_state(self) -> None:
@@ -307,7 +312,12 @@ class Bot:
             log.exception("Prune failed")
         self.session_ready = self.eod_done = False
         self._auth_alerted = self._halt_alerted = False
-        self._exit_failures = 0
+        self._exit_failures = self._entry_failures = 0
+        self._entry_block_until, self._stall_alerted = 0.0, False
+        if self.position and not self.live:    # a paper position left from an earlier day refers to expired contracts
+            log.warning("Dropping stale paper position %s from %s", self.position.plan.variant_id,
+                        self.position.entered_at.date())
+            self.position = None
         self._approved_stamp = None            # force a reload below
         self._refresh_approvals(now)
         self._save_state()

@@ -113,7 +113,10 @@ class TokenService:
                    and not self.fresh() and time.monotonic() - last >= every_s)
             if due:
                 last = time.monotonic()
-                self.alerts.send(f"Tap to log in to Kite for today's trading session:\n{self.login_url()}")
+                try:
+                    self.alerts.send(f"Tap to log in to Kite for today's trading session:\n{self.login_url()}")
+                except Exception:  # noqa: BLE001 - a failed prompt must not end the daily prompt loop
+                    log.exception("Could not send the login prompt")
             time.sleep(30)
 
     # ----------------------------------------------------------------- server
