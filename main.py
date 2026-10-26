@@ -28,6 +28,7 @@ from kiteconnect import exceptions as kex
 from alerts import Alerter
 from config import IST, Config, capital_tier, load_config
 from costs import trade_cost
+from explorer import pick_explore
 from execution import (LiveBroker, OrderLeg, PaperBroker, apply_exit_fills, round_tick as _round_tick,  # noqa: F401
                        validate_margin, validate_plan_quotes)
 from market_data import MarketData, Snapshot
@@ -446,11 +447,31 @@ class Bot:
         if reason:
             self._exit(reason)
 
+    def _try_explore(self, now: dt.datetime, snap: Snapshot) -> None:
+        """Paper only: trade the scanner's best affordable setup when no approved variant fired (see explorer.py)."""
+        if self.live or not self.cfg.paper_explore or self.trades_today >= self.cfg.explore_max_trades:
+            return
+        if time.monotonic() < self._entry_block_until:
+            return
+        ok, _why = self.risk.entry_allowed(now, 0)         # window / halt only; the explore cap is applied above
+        if not ok:
+            return
+        pick = pick_explore(snap, self.specs, self.capital, lambda p: self.risk.size(p, self.capital), now,
+                            self.cfg.explore_min_score)
+        if pick:
+            plan, lots, score = pick
+            self._enter(now, snap, plan, lots, score, 1)
+
     def _try_entry(self, now: dt.datetime, snap: Snapshot) -> None:
-        if not snap.fresh or snap.chain is None or not self.approved:
+        if not snap.fresh or snap.chain is None:
+            return
+        if not self.approved:
+            self._try_explore(now, snap)
             return
         ok, why = self.risk.entry_allowed(now, self.trades_today)
         if not ok or time.monotonic() < self._entry_block_until:
+            if not ok and self.trades_today >= self.risk.p.max_trades_per_day:
+                self._try_explore(now, snap)
             return
         candidates: list[tuple[float, TradePlan]] = []
         for vid, score in self.approved.items():
@@ -474,6 +495,7 @@ class Bot:
                 continue
             self._enter(now, snap, plan, lots, score, len(candidates))
             return
+        self._try_explore(now, snap)                    # nothing approved fired: paper-explore the scanner's best setup
 
     def _enter(self, now: dt.datetime, snap: Snapshot, plan: TradePlan, lots: int,
                score: float, n_candidates: int) -> None:

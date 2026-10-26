@@ -206,6 +206,9 @@ class Config:
     execution: ExecutionParams = field(default_factory=ExecutionParams)
     schedule: Schedule = field(default_factory=Schedule)
     paper_capital: float = 500_000.0
+    paper_explore: bool = True                # paper only: also trade the scanner's best setups (see explorer.py)
+    explore_min_score: float = 60.0
+    explore_max_trades: int = 4               # paper exploration trades per day (separate from the approved-variant cap)
     sheets_url: str | None = None             # Google Apps Script web-app URL (optional live feed)
     sheets_secret: str | None = None
     loop_interval_s: float = 1.0              # decision cadence (seconds)
@@ -248,6 +251,9 @@ def load_config() -> Config:
                                 slippage_pct=_env_float("BT_SLIPPAGE_PCT", 0.01)),
         execution=ExecutionParams(product=product),
         paper_capital=_env_float("PAPER_CAPITAL", 500_000.0),
+        paper_explore=(_env("PAPER_EXPLORE", "1") or "1") != "0",
+        explore_min_score=_env_float("EXPLORE_MIN_SCORE", 60.0),
+        explore_max_trades=int(_env_float("EXPLORE_MAX_TRADES", 4)),
         sheets_url=_env("SHEETS_WEBHOOK_URL"),
         sheets_secret=_env("SHEETS_SECRET"),
         loop_interval_s=_env_float("LOOP_INTERVAL_S", 1.0),

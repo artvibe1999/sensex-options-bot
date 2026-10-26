@@ -269,6 +269,31 @@ class IndependentReviewTests(unittest.TestCase):
         self.assertNotIn("deadbeef", "\n".join(cm.output))
 
 
+class ExploreTests(unittest.TestCase):
+    def _pick(self, capital, **kw):
+        import test_core
+        from risk_manager import RiskManager
+        import explorer
+        snap = test_core.ScannerTests()._snap(**kw)
+        rm = RiskManager(RiskParams(), Schedule())
+        rm.apply_capital(capital)
+        return explorer.pick_explore(snap, lib.build_library(), capital, lambda p: rm.size(p, capital), snap.ts)
+
+    def test_every_account_size_gets_a_labelled_paper_trade_on_a_clear_setup(self):
+        for cap in (15_000.0, 100_000.0, 500_000.0):
+            with self.subTest(capital=cap):
+                got = self._pick(cap)
+                self.assertIsNotNone(got)
+                plan, lots, score = got
+                self.assertTrue(plan.rationale.startswith("[EXPLORE "))
+                self.assertGreaterEqual(lots, 1)
+                self.assertLessEqual(plan.max_loss_per_lot * lots, cap * 0.2)      # sized inside the account's limits
+
+    def test_no_exploration_without_a_signal(self):
+        self.assertIsNone(self._pick(100_000.0, spread=9.0))                     # illiquid
+        self.assertIsNone(self._pick(100_000.0, spike=True))                     # volatility spike
+
+
 import sim_harness as _sh
 CHAIN_FOR_REVIEW = _sh.sample_chain()[0]
 
