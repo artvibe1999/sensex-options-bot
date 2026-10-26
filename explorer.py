@@ -20,8 +20,8 @@ from strategy_library import StrategySpec, _round_trip_cost, build_plan
 
 
 def pick_explore(snap, specs: list[StrategySpec], capital: float, size_fn: Callable[[TradePlan], int],
-                 now: dt.datetime, min_score: float = 60.0, max_setups: int = 2
-                 ) -> Optional[tuple[TradePlan, int, float]]:
+                 now: dt.datetime, min_score: float = 60.0, max_setups: int = 2,
+                 gate: Optional[Callable[[TradePlan, int], bool]] = None) -> Optional[tuple[TradePlan, int, float]]:
     """Best (plan, lots, scanner score) for the scanner's leading setups, or None. A candidate must be quoted and
     liquid, fit the account, and keep a positive expected margin after costs: (target profit - round-trip cost)
     relative to the stop-loss amount. The highest margin wins, which naturally favours cheap, few-leg structures
@@ -37,7 +37,7 @@ def pick_explore(snap, specs: list[StrategySpec], capital: float, size_fn: Calla
             if plan is None or not validate_plan_quotes(plan, snap.chain).ok:
                 continue
             lots = size_fn(plan)
-            if lots < 1:
+            if lots < 1 or (gate is not None and not gate(plan, lots)):
                 continue
             target = spec.tp_frac * plan.max_profit_per_lot
             stop = spec.sl_frac * plan.max_loss_per_lot

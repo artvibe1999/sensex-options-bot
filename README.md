@@ -186,3 +186,15 @@ See `deploy/DEPLOY.md`.
 
 ### Rupee exit rules on the combined position
 Exits use the combined P&L of all legs. `TRAIL_MIN_PROFIT_RS` (default 2000): the trailing profit stop only arms once combined profit reaches it and never exits below it (floor = max(peak x (1 - giveback), this)); the day-level trailing stop obeys it too. `POSITION_STOP_RS` (default 2000): combined stop-loss ceiling, a variant's tighter stop still applies. Set either to 0 to disable. These are live/paper overlays; backtest and shadow results are computed without them, so they do not reflect these rules.
+
+### Exit engine and entry filter (`exit_engine.py`, `market_context.py`, `entry_filter.py`)
+**Exits** work on the combined P&L of every leg (quantities include the 20-unit lot):
+- Combined hard stop at -`POSITION_STOP_RS` (2000). Between -2000 and +2000 nothing exits the trade: not variant stop/take-profit fractions, not the day-level trailing stop (disabled while the engine is on).
+- Once the peak reaches +`TRAIL_MIN_PROFIT_RS` (2000) the trail arms. The floor is a ratchet (never lowered): `max(2000, peak x (1 - giveback), milestone - lag x step)`, so it steps up at 3000, 4000, ... A print strictly below the floor exits with `TRAILING_STOP`.
+- `giveback` starts at 40% and is tightened or widened (15%-60%) from live signals: reversal retrace off the favourable extreme, 5-min momentum exhaustion, PCR momentum, max-pain drift, OI build-up and option-writing side, VIX change versus the structure's vega, and the theta window (from 13:30 on expiry day, from 14:15 otherwise). Widening never lowers a floor already locked.
+- Not "noise", so they still exit: 15:15 square-off, daily-loss kill-switch, shutdown, broker position mismatch / exit-not-completing halts.
+- Trail state (`peak`, `floor`) is saved with the position and survives restarts.
+
+**Entry filter** (all must pass; missing data fails closed unless `ENTRY_FILTER_STRICT=0`): the structure's net-delta bias must be confirmed by the daily/intraday trend or a trap reversal with nothing opposing (neutral structures need no valid trend); IV skew (25-delta put IV - call IV) must not contradict it; price-vs-OI build-up (long/short build-up, short covering, long unwinding) or option-writing side must agree (neutral structures need quiet OI); and, with `REQUIRE_REACHABLE_ARM=1`, the plan's maximum profit must exceed the 2000 arm level. Every pass/reject is logged with the reason (`ENTRY-FILTER ...`).
+
+The backtest and shadow book do **not** apply these exit or entry rules, so approvals still reflect the older rules.

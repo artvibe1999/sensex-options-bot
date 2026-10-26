@@ -28,9 +28,12 @@ from kiteconnect import exceptions as kex
 from alerts import Alerter
 from config import IST, Config, capital_tier, load_config
 from costs import trade_cost
+from entry_filter import EntryParams, evaluate_entry
+from exit_engine import ExitEngine, ExitParams
 from explorer import pick_explore
 from execution import (LiveBroker, OrderLeg, PaperBroker, apply_exit_fills, round_tick as _round_tick,  # noqa: F401
                        validate_margin, validate_plan_quotes)
+from market_context import MarketContext
 from market_data import MarketData, Snapshot
 from recorder import Recorder
 from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
@@ -70,7 +73,7 @@ def _position_to_dict(pos: ManagedPosition) -> dict:
         "legs": [{"contract": _contract_to_dict(l.contract), "side": l.side, "qty": l.qty,
                   "entry_price": l.entry_price} for l in pos.legs],
         "entered_at": pos.entered_at.isoformat(), "max_loss": pos.max_loss,
-        "max_profit": pos.max_profit, "peak_pnl": pos.peak_pnl,
+        "max_profit": pos.max_profit, "peak_pnl": pos.peak_pnl, "exit_state": pos.exit_state,
     }
 
 
@@ -85,7 +88,7 @@ def _position_from_dict(d: dict) -> ManagedPosition:
         sl_frac=p.get("sl_frac"), tp_frac=p.get("tp_frac"))
     legs = [OpenLeg(_contract_from_dict(l["contract"]), l["side"], l["qty"], l["entry_price"]) for l in d["legs"]]
     return ManagedPosition(plan, d["lots"], legs, dt.datetime.fromisoformat(d["entered_at"]),
-                           d["max_loss"], d["max_profit"], d.get("peak_pnl", 0.0))
+                           d["max_loss"], d["max_profit"], d.get("peak_pnl", 0.0), d.get("exit_state") or {})
 
 
 # ---------------------------------------------------------------------- bot
@@ -129,6 +132,13 @@ class Bot:
         self.engine.use_stream = cfg.stream_chain
         self.stream_full = os.getenv("STREAM_FULL", "1") != "0"   # tick-level OI/volume/depth near ATM
         self._approved_stamp: Optional[tuple] = None
+        self.xp = ExitParams.from_env()
+        self.exit_engine = ExitEngine(self.xp)
+        self.ep = EntryParams.from_env()
+        self.ctx = MarketContext()
+        self._last_snap: Optional[Snapshot] = None
+        self._gate_logged: dict[str, float] = {}
+        self._last_exit_status = 0.0
         self._load_state()
 
     # ------------------------------------------------------------ persistence
@@ -250,6 +260,8 @@ class Bot:
                     full = time.monotonic() - self._last_chain_rec >= self.cfg.chain_record_every_s
                     if full:
                         self._last_chain_rec = time.monotonic()
+                    self.ctx.update(snap, now)
+                    self._last_snap = snap
                     self.rec.record_snapshot(snap, with_chain=full)
                     self.shadow.step(snap, now)
                     self._record_flow(now, snap)
@@ -327,6 +339,8 @@ class Bot:
         self.risk.reset_day()
         self.shadow.reset_day()
         self.md.reset_day()
+        self.ctx.reset()
+        self._last_snap = None
         try:
             n = self.rec.prune_flow(self.cfg.flow_retention_days, now.date().isoformat())
             if n:
@@ -437,15 +451,45 @@ class Bot:
         pos = self.position
         assert pos
         pnl = pos.pnl(self._ltps(pos))
-        reason = self.risk.update_portfolio(self.capital, self.realized + pnl)
-        reason = reason or self.risk.check_position(pos, pnl)
+        if self.xp.enabled:
+            # Safety kill-switches first (daily loss / halts). The day-level trailing stop is off: it could exit
+            # inside the neutral zone. Profit protection is the exit engine's laddered trail on the combined P&L.
+            reason = self.risk.update_portfolio(self.capital, self.realized + pnl,
+                                                day_trail=not self.xp.suppress_day_trail)
+            if not reason:
+                snap = self._last_snap
+                fresh = snap is not None and (now - snap.ts).total_seconds() <= 120
+                sig = self.ctx.signals() if fresh else None
+                dec = self.exit_engine.evaluate(pos, pnl, now, sig, snap.spot if fresh else None)
+                reason = dec.reason
+                if time.monotonic() - self._last_exit_status > 60:
+                    self._last_exit_status = time.monotonic()
+                    log.info("MTM %s pnl=%.0f peak=%.0f floor=%s armed=%s giveback=%.0f%% %s", pos.plan.variant_id,
+                             pnl, dec.peak, "-" if dec.floor is None else f"{dec.floor:.0f}", dec.armed,
+                             dec.giveback * 100, "; ".join(dec.notes))
+        else:
+            reason = self.risk.update_portfolio(self.capital, self.realized + pnl)
+            reason = reason or self.risk.check_position(pos, pnl)
         if not reason and now.time() >= self.cfg.schedule.square_off and (
                 self.cfg.execution.product == "MIS" or pos.plan.expiry <= now.date()):
             reason = "SQUARE_OFF_TIME"
         if time.monotonic() - self._last_state_save > 30:
-            self._save_state()                         # persists the trailing-stop peak
+            self._save_state()                         # persists the trailing-stop peak and floor
         if reason:
             self._exit(reason)
+
+    def _gate(self, plan: TradePlan, lots: int, snap: Snapshot) -> bool:
+        """Entry filter (bias, IV skew, OI build-up, reachable trail). Rejections are logged at most once a minute."""
+        arm = self.xp.arm_rs if (self.xp.enabled and self.xp.require_reachable_arm) else None
+        dec = evaluate_entry(plan, snap, self.ctx.signals(), self.ep, lots, arm)
+        if dec.ok:
+            log.info("ENTRY-FILTER pass %s: %s", plan.variant_id, dec.summary())
+            return True
+        now_m = time.monotonic()
+        if now_m - self._gate_logged.get(plan.variant_id, 0.0) >= 60:
+            self._gate_logged[plan.variant_id] = now_m
+            log.info("ENTRY-FILTER reject %s: %s", plan.variant_id, dec.reason)
+        return False
 
     def _try_explore(self, now: dt.datetime, snap: Snapshot) -> None:
         """Paper only: trade the scanner's best affordable setup when no approved variant fired (see explorer.py)."""
@@ -457,7 +501,7 @@ class Bot:
         if not ok:
             return
         pick = pick_explore(snap, self.specs, self.capital, lambda p: self.risk.size(p, self.capital), now,
-                            self.cfg.explore_min_score)
+                            self.cfg.explore_min_score, gate=lambda p, n: self._gate(p, n, snap))
         if pick:
             plan, lots, score = pick
             self._enter(now, snap, plan, lots, score, 1)
@@ -491,7 +535,7 @@ class Bot:
                 margin_fn = lambda n, plan=plan: self.client.required_margin(
                     [(l.contract, l.side, plan.qty_for(l, n)) for l in plan.legs], product)
             lots = self.risk.size(plan, self.capital, margin_fn)
-            if lots < 1:
+            if lots < 1 or not self._gate(plan, lots, snap):
                 continue
             self._enter(now, snap, plan, lots, score, len(candidates))
             return
@@ -519,6 +563,7 @@ class Bot:
         self.position = ManagedPosition(
             plan, lots, [OpenLeg(l.contract, l.side, l.qty, fills[l.contract.symbol]) for l in legs],
             now, plan.max_loss_per_lot * lots, plan.max_profit_per_lot * lots)
+        self.exit_engine.init_state(self.position, snap.chain, snap.spot)
         self.trades_today += 1
         self._save_state()
         payload = {"lots": lots, "fills": fills, "rationale": plan.rationale, "score": score,
@@ -621,7 +666,8 @@ class Bot:
                        {"lots": pos.lots, "day_pnl": self.realized, "remaining": [l.contract.symbol for l in remaining],
                         "explore": pos.plan.rationale.startswith("[EXPLORE"),
                         "setup": pos.plan.rationale.split()[1] if pos.plan.rationale.startswith("[EXPLORE") else "",
-                        "max_loss_per_lot": pos.plan.max_loss_per_lot})
+                        "max_loss_per_lot": pos.plan.max_loss_per_lot,
+                        "peak_pnl": pos.peak_pnl, "floor": pos.exit_state.get("floor")})
         self.sheets.append("Orders", ORDERS_HEADER, [
             [ts, self.mode, pos.plan.variant_id, "EXIT" if not remaining else "EXIT-PARTIAL", o.contract.symbol,
              o.side, res[o.contract.symbol][1], round(o.ref_price, 2), round(res[o.contract.symbol][0], 2), reason]

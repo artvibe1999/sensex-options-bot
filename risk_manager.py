@@ -31,6 +31,7 @@ class ManagedPosition:
     max_loss: float
     max_profit: float
     peak_pnl: float = 0.0
+    exit_state: dict = field(default_factory=dict)   # exit-engine ratchet state (JSON-safe, persisted)
 
     def pnl(self, ltps: dict[int, float]) -> float:
         total = 0.0
@@ -95,7 +96,7 @@ class RiskManager:
         return True, ""
 
     # --------------------------------------------------------------- exits
-    def update_portfolio(self, capital: float, day_pnl: float) -> Optional[str]:
+    def update_portfolio(self, capital: float, day_pnl: float, day_trail: bool = True) -> Optional[str]:
         """Daily loss limit and portfolio trailing stop. Returns a reason to flatten."""
         if self.halted:
             # only loss-control halts flatten the book; a mismatch / unconfirmed unwind needs a human, not a blind exit
@@ -103,6 +104,8 @@ class RiskManager:
         if day_pnl <= -capital * self.p.max_daily_loss_pct:
             return self._halt("DAILY_LOSS_LIMIT")
         self._day_peak = max(self._day_peak, day_pnl)
+        if not day_trail:                  # per-position exit engine owns profit protection (no exits in the neutral zone)
+            return None
         mp = self.p.trail_min_profit_rs
         if self._day_peak >= max(capital * self.p.portfolio_trail_activation_pct, mp):
             floor = max(self._day_peak * (1 - self.p.portfolio_trail_giveback_pct), mp)
