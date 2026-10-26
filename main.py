@@ -618,7 +618,10 @@ class Bot:
         remaining = [l for l in pos.legs if l.qty > 0]
         tag = "exit" if not remaining else "exit_partial"
         self.rec.trade(ts, self.mode, pos.plan.variant_id, tag, reason, gross, cost, net,
-                       {"lots": pos.lots, "day_pnl": self.realized, "remaining": [l.contract.symbol for l in remaining]})
+                       {"lots": pos.lots, "day_pnl": self.realized, "remaining": [l.contract.symbol for l in remaining],
+                        "explore": pos.plan.rationale.startswith("[EXPLORE"),
+                        "setup": pos.plan.rationale.split()[1] if pos.plan.rationale.startswith("[EXPLORE") else "",
+                        "max_loss_per_lot": pos.plan.max_loss_per_lot})
         self.sheets.append("Orders", ORDERS_HEADER, [
             [ts, self.mode, pos.plan.variant_id, "EXIT" if not remaining else "EXIT-PARTIAL", o.contract.symbol,
              o.side, res[o.contract.symbol][1], round(o.ref_price, 2), round(res[o.contract.symbol][0], 2), reason]

@@ -294,6 +294,54 @@ class ExploreTests(unittest.TestCase):
         self.assertIsNone(self._pick(100_000.0, spike=True))                     # volatility spike
 
 
+class PromoteExploreTests(unittest.TestCase):
+    def _run(self, rows_shadow, rows_explore, extra=()):
+        import contextlib, io, json, sqlite3
+        d = tempfile.mkdtemp()
+        rec = recorder.Recorder(os.path.join(d, "sxbot.db"))
+        for r in rows_shadow:
+            rec.shadow_trade(*r)
+        for vid, ts, net, pl in rows_explore:
+            rec.trade(ts, "PAPER", vid, "exit", "tp", net, 0.0, net, pl)
+        rec._db.close()
+        buf = io.StringIO()
+        old = sys.argv
+        sys.argv = ["promote.py", "--data-dir", d, *extra]
+        try:
+            with contextlib.redirect_stdout(buf):
+                promote.main()
+        finally:
+            sys.argv = old
+        with open(os.path.join(d, "approved_live.json")) as f:
+            return json.load(f), buf.getvalue()
+
+    def test_explore_promotes_unbacktested_variant_and_dedupes(self):
+        today = dt.date.today()
+        vid = "iron_condor|x|r1|d0|t0|x0.5-0.5"
+        rows = []
+        for i in range(45):
+            day = (today - dt.timedelta(days=i + 1)).isoformat()
+            net = 900.0 if i % 3 else -300.0
+            rows.append((vid, day + "T10:00:00+05:30", net, {"lots": 1, "explore": True, "setup": "RANGE_PIN",
+                                                              "max_loss_per_lot": 3000.0}))
+        doc, out = self._run([], rows, ("--min-t", "0.5"))
+        self.assertIn("RANGE_PIN", out)
+        self.assertEqual([v["id"] for v in doc["variants"]], [vid])
+        self.assertEqual(doc["variants"][0]["evidence"], "forward_explore")
+        # shadow already traded the same days -> explore must NOT double count
+        shadow = [(vid, r[1], r[1], "tp", "RANGE", r[2], 0.0, r[2], 3000.0) for r in rows[:5]]
+        doc2, _ = self._run(shadow, rows[:5], ("--min-t", "0.5"))
+        self.assertEqual(doc2["variants"], [])
+
+    def test_non_explore_exit_ignored(self):
+        today = dt.date.today()
+        rows = [("v|a", (today - dt.timedelta(days=1)).isoformat() + "T10:00:00+05:30", 500.0,
+                 {"lots": 1, "explore": False})]
+        doc, out = self._run([], rows)
+        self.assertEqual(doc["variants"], [])
+        self.assertNotIn("Paper exploration results", out)
+
+
 import sim_harness as _sh
 CHAIN_FOR_REVIEW = _sh.sample_chain()[0]
 

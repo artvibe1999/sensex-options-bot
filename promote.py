@@ -43,6 +43,26 @@ def _tstat(nets: list[float]) -> float:
     return mean / (var / n) ** 0.5
 
 
+def _explore_trades(db, since: str) -> list[tuple[str, str, float, float, str]]:
+    """Closed paper exploration trades: (variant, day, net per ONE lot, max loss per lot, scanner setup)."""
+    out = []
+    try:
+        rows = db.execute("SELECT variant, ts, net, payload FROM trades WHERE event='exit' AND mode='PAPER' AND ts >= ?",
+                          (since,)).fetchall()
+    except sqlite3.Error:
+        return out
+    for vid, ts, net, payload in rows:
+        try:
+            pl = json.loads(payload or "{}")
+        except ValueError:
+            continue
+        if not pl.get("explore"):
+            continue
+        lots = max(int(pl.get("lots") or 1), 1)
+        out.append((vid, ts[:10], net / lots, float(pl.get("max_loss_per_lot") or 0.0), str(pl.get("setup") or "?")))
+    return out
+
+
 def _tier_nets(rows: list[tuple[float, float]], capital: float) -> list[float]:
     """Forward one-lot results (net, max_loss) re-expressed for an account size: n lots from the real sizing rule,
     trades that do not fit are skipped. Costs are scaled with n too, which slightly OVERstates them (conservative)."""
@@ -66,6 +86,8 @@ def main() -> int:
     ap.add_argument("--min-pf", type=float, default=1.2)
     ap.add_argument("--min-trades-oi", type=int, default=40, help="forward trades needed by OI-rule variants")
     ap.add_argument("--min-pf-oi", type=float, default=1.3)
+    ap.add_argument("--min-explore", type=int, default=10,
+                    help="scanner-selected paper trades a non-backtested variant needs (and they must be net positive)")
     ap.add_argument("--min-t", type=float, default=1.0,
                     help="mean net per trade must be this many standard errors above zero (guards against luck: "
                          "with ~1000 variants some always look good on 20 trades). 0 disables.")
@@ -83,9 +105,24 @@ def main() -> int:
     db = sqlite3.connect(os.path.join(args.data_dir, "sxbot.db"))
     fwd: dict[str, list[float]] = {}
     fwd_rows: dict[str, list[tuple[float, float]]] = {}
-    for vid, net, ml in db.execute("SELECT variant, net, max_loss FROM shadow_trades WHERE entry_ts >= ?", (since,)):
+    shadow_days: set[tuple[str, str]] = set()
+    for vid, net, ml, ets in db.execute("SELECT variant, net, max_loss, entry_ts FROM shadow_trades WHERE entry_ts >= ?",
+                                        (since,)):
         fwd.setdefault(vid, []).append(net)
         fwd_rows.setdefault(vid, []).append((net, ml))
+        shadow_days.add((vid, ets[:10]))
+    # Paper "[EXPLORE ...]" trades (real paper executions). A variant already shadow-traded the same day is NOT
+    # counted again (it would be the same trade twice); explore adds only days the shadow book did not trade.
+    explore = _explore_trades(db, since)
+    explore_n: dict[str, int] = {}
+    explore_net: dict[str, float] = {}
+    for vid, day, net1, ml, _setup in explore:
+        if (vid, day) in shadow_days:
+            continue
+        fwd.setdefault(vid, []).append(net1)
+        fwd_rows.setdefault(vid, []).append((net1, ml))
+        explore_n[vid] = explore_n.get(vid, 0) + 1
+        explore_net[vid] = explore_net.get(vid, 0.0) + net1
     db.close()
 
     def fwd_tiers(vid: str, min_n: int, min_pf: float) -> list[str]:
@@ -130,6 +167,24 @@ def main() -> int:
                          "forward": {"n": n, "net": total, "pf": pf},
                          "plain_twin": {"n": bn, "avg": bavg, "pf": bpf}})
 
+    # Variants with no backtest approval that earn promotion on forward evidence alone (same strict bar as the
+    # OI-rule variants), but only if their own scanner-selected paper trades are also positive.
+    known = {v["id"] for v in bt["variants"]} | {s.id for s in build_library() if s.forward_only}
+    explore_rows = []
+    for vid in sorted(explore_n):
+        if vid in known:
+            continue
+        nets = fwd.get(vid, [])
+        n, total, pf, tt = len(nets), sum(nets), _pf(nets), _tstat(nets)
+        ok = (explore_n[vid] >= args.min_explore and explore_net[vid] > 0 and n >= args.min_trades_oi
+              and total > 0 and pf >= args.min_pf_oi and tt >= args.min_t)
+        explore_rows.append((vid, n, total, pf, explore_n[vid], explore_net[vid], ok))
+        tiers = fwd_tiers(vid, args.min_trades_oi, args.min_pf_oi) if ok else []
+        if ok and tiers:
+            live.append({"id": vid, "score": pf, "evidence": "forward_explore", "tiers": tiers,
+                         "forward": {"n": n, "net": total, "pf": pf},
+                         "explore": {"n": explore_n[vid], "net": explore_net[vid]}})
+
     print(f"{'variant':<64} {'fwd n':>6} {'fwd net':>10} {'pf':>6}  live")
     for vid, n, total, pf, ok in sorted(rows, key=lambda r: -r[2])[:25]:
         print(f"{vid:<64} {n:>6} {total:>10,.0f} {pf:>6.2f}  {'YES' if ok else '-'}")
@@ -139,6 +194,17 @@ def main() -> int:
         for vid, n, total, pf, bn, bavg, ok in sorted(oi_rows, key=lambda r: -r[2])[:15]:
             if n:
                 print(f"{vid:<72} {n:>4} {total:>9,.0f} {pf:>5.2f} {bn:>6} {bavg:>9,.0f}  {'YES' if ok else '-'}")
+    if explore:
+        print("\nPaper exploration results by scanner setup (net per ONE lot, after costs):")
+        by: dict[str, list[float]] = {}
+        for _v, _d, net1, _m, setup in explore:
+            by.setdefault(setup, []).append(net1)
+        for setup, nets in sorted(by.items(), key=lambda kv: -sum(kv[1])):
+            print(f"  {setup:<20} n={len(nets):<4} net={sum(nets):>9,.0f}  pf={_pf(nets):.2f}  win%={100 * sum(x > 0 for x in nets) / len(nets):.0f}")
+    if explore_rows:
+        print("\nExploration-only candidates (no backtest approval; strict forward bar):")
+        for vid, n, total, pf, en, enet, ok in sorted(explore_rows, key=lambda r: -r[2])[:15]:
+            print(f"  {vid:<64} n={n:<4} net={total:>8,.0f} pf={pf:.2f} explore n={en} net={enet:>8,.0f}  {'YES' if ok else '-'}")
     doc = {"generated_at": dt.datetime.now(IST).isoformat(), "source": "promote",
            "valid_until": str(dt.date.today() + dt.timedelta(days=args.valid_days)), "variants": live}
     path = os.path.join(args.data_dir, "approved_live.json")

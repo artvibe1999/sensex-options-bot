@@ -122,6 +122,8 @@ sequence.
 ### Paper exploration (so paper mode always produces trades to learn from)
 In `--paper` mode, when no approved variant fires (or none is approved for your account size), `explorer.py` takes the scanner's best setups (score >= `EXPLORE_MIN_SCORE`, default 60), picks the affordable, liquid, defined-risk variant with the best (target - costs) / stop margin and paper-trades it, up to `EXPLORE_MAX_TRADES` (default 4) a day. Trades are labelled `[EXPLORE <setup> <score>]`. Set `PAPER_EXPLORE=0` to disable. It never runs in `--live` mode, and it is an experiment generator, not evidence of an edge: judge it by the recorded results after costs.
 
+`promote.py` counts these trades as forward evidence (per one lot, after costs), but never twice: if the shadow book already traded the same variant that day, only the shadow trade counts. A variant with no backtest approval can be promoted from exploration only under a stricter bar: `--min-explore` (default 10) scanner-selected trades that are net positive, plus the forward-only bar (>= 40 trades, profit factor >= 1.3, t-stat >= `--min-t`, per account tier). `promote.py` also prints results per scanner setup, which shows which setups (if any) are worth keeping.
+
 ## Trends, traps and account-size tiers
 
 **Valid trend / trap detection** (`trend_regime.py`). A *valid* trend is a clean one-directional move (high
