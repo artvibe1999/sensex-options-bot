@@ -342,6 +342,38 @@ class PromoteExploreTests(unittest.TestCase):
         self.assertNotIn("Paper exploration results", out)
 
 
+class RupeeRiskRuleTests(unittest.TestCase):
+    def _pos(self, max_loss=10000.0, max_profit=20000.0):
+        from types import SimpleNamespace
+        plan = SimpleNamespace(sl_frac=0.5, tp_frac=1.0)
+        return SimpleNamespace(plan=plan, max_loss=max_loss, max_profit=max_profit, peak_pnl=0.0)
+
+    def test_combined_stop_and_trail(self):
+        from risk_manager import RiskManager
+        rm = RiskManager(RiskParams(), Schedule())
+        pos = self._pos()
+        self.assertIsNone(rm.check_position(pos, -1999))
+        self.assertEqual(rm.check_position(pos, -2000), "HARD_STOP")      # 2000 ceiling beats 50% of 10000
+        pos = self._pos()
+        self.assertIsNone(rm.check_position(pos, 1900))                    # below 2000: trail not armed
+        self.assertIsNone(rm.check_position(pos, 500))                     # gives back, still no exit
+        pos = self._pos()
+        rm.check_position(pos, 3000)
+        self.assertIsNone(rm.check_position(pos, 2100))                    # 40% giveback = 1800, floor 2000 holds
+        self.assertEqual(rm.check_position(pos, 1990), "TRAILING_STOP")    # never exits via trail under 2000
+
+    def test_tighter_variant_stop_still_wins(self):
+        from risk_manager import RiskManager
+        rm = RiskManager(RiskParams(), Schedule())
+        self.assertEqual(rm.check_position(self._pos(max_loss=2300.0), -1150), "HARD_STOP")
+
+    def test_day_trail_respects_minimum(self):
+        from risk_manager import RiskManager
+        rm = RiskManager(RiskParams(), Schedule())
+        self.assertIsNone(rm.update_portfolio(20000, 400))
+        self.assertIsNone(rm.update_portfolio(20000, 100))                 # old rule would have flattened here
+
+
 import sim_harness as _sh
 CHAIN_FOR_REVIEW = _sh.sample_chain()[0]
 

@@ -89,6 +89,12 @@ class RiskParams:
     trail_giveback_pct: float = 0.40          # exit after giving back 40% of peak
     portfolio_trail_activation_pct: float = 0.015
     portfolio_trail_giveback_pct: float = 0.50
+    # Rupee rules on the COMBINED P&L of the open multi-leg position (0 = off):
+    #  - trail_min_profit_rs: trailing profit stop only arms once combined profit reaches this, and it never
+    #    exits below it (floor = max(peak x (1 - giveback), this)); the day-level trailing stop obeys it too.
+    #  - position_stop_rs: combined stop loss; applied as a CEILING, so a variant's tighter stop still wins.
+    trail_min_profit_rs: float = 2000.0
+    position_stop_rs: float = 2000.0
     # Small accounts: one SENSEX lot can risk more than max_risk_per_trade_pct of capital. If
     # one_lot_risk_pct > 0 a plan whose worst-case loss for ONE lot is <= this share of capital
     # may still trade 1 lot. 0 = off (standard accounts never exceed max_risk_per_trade_pct).
@@ -244,6 +250,8 @@ def load_config() -> Config:
             max_risk_per_trade_pct=_env_float("MAX_RISK_PER_TRADE_PCT", 0.02),
             max_daily_loss_pct=_env_float("MAX_DAILY_LOSS_PCT", 0.03),
             max_lots=int(_env_float("MAX_LOTS", 10)),
+            trail_min_profit_rs=_env_float("TRAIL_MIN_PROFIT_RS", 2000.0),
+            position_stop_rs=_env_float("POSITION_STOP_RS", 2000.0),
         ),
         backtest=BacktestParams(iv_scale=_env_float("BT_IV_SCALE", 0.95),
                                 lot_size=int(_env_float("BT_LOT_SIZE", 20)),

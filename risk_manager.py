@@ -103,8 +103,9 @@ class RiskManager:
         if day_pnl <= -capital * self.p.max_daily_loss_pct:
             return self._halt("DAILY_LOSS_LIMIT")
         self._day_peak = max(self._day_peak, day_pnl)
-        if self._day_peak >= capital * self.p.portfolio_trail_activation_pct:
-            floor = self._day_peak * (1 - self.p.portfolio_trail_giveback_pct)
+        mp = self.p.trail_min_profit_rs
+        if self._day_peak >= max(capital * self.p.portfolio_trail_activation_pct, mp):
+            floor = max(self._day_peak * (1 - self.p.portfolio_trail_giveback_pct), mp)
             if day_pnl <= floor:
                 return self._halt("PORTFOLIO_TRAILING_STOP")
         return None
@@ -114,11 +115,20 @@ class RiskManager:
         sl = pos.plan.sl_frac if pos.plan.sl_frac is not None else p.stop_loss_pct_of_max_loss
         tp = pos.plan.tp_frac if pos.plan.tp_frac is not None else p.take_profit_pct_of_max_profit
         pos.peak_pnl = max(pos.peak_pnl, pnl)
-        if pnl <= -sl * pos.max_loss:
+        stop = sl * pos.max_loss
+        if p.position_stop_rs > 0:
+            stop = min(stop, p.position_stop_rs)           # combined loss never allowed past the rupee stop
+        if pnl <= -stop:
             return "HARD_STOP"
         if pnl >= tp * pos.max_profit:
             return "TAKE_PROFIT"
-        if (pos.peak_pnl >= p.trail_activation_pct_of_max_profit * pos.max_profit
+        if p.trail_min_profit_rs > 0:
+            # arms only at the minimum rupee profit and never gives back below it
+            if pos.peak_pnl >= p.trail_min_profit_rs:
+                floor = max(pos.peak_pnl * (1 - p.trail_giveback_pct), p.trail_min_profit_rs)
+                if pnl <= floor:
+                    return "TRAILING_STOP"
+        elif (pos.peak_pnl >= p.trail_activation_pct_of_max_profit * pos.max_profit
                 and pnl <= pos.peak_pnl * (1 - p.trail_giveback_pct)):
             return "TRAILING_STOP"
         return None

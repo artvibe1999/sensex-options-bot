@@ -183,3 +183,6 @@ shadow-trades but places NO paper orders; run the backtest first (step 1 above),
 
 ## Daily token
 See `deploy/DEPLOY.md`.
+
+### Rupee exit rules on the combined position
+Exits use the combined P&L of all legs. `TRAIL_MIN_PROFIT_RS` (default 2000): the trailing profit stop only arms once combined profit reaches it and never exits below it (floor = max(peak x (1 - giveback), this)); the day-level trailing stop obeys it too. `POSITION_STOP_RS` (default 2000): combined stop-loss ceiling, a variant's tighter stop still applies. Set either to 0 to disable. These are live/paper overlays; backtest and shadow results are computed without them, so they do not reflect these rules.
