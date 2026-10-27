@@ -104,7 +104,7 @@ def sheet_row(now: dt.datetime, mode: str, res: dict[str, Any]) -> list:
     return [now.isoformat(timespec="seconds"), mode, "yes" if i["token_fresh"] else "NO",
             i["paper_approved"] if str(mode).lower() == "paper" else i["live_approved"],
             i["spot"], i["vix"], i["regime"], i["market_rows"], i["chain_rows"],
-            None if i["age_s"] is None else round(i["age_s"]), len(i["trades"]), i["shadow_closed"],
+            None if i["age_s"] is None else round(i["age_s"]), sum(1 for t in i["trades"] if t[3] == "entry"), i["shadow_closed"],
             round(i["shadow_net"]), "OK" if not f else " | ".join(f)[:300]]
 
 
