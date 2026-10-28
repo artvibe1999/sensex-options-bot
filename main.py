@@ -139,6 +139,7 @@ class Bot:
         self._last_snap: Optional[Snapshot] = None
         self._gate_logged: dict[str, float] = {}
         self._last_exit_status = 0.0
+        self._margin_cache: dict[tuple, tuple[float, Optional[float]]] = {}
         self._load_state()
 
     # ------------------------------------------------------------ persistence
@@ -478,6 +479,25 @@ class Bot:
         if reason:
             self._exit(reason)
 
+    def _margin_fn(self, plan: TradePlan):
+        """lots -> margin Kite says the whole structure needs (basket margins, a read-only API call), in BOTH paper and
+        live mode so paper only takes trades the account could really carry. Cached ~30 s (the loop runs every second).
+        None = the query failed, which blocks the trade (fail closed)."""
+        product = self.cfg.execution.product
+
+        def fn(n: int) -> Optional[float]:
+            legs = tuple((l.contract, l.side, plan.qty_for(l, n)) for l in plan.legs)
+            key = tuple((c.token, s, q) for c, s, q in legs)
+            hit = self._margin_cache.get(key)
+            if hit and time.monotonic() - hit[0] < 30:
+                return hit[1]
+            val = self.client.required_margin(list(legs), product)
+            if len(self._margin_cache) > 200:
+                self._margin_cache.clear()
+            self._margin_cache[key] = (time.monotonic(), val)
+            return val
+        return fn
+
     def _gate(self, plan: TradePlan, lots: int, snap: Snapshot) -> bool:
         """Entry filter (bias, IV skew, OI build-up, reachable trail). Rejections are logged at most once a minute."""
         arm = self.xp.arm_rs if (self.xp.enabled and self.xp.require_reachable_arm) else None
@@ -500,7 +520,7 @@ class Bot:
         ok, _why = self.risk.entry_allowed(now, 0)         # window / halt only; the explore cap is applied above
         if not ok:
             return
-        pick = pick_explore(snap, self.specs, self.capital, lambda p: self.risk.size(p, self.capital), now,
+        pick = pick_explore(snap, self.specs, self.capital, lambda p: self.risk.size(p, self.capital, self._margin_fn(p)), now,
                             self.cfg.explore_min_score, gate=lambda p, n: self._gate(p, n, snap))
         if pick:
             plan, lots, score = pick
@@ -524,17 +544,12 @@ class Bot:
             if plan:
                 candidates.append((score, plan))
         candidates.sort(key=lambda c: c[0], reverse=True)
-        product = self.cfg.execution.product
         for score, plan in candidates:
             qc = validate_plan_quotes(plan, snap.chain)         # strikes still listed, quoted, liquid and defined-risk
             if not qc.ok:
                 log.info("Skip %s: %s", plan.variant_id, qc.reason)
                 continue
-            margin_fn = None
-            if self.live:
-                margin_fn = lambda n, plan=plan: self.client.required_margin(
-                    [(l.contract, l.side, plan.qty_for(l, n)) for l in plan.legs], product)
-            lots = self.risk.size(plan, self.capital, margin_fn)
+            lots = self.risk.size(plan, self.capital, self._margin_fn(plan))
             if lots < 1 or not self._gate(plan, lots, snap):
                 continue
             self._enter(now, snap, plan, lots, score, len(candidates))
@@ -546,14 +561,16 @@ class Bot:
         log.info("ENTRY %s lots=%d | %s", plan.variant_id, lots, plan.rationale)
         legs = [OrderLeg(l.contract, l.side, plan.qty_for(l, lots), l.ref_price) for l in plan.legs]
         ts = now.isoformat(timespec="seconds")
-        if self.live:                                   # final pre-trade check on the exact structure to be sent
-            chk = validate_margin(self.client, legs, self.cfg.execution.product, self.client.available_cash(),
-                                  self.risk.p.margin_utilisation)
-            if not chk.ok:
-                self.alerts.send(f"Entry blocked by margin check for {plan.variant_id}: {chk.reason}",
-                                 level="ERROR", key="entry-margin")
-                self.rec.event(ts, "entry_blocked_margin", plan.variant_id, {"lots": lots, "reason": chk.reason})
-                return
+        # final pre-trade margin check on the exact structure (paper checks against the paper capital, so a paper trade
+        # is only taken if the account could really carry it)
+        cash = self.client.available_cash() if self.live else self.capital
+        chk = validate_margin(self.client, legs, self.cfg.execution.product, cash, self.risk.p.margin_utilisation)
+        if not chk.ok:
+            self.alerts.send(f"Entry blocked by margin check for {plan.variant_id}: {chk.reason}",
+                             level="ERROR", key="entry-margin")
+            self.rec.event(ts, "entry_blocked_margin", plan.variant_id, {"lots": lots, "reason": chk.reason})
+            return
+        margin_req = chk.required
         fills = self.broker.execute(legs, self.cfg.execution.product)
         if not fills:
             self._entry_failed(ts, plan, lots, legs)
@@ -568,13 +585,15 @@ class Bot:
         self._save_state()
         payload = {"lots": lots, "fills": fills, "rationale": plan.rationale, "score": score,
                    "candidates": n_candidates, "spot": snap.spot, "vix": snap.vix,
-                   "regime": snap.rs.regime.value, "trend": snap.trend_dir}
+                   "regime": snap.rs.regime.value, "trend": snap.trend_dir, "margin": margin_req}
         self.rec.event(ts, "entry", plan.variant_id, payload)
         self.rec.trade(ts, self.mode, plan.variant_id, "entry", "", 0.0, 0.0, 0.0, payload)
         self.sheets.append("Orders", ORDERS_HEADER, [
             [ts, self.mode, plan.variant_id, "ENTRY", l.contract.symbol, l.side, l.qty,
-             round(l.ref_price, 2), round(fills[l.contract.symbol], 2), plan.rationale[:120]] for l in legs])
-        self.alerts.send(f"ENTRY {plan.name} x{lots} [{plan.variant_id}] {plan.rationale}")
+             round(l.ref_price, 2), round(fills[l.contract.symbol], 2), plan.rationale[:120]]
+            for l in sorted(legs, key=lambda x: x.side != "BUY")])      # rows listed in execution order: hedges first
+        mtxt = f", margin {margin_req:,.0f} of {cash:,.0f}" if margin_req else ""
+        self.alerts.send(f"ENTRY {plan.name} x{lots} [{plan.variant_id}] {plan.rationale}{mtxt}")
         self._verify_positions({l.contract.symbol: (l.qty if l.side == "BUY" else -l.qty) for l in legs}, "entry")
 
     def _entry_failed(self, ts: str, plan: TradePlan, lots: int, legs: list[OrderLeg]) -> None:

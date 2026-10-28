@@ -335,5 +335,33 @@ class BotManageTests(unittest.TestCase):
         self.assertEqual(b.exited, ["DAILY_LOSS_LIMIT"])
 
 
+class MarginInPaperModeTests(unittest.TestCase):
+    def _bot(self, margin):
+        import main
+        from config import RiskParams, Schedule
+        from risk_manager import RiskManager
+        b = object.__new__(main.Bot)
+        b.live, b.capital = False, 20000.0
+        b.cfg = SimpleNamespace(execution=SimpleNamespace(product="MIS"))
+        b.calls = []
+        b.client = SimpleNamespace(required_margin=lambda legs, product: (b.calls.append(1), margin)[1])
+        b._margin_cache = {}
+        b.risk = RiskManager(RiskParams(), Schedule())
+        b.risk.apply_capital(b.capital)
+        return b
+
+    def test_paper_sizing_respects_margin_and_caches(self):
+        plan = sh.plan_from_strategy(STRATEGY_CLASSES["bull_call_spread"](), CH)
+        ok = self._bot(10000.0)
+        self.assertEqual(ok.risk.size(plan, ok.capital, ok._margin_fn(plan)), 1)
+        n = len(ok.calls)
+        ok.risk.size(plan, ok.capital, ok._margin_fn(plan))
+        self.assertEqual(len(ok.calls), n)                                # cached: no second API call
+        big = self._bot(60000.0)                                          # far more than 80% of Rs 20,000
+        self.assertEqual(big.risk.size(plan, big.capital, big._margin_fn(plan)), 0)
+        fail = self._bot(None)                                            # margin query failed -> fail closed
+        self.assertEqual(fail.risk.size(plan, fail.capital, fail._margin_fn(plan)), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

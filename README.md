@@ -198,3 +198,6 @@ Exits use the combined P&L of all legs. `TRAIL_MIN_PROFIT_RS` (default 2000): th
 **Entry filter** (all must pass; missing data fails closed unless `ENTRY_FILTER_STRICT=0`): the structure's net-delta bias must be confirmed by the daily/intraday trend or a trap reversal with nothing opposing (neutral structures need no valid trend); IV skew (25-delta put IV - call IV) must not contradict it; price-vs-OI build-up (long/short build-up, short covering, long unwinding) or option-writing side must agree (neutral structures need quiet OI); and, with `REQUIRE_REACHABLE_ARM=1`, the plan's maximum profit must exceed the 2000 arm level. Every pass/reject is logged with the reason (`ENTRY-FILTER ...`).
 
 The backtest and shadow book do **not** apply these exit or entry rules, so approvals still reflect the older rules.
+
+### Margin in paper mode
+Paper trades now go through the same Kite basket-margin check as live (read-only API call, no orders): lots are sized to fit `margin_utilisation` x capital, and the final entry is blocked if the whole structure needs more. A failed margin query blocks the trade. The Telegram ENTRY alert shows the margin used. Order rows in the Orders sheet are listed in execution order (BUY hedges first, then SELLs).
