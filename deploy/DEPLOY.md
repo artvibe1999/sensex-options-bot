@@ -63,3 +63,9 @@ Keep the VM up on a given day: `touch data/NO_AUTOSTOP` (delete the file to resu
 It only reads the bot's own record; with live money also check the broker's positions page if you get the alert.
 
 `install_autostop.sh` also installs `sxbot-compose.service`, which runs `docker compose up -d` on every boot, so the bot, login service and web server always start with the VM.
+
+## Weekly intraday-approval refresh
+`sudo bash deploy/install_intraday_refresh.sh` (once). Every Friday at 15:35 IST it re-downloads 5-minute SENSEX/VIX
+history with that day's Kite login and re-runs `intraday_backtest.py` (~15 min on 2 vCPU), holding off the auto-stop
+while it works, then sends the result to Telegram. A failed run (e.g. no login that day) keeps the old approvals
+(valid 60 days). History: `logs/intraday_refresh_history.log`; last run's output: `logs/intraday_refresh.log`.
