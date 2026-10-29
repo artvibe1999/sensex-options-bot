@@ -288,3 +288,16 @@ treat backtest numbers as optimistic. Hence:
 docker compose exec bot python intraday_backtest.py --fetch-kite 1400     # or --index data/sensex_5m.csv --vix data/vix_5m.csv
 docker compose restart bot
 ```
+
+### Calls vs puts, ITM strikes, pullbacks (revisited, Oct 2026)
+Protocol: rules designed on 2023-2024 only, each direction's chosen rule tested once on 2025-2026, then the full
+walk-forward decides approvals.
+- **Calls need the sideways-day filter** (+31/trade with it vs -218 without, 2023-24), confirmation, a 2.5R target and
+  in-the-money strikes (200 ITM: -111/trade vs 100 OTM: -170 across all call variants) - ITM premium is mostly
+  intrinsic, so the IV crush that comes with rallies hurts less.
+- Even so, the best call rule was only breakeven on 2025-26 (PF 1.08) and LOST in the full walk-forward (out-of-sample
+  PF 0.94, max drawdown ~Rs 25k per lot). No call-buying variant is approved. They stay in the library, so the shadow
+  book keeps forward-testing them and `promote.py` will pick one up if live evidence turns positive.
+- The pullback-retest entry looked good in 2023-24 calls but lost Rs 45k on 2025-26 (PF 0.50): rejected.
+- Calls and puts are separate variants now (`dir` +1 / -1). A "both directions" variant could pass on its put trades
+  and switch call buying on by itself; that can no longer happen.

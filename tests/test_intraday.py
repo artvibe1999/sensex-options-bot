@@ -107,6 +107,16 @@ class SignalTests(unittest.TestCase):
         self.assertGreater(s.stop, 74120)                                 # beyond the poke high
         self.assertIsNone(self._detect(TRAP[:-1] + [(74010, 74080, 74005, 74070)], I.TRAP))   # held above: no trap
 
+    def test_pullback_after_a_confirmed_breakdown(self):
+        rows = BREAKDOWN + [(73780, 73835, 73775, 73830),       # pulls back up towards the broken 73850
+                            (73830, 73845, 73800, 73810),
+                            (73810, 73812, 73720, 73725)]       # strong red bar below the previous low: resume
+        s = self._detect(rows, I.PULLBACK, room_r=1.0)
+        self.assertEqual((s.kind, s.direction, s.level), (I.PULLBACK, -1, 73850))
+        self.assertGreater(s.stop, 73845)                                 # above the pullback high
+        reclaimed = BREAKDOWN + [(73780, 73990, 73775, 73980), (73980, 73985, 73900, 73905)]
+        self.assertIsNone(self._detect(reclaimed, I.PULLBACK, room_r=1.0))   # closed back above the stop: failed
+
     def test_range_day(self):
         quiet = OR + [(74000, 74020, 73980, 74000 + (5 if i % 2 else -5)) for i in range(20)]
         s = self._detect(quiet, I.RANGE)
@@ -144,8 +154,7 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(spec.multi_leg)
 
     def test_direction_filter_and_no_signal(self):
-        bull_only = dataclasses.replace(_spec("ib_long", sig=1, dir=0, flt=0, conf=1),
-                                        params=tuple({**_spec("ib_long", sig=1, dir=0, flt=0, conf=1).p, "dir": 1}.items()))
+        bull_only = _spec("ib_long", sig=1, dir=1, flt=0, conf=1)
         self.assertIsNone(lib.build_plan(bull_only, _chain(73780, self.T), NORMAL, None, DAY, self.T, None, None,
                                          _ictx(BREAKDOWN)))
         spec = _spec("ib_long", sig=1, dir=-1, flt=0, conf=1)

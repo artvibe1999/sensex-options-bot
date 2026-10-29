@@ -21,6 +21,17 @@ from strategy_engine import Regime, RegimeState, bs_price, implied_vol
 BP, SP = BacktestParams(), StrategyParams()
 
 
+def trading_days_ahead(day: dt.date) -> dt.date:
+    """A weekday expiry 1-3 calendar days ahead (the test variants trade DTE 1-3). A fixed +2 days lands on a weekend
+    on Thursdays and Fridays, where the backtest's weekday clock prices the options at almost nothing and no structure
+    can be built, so these tests used to fail depending on the day they ran."""
+    for off in (2, 3, 1):
+        d = day + dt.timedelta(days=off)
+        if d.weekday() < 5:
+            return d
+    raise AssertionError("unreachable")
+
+
 class BacktestAuditTests(unittest.TestCase):
     def test_expiry_weekday_follows_the_real_history(self):
         self.assertEqual(bt.expiry_weekday_on(dt.date(2024, 6, 3), BP), 4)     # Friday era
@@ -98,7 +109,7 @@ class ShadowAuditTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def snap(self, t, spread_pct=None):
-        chain = bt.model_chain(80000.0, 0.11, t.date() + dt.timedelta(days=2), t, BP, SP.risk_free_rate)
+        chain = bt.model_chain(80000.0, 0.11, trading_days_ahead(t.date()), t, BP, SP.risk_free_rate)
         if spread_pct is not None:                                       # attach two-sided depth around the model price
             from dataclasses import replace
             for k, q in list(chain.quotes.items()):

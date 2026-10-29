@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from chain_features import ChainFeatures
-from intraday import BREAKOUT, RANGE, TRAP, Signal, SignalParams, detect
+from intraday import BREAKOUT, PULLBACK, RANGE, TRAP, Signal, SignalParams, detect
 from strategy_engine import Chain, Leg, OptionQuote, RegimeState, TradePlan
 from option_strategies import STRATEGY_BUILDERS, STRATEGY_DIRECTION
 from trend_regime import TrendInfo
@@ -85,7 +85,7 @@ class StrategySpec:
 
 
 SINGLE_LEG_TEMPLATES = frozenset({"long_call", "long_put", "ib_long"})
-SIG_KIND = {1: BREAKOUT, 2: TRAP, 3: RANGE}
+SIG_KIND = {1: BREAKOUT, 2: TRAP, 3: RANGE, 4: PULLBACK}
 
 
 # ------------------------------------------------------------------ intraday signal context
@@ -477,29 +477,32 @@ def build_library() -> list[StrategySpec]:
                     add("os_bull_call_spread_itm", {"itm_offset": itm, "width": width}, regimes, band, "with", 0.5, 0.5)
                     add("os_bear_put_spread_itm", {"itm_offset": itm, "width": width}, regimes, band, "with", 0.5, 0.5)
     # ---- intraday price-action family (intraday.py), validated by intraday_backtest.py on 5-minute history.
-    # sig: 1 breakout, 2 trap (failed breakout), 3 range day. dir: 0 both, -1 bearish only. flt: sideways-day filters.
-    # ib_long (one option) is the single-leg family for small accounts; the rest are multi-leg.
+    # sig: 1 breakout, 2 trap, 3 range day, 4 pullback. dir: +1 calls / bullish, -1 puts / bearish, 0 either.
+    # otm: strikes from ATM (negative = in the money: less extrinsic value, so less hurt by the IV crush of rallies).
+    # flt: sideways-day filters. Settings that lost in BOTH directions on 2023-24 (no confirmation, 1.5R target)
+    # are not repeated here. ib_long (one option) is the single-leg family for small accounts; the rest are multi-leg.
     ALL = (LOW, NORM, HIGH)
+    for d in (1, -1):
+        for flt in (0, 1):
+            for otm in (-2, -1, 0, 1):
+                for be in (0, 1):
+                    add("ib_long", {"sig": 1, "dir": d, "flt": flt, "conf": 1, "tr": 2.5, "otm": otm, "be": be},
+                        ALL, (1, 7), "none", 0.9, 1.0)
+        for otm in (-2, 0):
+            add("ib_long", {"sig": 4, "dir": d, "flt": 1, "conf": 1, "tr": 2.5, "otm": otm, "be": 1},
+                ALL, (1, 7), "none", 0.9, 1.0)
+    for be in (0, 1):
+        add("ib_long", {"sig": 2, "tr": 2.5, "otm": 0, "be": be}, ALL, (1, 7), "none", 0.9, 1.0)
     for flt in (0, 1):
-        for d in (0, -1):
-            for conf in (0, 1):
-                for tr in (1.5, 2.5):
-                    for otm in (0, 1):
-                        for be in (0, 1):
-                            add("ib_long", {"sig": 1, "dir": d, "flt": flt, "conf": conf, "tr": tr, "otm": otm,
-                                            "be": be}, ALL, (1, 7), "none", 0.9, 1.0)
-    for tr in (1.5, 2.5):
-        for be in (0, 1):
-            add("ib_long", {"sig": 2, "tr": tr, "otm": 0, "be": be}, ALL, (1, 7), "none", 0.9, 1.0)
-    for flt in (0, 1):
-        for d in (0, -1):
-            for width in (200, 400):
-                add("ib_debit", {"sig": 1, "dir": d, "flt": flt, "width": width, "tr": 2.0, "be": 1},
-                    ALL, (1, 7), "none", 0.9, 1.0)
+        for d in (0, -1, 1):
             for width in (200, 500):
                 for off in (0, 100):
                     add("ib_credit", {"sig": 1, "dir": d, "flt": flt, "width": width, "off": off},
                         ALL, (1, 7), "none", 0.9, 1.0)
+        for d in (0, -1):
+            for width in (200, 400):
+                add("ib_debit", {"sig": 1, "dir": d, "flt": flt, "width": width, "tr": 2.0, "be": 1},
+                    ALL, (1, 7), "none", 0.9, 1.0)
     for width in (200, 500):
         add("ib_credit", {"sig": 2, "width": width, "off": 0}, ALL, (1, 7), "none", 0.9, 1.0)
     for width in (300, 500):

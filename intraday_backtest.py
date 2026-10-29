@@ -143,9 +143,8 @@ def _simulate(plan, bars: list[Bar], i: int, vix: list[float], sp: SimParams, co
 
 
 def run_days(args) -> dict[str, list[Trade]]:
-    """Simulate every intraday spec over a block of days. args: (day keys, all days, vix map, spec ids, SimParams)."""
-    keys, days, vixmap, spec_ids, sp = args
-    specs = [s for s in build_library() if s.id in spec_ids]
+    """Simulate intraday specs over a block of days. args: (day keys, all days, vix map, specs, SimParams)."""
+    keys, days, vixmap, specs, sp = args
     bp = dataclasses.replace(BacktestParams(), lot_size=sp.lot_size, strike_step=sp.strike_step)
     costs = CostParams()
     xe = ExitEngine(ExitParams(), verbose=False)
@@ -200,10 +199,9 @@ def run_days(args) -> dict[str, list[Trade]]:
 
 def run(days: dict[str, list[Bar]], vixmap, specs: list[StrategySpec], sp: SimParams, workers: int) -> dict[str, list[Trade]]:
     keys = sorted(days)
-    ids = frozenset(s.id for s in specs)
     n = max(workers, 1)
     chunks = [keys[i::n] for i in range(n)]
-    jobs = [(c, days, vixmap, ids, sp) for c in chunks]
+    jobs = [(c, days, vixmap, list(specs), sp) for c in chunks]
     if n == 1:
         parts = [run_days(jobs[0])]
     else:
@@ -221,7 +219,7 @@ def run(days: dict[str, list[Bar]], vixmap, specs: list[StrategySpec], sp: SimPa
 # ------------------------------------------------------------------ report
 def family(vid: str) -> str:
     t, p = vid.split("|")[:2]
-    sig = {"1": "breakout", "2": "trap", "3": "range"}.get(p.split("_")[0][3:], "?")
+    sig = {"1": "breakout", "2": "trap", "3": "range", "4": "pullback"}.get(p.split("_")[0][3:], "?")
     return f"{t}/{sig}"
 
 

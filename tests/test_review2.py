@@ -25,12 +25,23 @@ BP, SP = BacktestParams(), StrategyParams()
 NORMAL = RegimeState(Regime.NORMAL, 15.0, 0.9, 13.0, False, 0)
 
 
+def trading_days_ahead(day: dt.date) -> dt.date:
+    """A weekday expiry 1-3 calendar days ahead (the test variants trade DTE 1-3). A fixed +2 days lands on a weekend
+    on Thursdays and Fridays, where the backtest's weekday clock prices the options at almost nothing and no structure
+    can be built, so these tests used to fail depending on the day they ran."""
+    for off in (2, 3, 1):
+        d = day + dt.timedelta(days=off)
+        if d.weekday() < 5:
+            return d
+    raise AssertionError("unreachable")
+
+
 def _t():
     return dt.datetime.now(IST).replace(hour=10, minute=0, second=0, microsecond=0)
 
 
 def _snap(t, trend_dir, trend_daily, rs=NORMAL):
-    chain = bt.model_chain(80000.0, 0.14, t.date() + dt.timedelta(days=2), t, BP, SP.risk_free_rate)
+    chain = bt.model_chain(80000.0, 0.14, trading_days_ahead(t.date()), t, BP, SP.risk_free_rate)
     return Snapshot(t, 80000.0, rs.vix, rs, chain, trend_dir, True, None, None, trend_daily)
 
 

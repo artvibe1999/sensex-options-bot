@@ -20,6 +20,11 @@ TRAP (failed breakout / stop hunt): what large players do to breakout buyers
   within the last `trap_bars` bars price poked beyond a key level, retail breakout orders and stops fired, then a bar
   closed back inside with an opposite-colour body. Trade the reversal; stop just beyond the poke extreme.
 
+PULLBACK (trend continuation after a breakout)
+  a confirmed breakout happened earlier today (within `pb_look` bars); price then came back to the broken level
+  (within `pb_tol`) without closing back through the stop, and the latest bar closed strongly in the breakout
+  direction beyond the previous bar's extreme. Stop: below the pullback low (above the high for shorts).
+
 RANGE (for premium sellers only)
   after `range_after`, a low-efficiency day still inside its opening range and well inside its average range.
 
@@ -32,7 +37,7 @@ import datetime as dt
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-BREAKOUT, TRAP, RANGE = "BREAKOUT", "TRAP", "RANGE"
+BREAKOUT, TRAP, RANGE, PULLBACK = "BREAKOUT", "TRAP", "RANGE", "PULLBACK"
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,8 @@ class SignalParams:
     room_r: float = 1.5               # next level must be at least this many risk-units away
     target_r: float = 2.0             # target = entry +/- target_r x risk
     trap_bars: int = 3                # the poke beyond the level happened within this many bars
+    pb_look: int = 18                 # pullback: the breakout happened within the last 90 minutes
+    pb_tol: float = 0.0015            # pullback: came back to within 0.15% of the broken level
     range_after: dt.time = dt.time(11, 0)
     range_er_max: float = 0.15
     range_adr_max: float = 0.6
@@ -262,6 +269,39 @@ def detect(bars: Sequence[Bar], lv: Levels, p: SignalParams, kind: str,
             if risk > 0:
                 return Signal(TRAP, 1, L, last.close, stop, last.close + p.target_r * risk, last.ts,
                               f"bear trap below {L:.0f} (low {lo:.0f}, closed back above)")
+        return None
+    if kind == PULLBACK:
+        if sideways(bars, lv, p)[0] or n < p.or_bars + 4:
+            return None
+        prev = bars[-2]
+        for j in range(n - 3, max(p.or_bars, n - 1 - p.pb_look) - 1, -1):     # most recent confirmed breakout first
+            hit = _breakout_at(bars, j, levels_upto(j), p)
+            if hit is None:
+                continue
+            d, L = hit
+            if d * (bars[j + 1].close - L) <= 0:
+                continue                                 # not confirmed by the next bar
+            after = bars[j + 1:-1]
+            stop_lvl = L * (1 - d * p.stop_buffer_pct)
+            if any(d * (b.close - stop_lvl) < 0 for b in after):
+                return None                              # closed back through the level: failed, not a pullback
+            touched = min(b.low for b in after) if d > 0 else max(b.high for b in after)
+            if d * (touched - L) > p.pb_tol * L:
+                return None                              # never came back to the level: no pullback yet
+            rng = last.high - last.low
+            strong = rng > 0 and d * (last.close - last.open) >= p.min_body * rng
+            if not (strong and d * (last.close - (prev.high if d > 0 else prev.low)) > 0):
+                return None
+            stop = min(touched, stop_lvl) * (1 - p.buffer_pct) if d > 0 else max(touched, stop_lvl) * (1 + p.buffer_pct)
+            risk = abs(last.close - stop)
+            if risk <= 0:
+                return None
+            beyond = [x for x in levels if d * (x - last.close) > 0]
+            nxt = min(beyond, key=lambda x: abs(x - last.close)) if beyond else None
+            if nxt is not None and abs(nxt - last.close) < p.room_r * risk:
+                return None
+            return Signal(PULLBACK, d, L, last.close, stop, last.close + d * p.target_r * risk, last.ts,
+                          f"{'up' if d > 0 else 'down'} pullback to {L:.0f} held")
         return None
     if kind == RANGE:
         if _bar_end(last) < p.range_after:
