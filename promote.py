@@ -92,6 +92,8 @@ def main() -> int:
                     help="mean net per trade must be this many standard errors above zero (guards against luck: "
                          "with ~1000 variants some always look good on 20 trades). 0 disables.")
     ap.add_argument("--lookback-days", type=int, default=90, help="forward window considered")
+    ap.add_argument("--since", help="only forward evidence entered on/after this date (YYYY-MM-DD), e.g. the day the "
+                                    "shadow book started using the live exit rules; overrides --lookback-days")
     ap.add_argument("--valid-days", type=int, default=30)
     args = ap.parse_args()
 
@@ -101,7 +103,8 @@ def main() -> int:
     except OSError:
         print("No approved_backtest.json: only OI-rule variants can be promoted.")
         bt = {"variants": []}
-    since = (dt.date.today() - dt.timedelta(days=args.lookback_days)).isoformat()
+    since = (dt.date.fromisoformat(args.since).isoformat() if args.since
+             else (dt.date.today() - dt.timedelta(days=args.lookback_days)).isoformat())
     db = sqlite3.connect(os.path.join(args.data_dir, "sxbot.db"))
     fwd: dict[str, list[float]] = {}
     fwd_rows: dict[str, list[tuple[float, float]]] = {}

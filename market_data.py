@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from chain_features import ChainFeatures, FeatureTracker
-from config import IST, StrategyParams
+from config import StrategyParams
 from trend_regime import TrendInfo, daily_state, intraday_state
 from strategy_engine import Chain, RegimeDetector, RegimeState, StrategyEngine, trend_direction
 from zerodha_client import ZerodhaClient

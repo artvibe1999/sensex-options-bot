@@ -19,7 +19,6 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
@@ -103,7 +102,8 @@ class Bot:
         self.md = MarketData(self.client, self.engine, self.detector, cfg.strategy,
                              cfg.paths.daily_cache, cfg.chain_interval_s)
         self.risk = RiskManager(cfg.risk, cfg.schedule)
-        self.broker = LiveBroker(self.client, cfg) if live else PaperBroker(cfg.execution.paper_slippage_pct)
+        self.broker = LiveBroker(self.client, cfg) if live else PaperBroker(cfg.execution.paper_slippage_pct,
+                                                                             quote_fn=self._paper_quote)
         self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id, background=True)
         self.rec = Recorder(cfg.paths.db)
         self.sheets = SheetsSink(cfg.sheets_url, cfg.sheets_secret)
@@ -113,7 +113,11 @@ class Bot:
             self.sheet_log.start()
         self.specs = build_library()
         self.spec_by_id = {s.id: s for s in self.specs}
-        self.shadow = ShadowBook(self.specs, self.rec, cfg.risk, cfg.schedule, cfg.costs)
+        self.xp = ExitParams.from_env()
+        self.exit_engine = ExitEngine(self.xp)
+        # the shadow book exits with the same engine as the bot, so its forward evidence matches what would be traded
+        self.shadow = ShadowBook(self.specs, self.rec, cfg.risk, cfg.schedule, cfg.costs,
+                                 exit_engine=ExitEngine(self.xp, verbose=False) if self.xp.enabled else None)
         self.approved: dict[str, float] = {}
         self.stop = threading.Event()
         self.position: Optional[ManagedPosition] = None
@@ -137,11 +141,11 @@ class Bot:
         self.engine.use_stream = cfg.stream_chain
         self.stream_full = os.getenv("STREAM_FULL", "1") != "0"   # tick-level OI/volume/depth near ATM
         self._approved_stamp: Optional[tuple] = None
-        self.xp = ExitParams.from_env()
-        self.exit_engine = ExitEngine(self.xp)
         self.ep = EntryParams.from_env()
         self.ctx = MarketContext()
         self._last_snap: Optional[Snapshot] = None
+        self._last_snap_at = -1e9                    # monotonic time of _last_snap (paper fills use its bid/ask)
+        self._explore_block: set[tuple[str, str]] = set()
         self._gate_logged: dict[str, float] = {}
         self._last_exit_status = 0.0
         self._margin_cache: dict[tuple, tuple[float, Optional[float]]] = {}
@@ -158,7 +162,7 @@ class Bot:
 
     def _save_state(self) -> None:
         doc = {"date": (self.day or dt.date.today()).isoformat(), "mode": self.mode,
-               "realized": self.realized, "trades_today": self.trades_today,
+               "realized": self.realized, "trades_today": self.trades_today, "eod_done": self.eod_done,
                "risk": self.risk.export(),
                "position": _position_to_dict(self.position) if self.position else None}
         path = self._state_path()
@@ -187,6 +191,7 @@ class Bot:
             self.day = dt.date.fromisoformat(doc["date"])
             self.realized = float(doc.get("realized", 0.0))
             self.trades_today = int(doc.get("trades_today", 0))
+            self.eod_done = bool(doc.get("eod_done", False))   # a restart after the close must not repeat the day summary
             self.risk.restore(doc.get("risk", {}))
             if doc.get("position"):
                 self.position = _position_from_dict(doc["position"])
@@ -267,9 +272,9 @@ class Bot:
                     if full:
                         self._last_chain_rec = time.monotonic()
                     self.ctx.update(snap, now)
-                    self._last_snap = snap
+                    self._last_snap, self._last_snap_at = snap, time.monotonic()
                     self.rec.record_snapshot(snap, with_chain=full)
-                    self.shadow.step(snap, now)
+                    self.shadow.step(snap, now, self.ctx.signals())
                     self._record_flow(now, snap)
                 else:
                     self.shadow.flatten_if_due(now)   # stale feed must not leave virtual positions open past square-off
@@ -363,7 +368,51 @@ class Bot:
             self.position = None
         self._approved_stamp = None            # force a reload below
         self._refresh_approvals(now)
+        self._refresh_explore_block(now)
         self._save_state()
+
+    def _refresh_explore_block(self, now: dt.datetime) -> None:
+        """Strategy families (template + trend filter) whose recent shadow results are clearly negative are not
+        paper-explored. Uses only trades closed BEFORE today, so it is walk-forward. Never raises."""
+        c = self.cfg
+        if c.explore_fwd_min_trades <= 0:
+            self._explore_block = set()
+            return
+        try:
+            since = (now.date() - dt.timedelta(days=c.explore_fwd_days)).isoformat()
+            rows = self.rec.shadow_results(since, now.date().isoformat())
+        except Exception:  # noqa: BLE001 - evidence is advisory; never block the day start
+            log.exception("Could not read shadow results for the exploration filter")
+            return
+        fam: dict[tuple[str, str], list[float]] = {}
+        for vid, net in rows:
+            spec = self.spec_by_id.get(vid)
+            if spec is not None:
+                fam.setdefault((spec.template, spec.trend), []).append(net)
+        block = set()
+        for key, nets in fam.items():
+            n = len(nets)
+            if n < c.explore_fwd_min_trades:
+                continue
+            mean = sum(nets) / n
+            var = sum((x - mean) ** 2 for x in nets) / (n - 1)
+            t = mean / (var / n) ** 0.5 if var > 0 else (-99.0 if mean < 0 else 99.0)
+            if t <= c.explore_fwd_max_t:
+                block.add(key)
+        self._explore_block = block
+        if block:
+            log.info("Exploration skips %d strategy families with negative forward evidence: %s", len(block),
+                     ", ".join(f"{t}/{m}" for t, m in sorted(block)))
+
+    def _paper_quote(self, c: OptionContract) -> Optional[tuple[float, float]]:
+        """(bid, ask) of this contract from the latest chain (at most 10 s old), so paper fills pay the real spread."""
+        snap = self._last_snap
+        if snap is None or snap.chain is None or time.monotonic() - self._last_snap_at > 10.0:
+            return None
+        q = snap.chain.get(c.strike, c.kind)
+        if q is None or q.contract.symbol != c.symbol or not (q.bid and q.ask and q.ask >= q.bid > 0):
+            return None
+        return q.bid, q.ask
 
     def _ensure_session(self, now: dt.datetime) -> bool:
         try:
@@ -538,7 +587,8 @@ class Bot:
         if self.xp.enabled:                                  # rank by the levels the exit engine will really use
             levels = lambda p: (self.exit_engine.arm_for(p.max_profit_per_lot),
                                 self.exit_engine.stop_for(p.max_loss_per_lot, p.sl_frac))
-        pick = pick_explore(snap, self.specs, self.capital, lambda p: self.risk.size(p, self.capital, self._margin_fn(p)), now,
+        specs = [s for s in self.specs if (s.template, s.trend) not in self._explore_block]
+        pick = pick_explore(snap, specs, self.capital, lambda p: self.risk.size(p, self.capital, self._margin_fn(p)), now,
                             self.cfg.explore_min_score, gate=lambda p, n: self._gate(p, n, snap), levels=levels)
         if pick:
             plan, lots, score = pick
@@ -695,6 +745,13 @@ class Bot:
         cost = trade_cost(cash, self.cfg.costs)
         net = gross - cost
         self.realized += net
+        prior_g, prior_c = pos.exit_state.get("closed_gross", 0.0), pos.exit_state.get("closed_cost", 0.0)
+        remaining_now = [l for l in pos.legs if l.qty > 0]
+        if remaining_now:                              # partial: remember it, report the whole trade at the end
+            pos.exit_state["closed_gross"], pos.exit_state["closed_cost"] = prior_g + gross, prior_c + cost
+        else:
+            gross, cost = prior_g + gross, prior_c + cost
+            net = gross - cost
         ts = dt.datetime.now(IST).isoformat(timespec="seconds")
         closed = [o for o in legs if o.contract.symbol in res]
         remaining = [l for l in pos.legs if l.qty > 0]

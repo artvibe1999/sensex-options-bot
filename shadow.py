@@ -1,8 +1,9 @@
 """Shadow book: forward-tests EVERY strategy variant in parallel, in simulation.
 
 Each variant gets at most one virtual one-lot trade per day, entered the first
-time its conditions are met and exited by its own stop / target / trailing rule
-or at the square-off time. Results go to the ``shadow_trades`` table and are
+time its conditions are met and exited by the same rules the bot trades with: the exit engine (structure-scaled
+stop, laddered trailing floor) when it is enabled, else the variant's own stop / target / trailing rule, and always
+at the square-off time. Plans use the same daily trend as the live bot and the backtest. Results go to the ``shadow_trades`` table and are
 what ``promote.py`` uses to decide which variants may trade live. This runs in
 both --paper and --live modes and never places orders.
 """
@@ -10,7 +11,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Optional
 
 from config import IST, RiskParams, Schedule
@@ -42,6 +44,7 @@ class _ShadowPos:
     max_loss: float
     max_profit: float
     peak: float = 0.0
+    xpos: Optional[SimpleNamespace] = None    # the view of this position the exit engine reads and updates
 
 
 def _round(p: float, tick: float) -> float:
@@ -50,9 +53,11 @@ def _round(p: float, tick: float) -> float:
 
 class ShadowBook:
     def __init__(self, specs: list[StrategySpec], recorder: Recorder, risk: RiskParams,
-                 schedule: Schedule, costs: CostParams, slippage_pct: float = 0.005) -> None:
+                 schedule: Schedule, costs: CostParams, slippage_pct: float = 0.005, exit_engine=None) -> None:
         self.specs, self.rec, self.risk, self.sched = specs, recorder, risk, schedule
         self.costs, self.slip = costs, slippage_pct
+        self.xe = exit_engine                 # None: the variant's own percentage rules (backtest-style)
+        self._sig = None
         self.open: dict[str, _ShadowPos] = {}
         self.done_today: set[str] = set()
         try:                        # a restart must not let a variant trade the same day twice
@@ -83,9 +88,11 @@ class ShadowBook:
         self.done_today.clear()
 
     # ---------------------------------------------------------------- stepping
-    def step(self, snap: Snapshot, now: dt.datetime) -> None:
+    def step(self, snap: Snapshot, now: dt.datetime, sig=None) -> None:
+        """sig: market-context signals (the exit engine adapts its trail to them, as for the live position)."""
         if snap.chain is None or not snap.fresh:
             return
+        self._sig = sig
         ts = now.isoformat(timespec="seconds")
         for vid in list(self.open):
             self._manage(vid, snap, now, ts)
@@ -95,7 +102,8 @@ class ShadowBook:
         for spec in self.specs:
             if spec.id in self.open or spec.id in self.done_today:
                 continue
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_dir, now.date(), now, snap.features, snap.tinfo)
+            # the DAILY trend, exactly as the live bot and the backtest build plans (not the 5-minute trend_dir)
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo)
             if plan is None:
                 continue
             if not validate_plan_quotes(plan, snap.chain).ok:
@@ -103,8 +111,13 @@ class ShadowBook:
             legs = []
             for leg in plan.legs:
                 legs.append(_ShadowLeg(leg, leg.side, self._entry_px(leg, snap.chain), leg.ref_price, leg.ref_price))
-            self.open[spec.id] = _ShadowPos(spec, plan, ts, legs, plan.max_loss_per_lot,
-                                            plan.max_profit_per_lot)
+            pos = _ShadowPos(spec, plan, ts, legs, plan.max_loss_per_lot, plan.max_profit_per_lot)
+            if self.xe is not None:
+                pos.xpos = SimpleNamespace(
+                    plan=plan, max_loss=pos.max_loss, max_profit=pos.max_profit, peak_pnl=0.0, exit_state={},
+                    legs=[SimpleNamespace(contract=l.contract, side=l.side, qty=plan.qty_for(l)) for l in plan.legs])
+                self.xe.init_state(pos.xpos, snap.chain, snap.spot)
+            self.open[spec.id] = pos
             self.done_today.add(spec.id)
             self.rec.event(ts, "shadow_entry", spec.id, {})
 
@@ -129,14 +142,16 @@ class ShadowBook:
         pos.peak = max(pos.peak, pnl)
         r = self.risk
         reason: Optional[str] = None
-        if pnl <= -pos.spec.sl_frac * pos.max_loss:
+        if pos.xpos is not None:
+            reason = self.xe.evaluate(pos.xpos, pnl, now, self._sig, snap.spot).reason
+        elif pnl <= -pos.spec.sl_frac * pos.max_loss:
             reason = "HARD_STOP"
         elif pnl >= pos.spec.tp_frac * pos.max_profit:
             reason = "TAKE_PROFIT"
         elif (pos.peak >= r.trail_activation_pct_of_max_profit * pos.max_profit
               and pnl <= pos.peak * (1 - r.trail_giveback_pct)):
             reason = "TRAILING_STOP"
-        elif now.time() >= self.sched.square_off:
+        if not reason and now.time() >= self.sched.square_off:
             reason = "SQUARE_OFF_TIME"
         if reason:
             self._close(vid, reason, ts)

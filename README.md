@@ -221,3 +221,31 @@ What the trades showed, and what changed:
 - Exploration now ranks candidates by the exit engine's real arm/stop levels, not a 60% take-profit no intraday trade reaches.
 None of this is a proven edge: it removes trades that could not pay for themselves. Keep paper mode until `promote.py`
 approves variants on forward evidence.
+
+### Second review (full code + data review, Oct 2026)
+**Evidence used:** 6 recorded days (full chain every 10 s, depth near ATM), 898 shadow trades, 476 days of SENSEX/VIX.
+- `calibrate.py` on the recorded chain: ATM IV / India VIX = 0.951 (backtest assumes 0.95) and the median half-spread
+  is 0.13% (backtest charges 1%): the model is not flattering itself.
+- Walk-forward backtest: the average out-of-sample result of the variants picked in each training window is
+  **negative (-Rs 177 per variant per window)**, and no variant passes for the small (Rs 15k) or medium (Rs 1L) tier.
+  Selecting from ~1,000 variants does not find a durable edge on daily data; only paper/shadow evidence can.
+- A minute-by-minute replay of the recorded days through the real `Bot` and `ShadowBook` reproduces the live paper
+  trades (same structure, same entry time). Tuning exits on it moved the shadow total by only +-10% for every setting
+  tried: losses come from entries (mostly direction: the daily trend pointed down in a rising week), not exits.
+
+**Bugs fixed**
+- Shadow book built plans with the 5-minute trend (`trend_dir`) while the live bot and backtest use the daily trend:
+  forward evidence for every `with`/`flat` variant measured a different signal than the one traded.
+- Shadow book exited with the old percentage rules while the bot uses the exit engine: it now uses the same engine
+  (quiet logging), so `promote.py` approves on the rules that will actually trade.
+- Paper fills were LTP +/- 0.5%; they now pay the real bid/ask from the chain (as the shadow book does), so paper
+  results are as pessimistic as live execution.
+- A restart after the close repeated the day summary (Status tab / Telegram): `eod_done` is now persisted.
+- After a partial exit, the Trades row and the `exit` record (used by `promote.py`) held only the last fill: they now
+  carry the whole trade.
+- Removed `StrategyEngine.select()` and helpers: dead code referencing config fields that do not exist.
+
+**New**
+- Exploration skips strategy families with clearly negative forward evidence (walk-forward, see `EXPLORE_FWD_*`).
+- `promote.py --since YYYY-MM-DD` ignores evidence recorded before a rules change. Shadow trades before this version
+  used the old trend/exit rules: run `python promote.py --since 2026-10-30` once enough new data exists.

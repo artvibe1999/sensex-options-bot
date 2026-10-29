@@ -158,6 +158,12 @@ class Recorder:
                                  (lo, hi)).fetchall()
         return {v for (v,) in a} | {v for (v,) in b}
 
+    def shadow_results(self, since: str, before: str) -> list[tuple[str, float]]:
+        """(variant, net) of shadow trades entered on or after `since` and before `before` (ISO dates)."""
+        with self._lock:
+            return self._db.execute("SELECT variant, net FROM shadow_trades WHERE entry_ts>=? AND entry_ts<?",
+                                    (since, before)).fetchall()
+
     def prune_flow(self, keep_days: int, today: str) -> int:
         """Delete flow rows older than keep_days (the 1 s capture is the bulky table). 0 = keep everything."""
         if keep_days <= 0:

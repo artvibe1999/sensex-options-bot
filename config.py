@@ -215,6 +215,11 @@ class Config:
     paper_explore: bool = True                # paper only: also trade the scanner's best setups (see explorer.py)
     explore_min_score: float = 60.0
     explore_max_trades: int = 4               # paper exploration trades per day (separate from the approved-variant cap)
+    # Exploration skips a strategy family (template + trend filter) whose shadow trades over the last
+    # explore_fwd_days are clearly losing: >= explore_fwd_min_trades trades and a t-stat of the mean net <= max_t.
+    explore_fwd_min_trades: int = 20          # 0 = off
+    explore_fwd_days: int = 60
+    explore_fwd_max_t: float = -1.0
     sheets_url: str | None = None             # Google Apps Script web-app URL (optional live feed)
     sheets_secret: str | None = None
     loop_interval_s: float = 1.0              # decision cadence (seconds)
@@ -262,6 +267,9 @@ def load_config() -> Config:
         paper_explore=(_env("PAPER_EXPLORE", "1") or "1") != "0",
         explore_min_score=_env_float("EXPLORE_MIN_SCORE", 60.0),
         explore_max_trades=int(_env_float("EXPLORE_MAX_TRADES", 4)),
+        explore_fwd_min_trades=int(_env_float("EXPLORE_FWD_MIN_TRADES", 20)),
+        explore_fwd_days=int(_env_float("EXPLORE_FWD_DAYS", 60)),
+        explore_fwd_max_t=_env_float("EXPLORE_FWD_MAX_T", -1.0),
         sheets_url=_env("SHEETS_WEBHOOK_URL"),
         sheets_secret=_env("SHEETS_SECRET"),
         loop_interval_s=_env_float("LOOP_INTERVAL_S", 1.0),

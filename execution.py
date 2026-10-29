@@ -137,17 +137,33 @@ def validate_margin(client, legs: Sequence[OrderLeg], product: str, available_ca
 
 # ------------------------------------------------------------------ paper
 class PaperBroker:
-    """Simulated fills at the reference price +/- slippage; no API orders are placed."""
+    """Simulated fills; no API orders are placed. With a quote function, a BUY fills at the current ask and a SELL at
+    the current bid (what a marketable order really pays, as the shadow book assumes); without a two-sided quote it
+    falls back to the reference price +/- slippage."""
 
-    def __init__(self, slippage_pct: float) -> None:
+    def __init__(self, slippage_pct: float,
+                 quote_fn: Optional[Callable[[OptionContract], Optional[tuple[float, float]]]] = None) -> None:
         self.slip = slippage_pct
+        self.quote_fn = quote_fn
+
+    def _fill(self, l: OrderLeg) -> float:
+        q = None
+        if self.quote_fn is not None:
+            try:
+                q = self.quote_fn(l.contract)
+            except Exception:  # noqa: BLE001 - a quote problem falls back to the slippage model
+                log.warning("Paper quote failed for %s", l.contract.symbol, exc_info=True)
+        if q is not None:
+            bid, ask = q
+            if ask >= bid > 0:
+                return ask if l.side == BUY else bid
+        return l.ref_price * (1 + self.slip if l.side == BUY else 1 - self.slip)
 
     def execute(self, legs: list[OrderLeg], product: str, buffer_mult: float = 1.0,
                 market: bool = False) -> Optional[dict[str, float]]:
         fills = {}
         for l in sorted(legs, key=lambda x: x.side != BUY):
-            f = l.ref_price * (1 + self.slip if l.side == BUY else 1 - self.slip)
-            fills[l.contract.symbol] = round_tick(f, l.contract.tick_size)
+            fills[l.contract.symbol] = round_tick(self._fill(l), l.contract.tick_size)
             log.info("[PAPER] %s %s x%d @ %.2f", l.side, l.contract.symbol, l.qty, fills[l.contract.symbol])
         return fills
 

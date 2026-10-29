@@ -20,7 +20,7 @@ from typing import Optional
 import backtest as bt
 from config import IST, BacktestParams, ExecutionParams, RiskParams, Schedule, StrategyParams
 from execution import OrderLeg, PaperBroker, reverse_legs
-from option_strategies import STRATEGY_CLASSES, EntryContext, OptionStrategy
+from option_strategies import STRATEGY_CLASSES, OptionStrategy
 from risk_manager import ManagedPosition, OpenLeg, RiskManager
 from strategy_engine import Leg, TradePlan, bs_price
 

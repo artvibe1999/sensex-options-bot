@@ -136,8 +136,11 @@ def describe_position(legs, chain, plan_name: str = "") -> dict:
 
 
 class ExitEngine:
-    def __init__(self, params: ExitParams) -> None:
+    def __init__(self, params: ExitParams, verbose: bool = True) -> None:
+        """verbose=False logs at DEBUG only (the shadow book runs one engine state per variant)."""
         self.p = params
+        self._info = log.info if verbose else log.debug
+        self._warn = log.warning if verbose else log.debug
 
     # ------------------------------------------------------------------ levels
     def arm_for(self, max_profit_total: float) -> float:
@@ -168,7 +171,7 @@ class ExitEngine:
         pos.exit_state = {"bias": desc["bias"], "vega": desc["vega"], "theta": desc["theta"],
                           "entry_spot": spot, "hi": spot, "lo": spot, "floor": None, "armed": False, "notes": []}
         stop, arm = self._levels(pos, pos.exit_state)
-        log.info("EXIT-ENGINE init %s bias=%+d vega=%.0f theta=%.0f greeks=%s hard_stop=-%.0f arm=+%.0f",
+        self._info("EXIT-ENGINE init %s bias=%+d vega=%.0f theta=%.0f greeks=%s hard_stop=-%.0f arm=+%.0f",
                  pos.plan.variant_id, desc["bias"], desc["vega"], desc["theta"], desc["greeks"], stop, arm)
 
     def reachable(self, max_profit_total: float) -> bool:
@@ -274,26 +277,26 @@ class ExitEngine:
             peak = pos.peak_pnl
             stop, arm = self._levels(pos, st)
             if stop > 0 and pnl <= -stop:
-                log.warning("EXIT-ENGINE HARD_STOP %s pnl=%.0f <= -%.0f", pos.plan.variant_id, pnl, stop)
+                self._warn("EXIT-ENGINE HARD_STOP %s pnl=%.0f <= -%.0f", pos.plan.variant_id, pnl, stop)
                 return ExitDecision("HARD_STOP", pnl, peak, st.get("floor"), bool(st.get("armed")))
             if peak < arm:
                 return ExitDecision(None, pnl, peak, None, False, p.base_giveback)      # neutral zone: hold
             if not st.get("armed"):
                 st["armed"] = True
-                log.info("EXIT-ENGINE trail ARMED %s peak=%.0f pnl=%.0f", pos.plan.variant_id, peak, pnl)
+                self._info("EXIT-ENGINE trail ARMED %s peak=%.0f pnl=%.0f", pos.plan.variant_id, peak, pnl)
             gb, notes = self._adapt(st, pos, sig, spot, now)
             cand = self._candidate_floor(peak, gb, arm)
             prev = st.get("floor")
             floor = cand if prev is None else max(prev, cand)                          # ratchet: never lowered
             if prev is None or floor > prev + 1e-9:
-                log.info("EXIT-ENGINE floor %s -> %.0f (peak %.0f, giveback %.0f%%, pnl %.0f)",
+                self._info("EXIT-ENGINE floor %s -> %.0f (peak %.0f, giveback %.0f%%, pnl %.0f)",
                          pos.plan.variant_id, floor, peak, gb * 100, pnl)
             if notes != st.get("notes"):
-                log.info("EXIT-ENGINE adaptation %s: %s", pos.plan.variant_id, "; ".join(notes) or "none")
+                self._info("EXIT-ENGINE adaptation %s: %s", pos.plan.variant_id, "; ".join(notes) or "none")
                 st["notes"] = notes
             st["floor"] = floor
             if pnl < floor:
-                log.warning("EXIT-ENGINE TRAILING_STOP %s pnl=%.0f < floor %.0f (peak %.0f)",
+                self._warn("EXIT-ENGINE TRAILING_STOP %s pnl=%.0f < floor %.0f (peak %.0f)",
                             pos.plan.variant_id, pnl, floor, peak)
                 return ExitDecision("TRAILING_STOP", pnl, peak, floor, True, gb, tuple(notes))
             return ExitDecision(None, pnl, peak, floor, True, gb, tuple(notes))
