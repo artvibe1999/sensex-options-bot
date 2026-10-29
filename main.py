@@ -68,7 +68,8 @@ def _position_to_dict(pos: ManagedPosition) -> dict:
                            "ratio": l.ratio} for l in p.legs],
                  "lot_size": p.lot_size, "max_loss_unit": p.max_loss_unit,
                  "max_profit_unit": p.max_profit_unit, "rationale": p.rationale,
-                 "variant_id": p.variant_id, "sl_frac": p.sl_frac, "tp_frac": p.tp_frac},
+                 "variant_id": p.variant_id, "sl_frac": p.sl_frac, "tp_frac": p.tp_frac,
+                 "spot_lo": p.spot_lo, "spot_hi": p.spot_hi, "spot_be": p.spot_be, "entry_spot": p.entry_spot},
         "lots": pos.lots,
         "legs": [{"contract": _contract_to_dict(l.contract), "side": l.side, "qty": l.qty,
                   "entry_price": l.entry_price} for l in pos.legs],
@@ -85,7 +86,8 @@ def _position_from_dict(d: dict) -> ManagedPosition:
                    for l in p["legs"]),
         lot_size=p["lot_size"], max_loss_unit=p["max_loss_unit"], max_profit_unit=p["max_profit_unit"],
         rationale=p["rationale"], variant_id=p.get("variant_id", ""),
-        sl_frac=p.get("sl_frac"), tp_frac=p.get("tp_frac"))
+        sl_frac=p.get("sl_frac"), tp_frac=p.get("tp_frac"), spot_lo=p.get("spot_lo"), spot_hi=p.get("spot_hi"),
+        spot_be=p.get("spot_be"), entry_spot=p.get("entry_spot"))
     legs = [OpenLeg(_contract_from_dict(l["contract"]), l["side"], l["qty"], l["entry_price"]) for l in d["legs"]]
     return ManagedPosition(plan, d["lots"], legs, dt.datetime.fromisoformat(d["entered_at"]),
                            d["max_loss"], d["max_profit"], d.get("peak_pnl", 0.0), d.get("exit_state") or {})
@@ -321,7 +323,8 @@ class Bot:
         """Load approved variants at startup (also after a same-day restart, when the new-day step is
         skipped) and again whenever the approvals file changes or the date rolls over."""
         paths = [self.cfg.paths.approved_live] if self.live else \
-            [self.cfg.paths.approved_backtest, self.cfg.paths.approved_live]   # paper also runs promoted variants
+            [self.cfg.paths.approved_backtest, self.cfg.paths.approved_intraday,
+             self.cfg.paths.approved_live]                                       # paper also runs promoted variants
         mtimes = []
         for p in paths:
             try:
@@ -552,9 +555,17 @@ class Bot:
             return val
         return fn
 
+    def _capital_allows(self, spec) -> bool:
+        """Small accounts trade single-leg structures only."""
+        return not spec.multi_leg or self.capital >= self.cfg.multi_leg_min_capital
+
     def _gate(self, plan: TradePlan, lots: int, snap: Snapshot) -> bool:
         """Entry filter (bias, IV skew, OI build-up, reachable trail, costs, intraday theta). Rejections are logged at
-        most once a minute."""
+        most once a minute. Intraday-signal plans carry their own validated entry logic (intraday.py: levels,
+        sideways-day filter, confirmation) and exit on the underlying, so this filter does not apply to them."""
+        if plan.spot_rules:
+            log.info("ENTRY-FILTER pass %s: intraday signal (%s)", plan.variant_id, plan.rationale)
+            return True
         arm = (self.exit_engine.arm_for(plan.max_profit_per_lot * lots)
                if (self.xp.enabled and self.xp.require_reachable_arm) else None)
         cost = _round_trip_cost(plan.legs) * lots
@@ -587,7 +598,7 @@ class Bot:
         if self.xp.enabled:                                  # rank by the levels the exit engine will really use
             levels = lambda p: (self.exit_engine.arm_for(p.max_profit_per_lot),
                                 self.exit_engine.stop_for(p.max_loss_per_lot, p.sl_frac))
-        specs = [s for s in self.specs if (s.template, s.trend) not in self._explore_block]
+        specs = [s for s in self.specs if (s.template, s.trend) not in self._explore_block and self._capital_allows(s)]
         pick = pick_explore(snap, specs, self.capital, lambda p: self.risk.size(p, self.capital, self._margin_fn(p)), now,
                             self.cfg.explore_min_score, gate=lambda p, n: self._gate(p, n, snap), levels=levels)
         if pick:
@@ -597,18 +608,22 @@ class Bot:
     def _try_entry(self, now: dt.datetime, snap: Snapshot) -> None:
         if not snap.fresh or snap.chain is None:
             return
-        if not self.approved:
+        usable = any(self._capital_allows(self.spec_by_id[v]) for v in self.approved if v in self.spec_by_id)
+        if not usable:                                  # nothing validated for this account size: explore (paper)
             self._try_explore(now, snap)
             return
         ok, why = self.risk.entry_allowed(now, self.trades_today)
         if not ok or time.monotonic() < self._entry_block_until:
-            if not ok and self.trades_today >= self.risk.p.max_trades_per_day:
+            if not ok and self.trades_today >= self.risk.p.max_trades_per_day and self.cfg.explore_with_approved:
                 self._try_explore(now, snap)
             return
         candidates: list[tuple[float, TradePlan]] = []
         for vid, score in self.approved.items():
             spec = self.spec_by_id.get(vid)
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo) if spec else None
+            if spec is None or not self._capital_allows(spec):
+                continue
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo,
+                              snap.ictx)
             if plan:
                 candidates.append((score, plan))
         candidates.sort(key=lambda c: c[0], reverse=True)
@@ -622,7 +637,8 @@ class Bot:
                 continue
             self._enter(now, snap, plan, lots, score, len(candidates))
             return
-        self._try_explore(now, snap)                    # nothing approved fired: paper-explore the scanner's best setup
+        if self.cfg.explore_with_approved:              # off by default: with validated strategies, wait for them
+            self._try_explore(now, snap)
 
     def _enter(self, now: dt.datetime, snap: Snapshot, plan: TradePlan, lots: int,
                score: float, n_candidates: int) -> None:

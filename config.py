@@ -62,6 +62,10 @@ class Paths:
         return os.path.join(self.data_dir, "approved_backtest.json")
 
     @property
+    def approved_intraday(self) -> str:
+        return os.path.join(self.data_dir, "approved_intraday.json")
+
+    @property
     def approved_live(self) -> str:
         return os.path.join(self.data_dir, "approved_live.json")
 
@@ -218,6 +222,12 @@ class Config:
     # Exploration skips a strategy family (template + trend filter) whose shadow trades over the last
     # explore_fwd_days are clearly losing: >= explore_fwd_min_trades trades and a t-stat of the mean net <= max_t.
     explore_fwd_min_trades: int = 20          # 0 = off
+    # Paper exploration normally runs only when no approved strategy can trade this account. True also explores when
+    # approved strategies exist but none fired (more paper trades, mostly from families the backtests reject).
+    explore_with_approved: bool = False
+    # Accounts below this trade single-leg structures only (one option bought, one sold back): at one SENSEX lot a
+    # 4-leg trade pays ~Rs 220 in charges, which the backtests show eats the whole edge of small multi-leg trades.
+    multi_leg_min_capital: float = 100_000.0
     explore_fwd_days: int = 60
     explore_fwd_max_t: float = -1.0
     sheets_url: str | None = None             # Google Apps Script web-app URL (optional live feed)
@@ -268,6 +278,8 @@ def load_config() -> Config:
         explore_min_score=_env_float("EXPLORE_MIN_SCORE", 60.0),
         explore_max_trades=int(_env_float("EXPLORE_MAX_TRADES", 4)),
         explore_fwd_min_trades=int(_env_float("EXPLORE_FWD_MIN_TRADES", 20)),
+        explore_with_approved=(_env("EXPLORE_WITH_APPROVED", "0") or "0") != "0",
+        multi_leg_min_capital=_env_float("MULTI_LEG_MIN_CAPITAL", 100_000.0),
         explore_fwd_days=int(_env_float("EXPLORE_FWD_DAYS", 60)),
         explore_fwd_max_t=_env_float("EXPLORE_FWD_MAX_T", -1.0),
         sheets_url=_env("SHEETS_WEBHOOK_URL"),

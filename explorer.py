@@ -36,7 +36,8 @@ def pick_explore(snap, specs: list[StrategySpec], capital: float, size_fn: Calla
     for opp in scan(snap, min_score)[:max_setups]:
         for vid in affordable(opp, specs, capital):
             spec = by_id[vid]
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo)
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo,
+                              getattr(snap, "ictx", None))
             if plan is None or not validate_plan_quotes(plan, snap.chain).ok:
                 continue
             lots = size_fn(plan)

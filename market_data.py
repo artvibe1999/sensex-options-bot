@@ -17,6 +17,8 @@ from typing import Optional
 
 from chain_features import ChainFeatures, FeatureTracker
 from config import StrategyParams
+from intraday import Bar, levels_from_daily
+from strategy_library import IntradayContext
 from trend_regime import TrendInfo, daily_state, intraday_state
 from strategy_engine import Chain, RegimeDetector, RegimeState, StrategyEngine, trend_direction
 from zerodha_client import ZerodhaClient
@@ -36,6 +38,7 @@ class Snapshot:
     features: Optional[ChainFeatures] = None   # OI / gamma / skew features of the latest chain
     tinfo: Optional[TrendInfo] = None          # valid-trend / trap classification (daily + intraday)
     trend_daily: Optional[int] = None          # EMA trend of COMPLETED daily closes: the definition the backtest uses
+    ictx: Optional[IntradayContext] = None     # today's completed 5-minute bars + levels (intraday signal variants)
 
 
 class MarketData:
@@ -50,6 +53,9 @@ class MarketData:
         self._tinfo_day: Optional[dt.date] = None
         self._tdaily = None
         self._hist5_at = -1e9
+        self._hist5_bucket = -1
+        self._ictx: Optional[IntradayContext] = None
+        self._ictx_key: Optional[tuple] = None
         self._bars: "OrderedDict[int, float]" = OrderedDict()
         self._chain: Optional[Chain] = None
         self._chain_at = -1e9
@@ -109,8 +115,12 @@ class MarketData:
             self._bars.popitem(last=False)
 
     def closes_5m(self, now: dt.datetime) -> list[float]:
-        if time.monotonic() - self._hist5_at > 300:
-            self._hist5_at = time.monotonic()
+        # refresh right after each 5-minute bar completes (+5 s for Kite to publish it), at most every 20 s; a
+        # fixed 300 s timer could make the intraday signals up to five minutes late
+        bucket = int((now.timestamp() - 5) // 300)
+        due = bucket != self._hist5_bucket or time.monotonic() - self._hist5_at > 300
+        if due and time.monotonic() - self._hist5_at > 20:
+            self._hist5_at, self._hist5_bucket = time.monotonic(), bucket
             try:
                 c = self.client.historical(self.client.spot_token, now - dt.timedelta(days=5), now, "5minute")
                 self._hist5 = [x for x in c]
@@ -161,4 +171,22 @@ class MarketData:
         return Snapshot(now, spot, vix, rs, self._chain, trend, fresh,
                         self._feat if self._chain is not None else None,
                         self.trend_info(now, spot, daily),
-                        trend_direction([c["close"] for c in daily[-60:]], self.p))
+                        trend_direction([c["close"] for c in daily[-60:]], self.p),
+                        self.intraday_context(now, daily))
+
+    def intraday_context(self, now: dt.datetime, daily: list[dict]) -> Optional[IntradayContext]:
+        """Today's COMPLETED 5-minute bars and support/resistance levels. Rebuilt only when a new bar completes, so
+        signals (cached inside the context) are computed once per bar. Never raises."""
+        try:
+            bars = [Bar(x["date"], float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]))
+                    for x in self._hist5
+                    if x["date"].date() == now.date() and x["date"] + dt.timedelta(minutes=5) <= now]
+            key = (now.date(), len(bars), bars[-1].ts if bars else None, len(daily))
+            if key != self._ictx_key:
+                self._ictx_key = key
+                lv = levels_from_daily(daily, bars, 6) if bars else None
+                self._ictx = IntradayContext(bars, lv) if lv is not None else None
+            return self._ictx
+        except Exception:  # noqa: BLE001 - signals are optional; never block price data
+            log.exception("Intraday context failed")
+            return None

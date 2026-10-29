@@ -249,3 +249,42 @@ approves variants on forward evidence.
 - Exploration skips strategy families with clearly negative forward evidence (walk-forward, see `EXPLORE_FWD_*`).
 - `promote.py --since YYYY-MM-DD` ignores evidence recorded before a rules change. Shadow trades before this version
   used the old trend/exit rules: run `python promote.py --since 2026-10-30` once enough new data exists.
+
+### Intraday price-action strategies (intraday.py, intraday_backtest.py)
+**Data:** 5-minute SENSEX and India VIX bars, Jan 2023 - Oct 2026 (~945 sessions), from Kite. Options priced with
+Black-Scholes at VIX x 0.951 (measured on recorded chains), 0.5% slippage per fill (2x stress), real charges.
+
+**What the data says about SENSEX intraday (so the strategy design follows evidence, not folklore)**
+- Intraday realised volatility is only **0.58 x India VIX**: options are priced for bigger moves than the session
+  delivers. Holding bought options intraday fights that premium; option WRITERS (institutions) collect it.
+- Only 5% of sessions trend cleanly (efficiency ratio > 0.3); prior-day-high tests fail (trap) more often than they
+  break out (238 vs 204); 30-minute opening-range breakouts follow through barely more than they fail (251 vs 209).
+- Walk-forward over 11 windows, every common rule LOSES before filters: breakout option buying, trap fading
+  (worst: fading "traps" mostly means betting against real breakouts), range-day condors (gross positive, but
+  ~Rs 220 of charges per 4-leg lot eats it).
+
+**What survived** (filters that helped in BOTH 2023-24 and 2025-26):
+- Buy a put on a confirmed downside breakdown of a key level (prior-day H/L, CPR, opening range, swing levels), on a
+  NON-sideways day: CPR width < 0.25%, the day's range >= 0.5 x ADR, session efficiency >= 0.2, room to the next
+  support >= 1.5 risk units, target 2.5R, stop back above the broken level. Calls on upside breakouts lose: rallies
+  crush implied volatility; selloffs inflate it.
+- Multi-leg (medium/large accounts): sell a 500-wide credit spread beyond the breakout/breakdown stop - writing the
+  option where trapped traders' stops sit.
+
+**Honest limits:** ~100 trades per variant in 3.8 years (about 2 a month). The best put-buying variant lost in 2023
+and 2025 and made money in 2024 and 2026; max drawdown about Rs 19-20k per lot - the whole of a Rs 20k account.
+The direction rule and the filters were chosen after looking at the data (with a discovery/validation split), so
+treat backtest numbers as optimistic. Hence:
+- paper mode trades the approved variants for every tier, but `promote.py` promotes a variant to LIVE for an account
+  tier only if that tier's capital >= 1.5 x the backtest max drawdown per lot (`--dd-capital-mult`);
+- accounts below `MULTI_LEG_MIN_CAPITAL` (Rs 1 lakh) never trade multi-leg structures;
+- signal trades are sized on their stop (rupee hard stop + 25%), not the whole premium, and exit on the underlying
+  (stop / target / breakeven after +1R) exactly as backtested; the entry filter and rupee trail do not apply to them;
+- with validated strategies available, the paper bot no longer explores unvalidated scanner setups
+  (`EXPLORE_WITH_APPROVED=0`).
+
+**Run / refresh** (weekly; approvals expire after 60 days):
+```bash
+docker compose exec bot python intraday_backtest.py --fetch-kite 1400     # or --index data/sensex_5m.csv --vix data/vix_5m.csv
+docker compose restart bot
+```

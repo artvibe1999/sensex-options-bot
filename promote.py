@@ -63,7 +63,7 @@ def _explore_trades(db, since: str) -> list[tuple[str, str, float, float, str]]:
     return out
 
 
-def _tier_nets(rows: list[tuple[float, float]], capital: float) -> list[float]:
+def _tier_nets(rows: list[tuple[float, float]], capital: float, spot_rules: bool = False) -> list[float]:
     """Forward one-lot results (net, max_loss) re-expressed for an account size: n lots from the real sizing rule,
     trades that do not fit are skipped. Costs are scaled with n too, which slightly OVERstates them (conservative)."""
     from types import SimpleNamespace
@@ -72,7 +72,7 @@ def _tier_nets(rows: list[tuple[float, float]], capital: float) -> list[float]:
     rm.apply_capital(capital, "auto")
     out = []
     for net, ml in rows:
-        n = rm.size(SimpleNamespace(max_loss_per_lot=ml), capital) if ml and ml > 0 else 0
+        n = rm.size(SimpleNamespace(max_loss_per_lot=ml, spot_rules=spot_rules), capital) if ml and ml > 0 else 0
         if n >= 1:
             out.append(net * n)
     return out
@@ -92,6 +92,8 @@ def main() -> int:
                     help="mean net per trade must be this many standard errors above zero (guards against luck: "
                          "with ~1000 variants some always look good on 20 trades). 0 disables.")
     ap.add_argument("--lookback-days", type=int, default=90, help="forward window considered")
+    ap.add_argument("--dd-capital-mult", type=float, default=1.5,
+                    help="a tier is promoted only if its capital >= this x the backtest max drawdown per lot")
     ap.add_argument("--since", help="only forward evidence entered on/after this date (YYYY-MM-DD), e.g. the day the "
                                     "shadow book started using the live exit rules; overrides --lookback-days")
     ap.add_argument("--valid-days", type=int, default=30)
@@ -103,6 +105,11 @@ def main() -> int:
     except OSError:
         print("No approved_backtest.json: only OI-rule variants can be promoted.")
         bt = {"variants": []}
+    try:                                         # intraday signal variants (intraday_backtest.py)
+        with open(os.path.join(args.data_dir, "approved_intraday.json"), encoding="utf-8") as f:
+            bt["variants"] = bt["variants"] + json.load(f)["variants"]
+    except (OSError, ValueError, KeyError):
+        pass
     since = (dt.date.fromisoformat(args.since).isoformat() if args.since
              else (dt.date.today() - dt.timedelta(days=args.lookback_days)).isoformat())
     db = sqlite3.connect(os.path.join(args.data_dir, "sxbot.db"))
@@ -131,7 +138,7 @@ def main() -> int:
     def fwd_tiers(vid: str, min_n: int, min_pf: float) -> list[str]:
         out = []
         for tier, cap in TIER_CAPITAL.items():
-            nets = _tier_nets(fwd_rows.get(vid, []), cap)
+            nets = _tier_nets(fwd_rows.get(vid, []), cap, vid.startswith("ib_"))
             if len(nets) >= min_n and sum(nets) > 0 and _pf(nets) >= min_pf and _tstat(nets) >= args.min_t:
                 out.append(tier)
         return out
@@ -144,7 +151,10 @@ def main() -> int:
         rows.append((v["id"], n, total, pf, ok))
         if ok:
             ft = fwd_tiers(v["id"], args.min_trades, args.min_pf)
-            tiers = [t for t in ft if "tiers" not in v or t in v["tiers"]]
+            dd = float((v.get("full") or {}).get("max_dd") or 0.0)
+            # a lot cannot be split: only promote for an account that can survive the backtest's worst drawdown
+            tiers = [t for t in ft if ("tiers" not in v or t in v["tiers"])
+                     and TIER_CAPITAL[t] >= args.dd_capital_mult * dd]
             if tiers:
                 live.append({"id": v["id"], "score": v["score"], "tiers": tiers,
                              "forward": {"n": n, "net": total, "pf": pf}})

@@ -251,6 +251,31 @@ class ExitEngine:
         f = min(max(f, p.factor_min), p.factor_max)
         return min(max(gb * f, p.min_giveback), p.max_giveback), notes
 
+    def _spot_exit(self, pos, st: dict, pnl: float, peak: float, spot: Optional[float]) -> ExitDecision:
+        """Signal trades (intraday.py) exit on the UNDERLYING, exactly as intraday_backtest.py simulates them: at or
+        beyond spot_lo / spot_hi, with the adverse bound moved to the entry level once spot_be is reached. The
+        rupee trail does not apply (the backtest validated these exits, not the trail)."""
+        plan = pos.plan
+        if "spot_lo" not in st:
+            st["spot_lo"], st["spot_hi"], st["spot_be"] = plan.spot_lo, plan.spot_hi, plan.spot_be
+        if spot is None:
+            return ExitDecision(None, pnl, peak)
+        lo, hi, be, e = st["spot_lo"], st["spot_hi"], st["spot_be"], plan.entry_spot
+        if lo is not None and spot <= lo:
+            self._warn("EXIT-ENGINE SPOT_LO %s spot=%.1f <= %.1f pnl=%.0f", plan.variant_id, spot, lo, pnl)
+            return ExitDecision("SPOT_LO", pnl, peak)
+        if hi is not None and spot >= hi:
+            self._warn("EXIT-ENGINE SPOT_HI %s spot=%.1f >= %.1f pnl=%.0f", plan.variant_id, spot, hi, pnl)
+            return ExitDecision("SPOT_HI", pnl, peak)
+        if be is not None and e is not None and ((be > e and spot >= be) or (be < e and spot <= be)):
+            if be > e:
+                st["spot_lo"] = max(lo if lo is not None else -math.inf, e)
+            else:
+                st["spot_hi"] = min(hi if hi is not None else math.inf, e)
+            st["spot_be"] = None
+            self._info("EXIT-ENGINE breakeven %s: stop moved to entry %.1f", plan.variant_id, e)
+        return ExitDecision(None, pnl, peak)
+
     def _candidate_floor(self, peak: float, giveback: float, arm: Optional[float] = None) -> float:
         p = self.p
         arm = p.arm_rs if arm is None else arm
@@ -279,6 +304,8 @@ class ExitEngine:
             if stop > 0 and pnl <= -stop:
                 self._warn("EXIT-ENGINE HARD_STOP %s pnl=%.0f <= -%.0f", pos.plan.variant_id, pnl, stop)
                 return ExitDecision("HARD_STOP", pnl, peak, st.get("floor"), bool(st.get("armed")))
+            if getattr(pos.plan, "spot_rules", False):
+                return self._spot_exit(pos, st, pnl, peak, spot)
             if peak < arm:
                 return ExitDecision(None, pnl, peak, None, False, p.base_giveback)      # neutral zone: hold
             if not st.get("armed"):

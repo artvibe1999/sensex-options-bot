@@ -124,6 +124,16 @@ class TradePlan:
     variant_id: str = ""
     sl_frac: Optional[float] = None   # hard stop as a fraction of max loss (None: RiskParams default)
     tp_frac: Optional[float] = None   # take-profit as a fraction of max profit
+    # Underlying-price exits for signal trades (intraday.py): exit when SENSEX trades at/below spot_lo or at/above
+    # spot_hi. Once it reaches spot_be, the adverse bound moves to entry_spot (breakeven). None = not used.
+    spot_lo: Optional[float] = None
+    spot_hi: Optional[float] = None
+    spot_be: Optional[float] = None
+    entry_spot: Optional[float] = None
+
+    @property
+    def spot_rules(self) -> bool:
+        return self.spot_lo is not None or self.spot_hi is not None
 
     def qty_for(self, leg: "Leg", lots: int = 1) -> int:
         return lots * self.lot_size * leg.ratio

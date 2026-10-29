@@ -218,8 +218,8 @@ def run_backtest(bars: list[dict], specs: list[StrategySpec], sp: StrategyParams
                 tinfo = TrendInfo(daily_state(candles[-60:]))
                 chain = model_chain(bar["open"], iv0, expiry, now, bp, sp.risk_free_rate)
                 for spec in specs:
-                    if spec.forward_only:
-                        continue                       # no historical OI / 5-minute data: validated forward only
+                    if spec.forward_only or spec.intraday_signal:
+                        continue                       # forward only / validated by intraday_backtest.py
                     plan = build_plan(spec, chain, rs, tdir, bar["date"], now, None, tinfo)
                     if plan:
                         results[spec.id].append(

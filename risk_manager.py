@@ -65,14 +65,15 @@ class RiskManager:
 
         If a margin function is supplied and fails, size fails closed (0 lots).
         """
-        if plan.max_loss_per_lot <= 0:
+        per_lot = self.risk_per_lot(plan)
+        if per_lot <= 0:
             return 0
         budget = capital * self.p.max_risk_per_trade_pct
-        lots = min(self.p.max_lots, math.floor(budget / plan.max_loss_per_lot))
-        if lots < 1 and plan.max_loss_per_lot <= capital * self.p.one_lot_risk_pct:
+        lots = min(self.p.max_lots, math.floor(budget / per_lot))
+        if lots < 1 and per_lot <= capital * self.p.one_lot_risk_pct:
             lots = 1                                   # small account: one lot, capped by one_lot_risk_pct
         if lots < 1:
-            log.debug("Risk budget %.0f < max loss per lot %.0f", budget, plan.max_loss_per_lot)
+            log.debug("Risk budget %.0f < risk per lot %.0f", budget, per_lot)
             return 0
         if margin_fn is not None:
             while lots >= 1:
@@ -83,6 +84,17 @@ class RiskManager:
                     break
                 lots -= 1
         return max(lots, 0)
+
+    STOP_SLIPPAGE = 1.25                              # a stop can fill worse than its trigger
+
+    def risk_per_lot(self, plan) -> float:
+        """Worst loss per lot the bot will actually take. Plans that exit on the underlying (intraday signals) are
+        closed by the spot stop or, failing that, by the rupee hard stop, so their risk is that stop (+25% for
+        slippage), not the whole option premium; every other plan is sized on its expiry max loss."""
+        ml = plan.max_loss_per_lot
+        if getattr(plan, "spot_rules", False) and self.p.position_stop_rs > 0:
+            return min(ml, self.p.position_stop_rs * self.STOP_SLIPPAGE)
+        return ml
 
     # -------------------------------------------------------------- gating
     def entry_allowed(self, now: dt.datetime, trades_today: int) -> tuple[bool, str]:

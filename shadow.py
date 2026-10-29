@@ -103,7 +103,8 @@ class ShadowBook:
             if spec.id in self.open or spec.id in self.done_today:
                 continue
             # the DAILY trend, exactly as the live bot and the backtest build plans (not the 5-minute trend_dir)
-            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo)
+            plan = build_plan(spec, snap.chain, snap.rs, snap.trend_daily, now.date(), now, snap.features, snap.tinfo,
+                              getattr(snap, "ictx", None))
             if plan is None:
                 continue
             if not validate_plan_quotes(plan, snap.chain).ok:

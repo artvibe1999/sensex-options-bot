@@ -40,6 +40,11 @@ def collect(cfg: Config, now: dt.datetime, day: Optional[str] = None) -> dict[st
         flags.append("Not logged in to Kite today: no session, no data.")
     for key, path in (("paper_approved", cfg.paths.approved_backtest), ("live_approved", cfg.paths.approved_live)):
         d = _approvals(path)
+        if key == "paper_approved":                  # paper mode also trades the intraday-signal approvals
+            extra = _approvals(cfg.paths.approved_intraday)
+            if extra:
+                d = {"valid_until": (d or extra).get("valid_until"),
+                     "variants": (d or {}).get("variants", []) + extra.get("variants", [])}
         info[key] = len(d.get("variants", [])) if d else 0
         info[key + "_until"] = d.get("valid_until") if d else None
         tc = {"small": 0, "medium": 0, "large": 0}

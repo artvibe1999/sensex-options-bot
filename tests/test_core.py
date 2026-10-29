@@ -60,7 +60,7 @@ class LibraryTests(unittest.TestCase):
 
     def test_every_template_can_produce_a_trade_and_is_defined_risk(self):
         by_template, total, built = {}, 0, 0
-        for spec in (s for s in lib.build_library() if not s.needs_oi):   # OI variants need live OI data
+        for spec in (s for s in lib.build_library() if not s.needs_oi and not s.intraday_signal):  # need live OI / a signal
             plan, _, _ = plan_for(spec)
             total += 1
             if plan:
@@ -68,7 +68,7 @@ class LibraryTests(unittest.TestCase):
                 by_template[spec.template] = by_template.get(spec.template, 0) + 1
                 self.assertGreater(plan.max_loss_unit, 0)
                 self.assertGreater(plan.max_profit_unit, 0)
-        self.assertEqual(set(by_template), {s.template for s in lib.build_library()},
+        self.assertEqual(set(by_template), {s.template for s in lib.build_library() if not s.intraday_signal},
                          f"templates that never built a plan: built={by_template}")
         print(f"\n  library coverage on a sample chain: {built}/{total} variants produced a plan")
         self.assertGreater(built / total, 0.5)
