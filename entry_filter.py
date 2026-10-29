@@ -7,8 +7,10 @@ history yet) FAILS the check when `strict` (the default): an unconfirmed entry i
 Checks
   reach       the structure's maximum profit can actually cross the trailing-stop arm level (otherwise the exit
               engine could never lock a profit on it)
+  cost        the arm level is at least `min_arm_cost_mult` x round-trip charges
+  theta       net premium sellers forced to square off the same day: expected intraday theta covers the charges
   direction   directional structures need the daily and/or intraday trend (or a trap reversal) to agree and none to
-              oppose; delta-neutral structures need NO valid trend
+              oppose; delta-neutral structures need NO valid trend, judged on a formed intraday read
   skew        25-delta IV skew (put IV - call IV, vol points) must not contradict the structure
   oi          price-vs-OI build-up (long / short build-up, short covering, long unwinding) and option-writing side
               must agree with the structure; neutral structures need a quiet, non-trending OI picture
@@ -43,6 +45,11 @@ class EntryParams:
     skew_bear_min: float = -1.0           # bearish structures: reject if calls are bid over puts (negative skew)
     skew_neutral_abs: float = 8.0         # neutral structures: reject if the skew is stressed either way
     neutral_vix_fall_pct: float = 3.0     # long-volatility structures: reject when VIX is falling this fast
+    min_arm_cost_mult: float = 2.0        # the trail's arm level must be at least this multiple of round-trip costs
+    # Premium-selling structures squared off the same day (MIS) only earn the theta of the hours left. Expected
+    # capture = net theta/day x theta_capture_frac x share of the session left; it must cover costs x the multiple.
+    theta_capture_frac: float = 0.5
+    min_theta_cost_mult: float = 1.5
 
     @classmethod
     def from_env(cls) -> "EntryParams":
@@ -51,7 +58,10 @@ class EntryParams:
                    strict=(os.getenv("ENTRY_FILTER_STRICT", "1") or "1") != "0",
                    skew_bull_max=_env_float("SKEW_BULL_MAX", d.skew_bull_max),
                    skew_bear_min=_env_float("SKEW_BEAR_MIN", d.skew_bear_min),
-                   skew_neutral_abs=_env_float("SKEW_NEUTRAL_ABS", d.skew_neutral_abs))
+                   skew_neutral_abs=_env_float("SKEW_NEUTRAL_ABS", d.skew_neutral_abs),
+                   min_arm_cost_mult=_env_float("MIN_ARM_COST_MULT", d.min_arm_cost_mult),
+                   theta_capture_frac=_env_float("THETA_CAPTURE_FRAC", d.theta_capture_frac),
+                   min_theta_cost_mult=_env_float("MIN_THETA_COST_MULT", d.min_theta_cost_mult))
 
 
 @dataclass(frozen=True)
@@ -86,8 +96,12 @@ def _missing(strict: bool, what: str) -> Check:
 
 
 def evaluate_entry(plan, snap, sig: Optional[ContextSignals], params: EntryParams, lots: int = 1,
-                   arm_rs: Optional[float] = None) -> EntryDecision:
-    """Never raises: any internal error is a rejection (fail closed)."""
+                   arm_rs: Optional[float] = None, cost_rs: Optional[float] = None,
+                   session_left: Optional[float] = None) -> EntryDecision:
+    """Never raises: any internal error is a rejection (fail closed).
+
+    cost_rs: round-trip charges for all lots. session_left: share (0-1) of the trading session left before a forced
+    same-day square-off (None = the position may be held overnight, so the intraday theta check does not apply)."""
     try:
         if not params.enabled:
             return EntryDecision(True, 0, (Check("filter", True, "disabled"),))
@@ -95,10 +109,21 @@ def evaluate_entry(plan, snap, sig: Optional[ContextSignals], params: EntryParam
         bias, vega = desc["bias"], desc["vega"]
         checks: list[Check] = []
 
-        # --- reachability of the trailing arm level
+        # --- reachability of the trailing arm level, and an arm level worth reaching after costs
         if arm_rs is not None:
             mp = plan.max_profit_per_lot * lots
             checks.append(Check("reach", mp > arm_rs, f"max profit {mp:,.0f} vs arm {arm_rs:,.0f}"))
+            if cost_rs is not None:
+                need = params.min_arm_cost_mult * cost_rs
+                checks.append(Check("cost", arm_rs >= need, f"arm {arm_rs:,.0f} vs {params.min_arm_cost_mult:g}x "
+                                                            f"costs {cost_rs:,.0f}"))
+
+        # --- same-day premium selling must be able to earn its costs from theta
+        if session_left is not None and cost_rs is not None and desc["greeks"] and desc["theta"] > 0:
+            capture = desc["theta"] * lots * params.theta_capture_frac * max(session_left, 0.0)
+            need = params.min_theta_cost_mult * cost_rs
+            checks.append(Check("theta", capture >= need, f"intraday theta ~{capture:,.0f} vs "
+                                                          f"{params.min_theta_cost_mult:g}x costs {cost_rs:,.0f}"))
 
         # --- direction
         td = snap.trend_daily
@@ -119,8 +144,12 @@ def evaluate_entry(plan, snap, sig: Optional[ContextSignals], params: EntryParam
                               else Check("direction", False, "no confirming trend"))
         else:
             valid = bool(getattr(daily, "valid", False)) or bool(getattr(intr, "valid", False))
-            checks.append(Check("direction", not valid, "valid trend present: neutral structure unsafe" if valid
-                                else "no valid trend"))
+            if intr is None or not getattr(intr, "ready", True):
+                # "no trend" before the intraday read has formed is unknown, not a range
+                checks.append(_missing(params.strict, "direction"))
+            else:
+                checks.append(Check("direction", not valid, "valid trend present: neutral structure unsafe" if valid
+                                    else "no valid trend"))
             if vega > 0 and sig is not None and sig.vix_chg_pct is not None:
                 falling = sig.vix_chg_pct <= -params.neutral_vix_fall_pct
                 checks.append(Check("vix", not falling, f"long-vega with VIX {sig.vix_chg_pct:+.1f}%"))

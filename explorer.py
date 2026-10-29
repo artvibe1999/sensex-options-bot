@@ -21,11 +21,14 @@ from strategy_library import StrategySpec, _round_trip_cost, build_plan
 
 def pick_explore(snap, specs: list[StrategySpec], capital: float, size_fn: Callable[[TradePlan], int],
                  now: dt.datetime, min_score: float = 60.0, max_setups: int = 2,
-                 gate: Optional[Callable[[TradePlan, int], bool]] = None) -> Optional[tuple[TradePlan, int, float]]:
+                 gate: Optional[Callable[[TradePlan, int], bool]] = None,
+                 levels: Optional[Callable[[TradePlan], tuple[float, float]]] = None,
+                 ) -> Optional[tuple[TradePlan, int, float]]:
     """Best (plan, lots, scanner score) for the scanner's leading setups, or None. A candidate must be quoted and
     liquid, fit the account, and keep a positive expected margin after costs: (target profit - round-trip cost)
     relative to the stop-loss amount. The highest margin wins, which naturally favours cheap, few-leg structures
-    on small accounts."""
+    on small accounts. levels(plan) -> (target, stop) per lot overrides the variant's tp/sl fractions: pass the exit
+    engine's arm and stop so a far-off take-profit (60% of an iron fly's credit) cannot win the ranking."""
     if snap is None or snap.chain is None or not snap.fresh:
         return None
     by_id = {s.id: s for s in specs}
@@ -39,8 +42,10 @@ def pick_explore(snap, specs: list[StrategySpec], capital: float, size_fn: Calla
             lots = size_fn(plan)
             if lots < 1 or (gate is not None and not gate(plan, lots)):
                 continue
-            target = spec.tp_frac * plan.max_profit_per_lot
-            stop = spec.sl_frac * plan.max_loss_per_lot
+            if levels is not None:
+                target, stop = levels(plan)
+            else:
+                target, stop = spec.tp_frac * plan.max_profit_per_lot, spec.sl_frac * plan.max_loss_per_lot
             margin = (target - _round_trip_cost(plan.legs)) / stop if stop > 0 else 0.0
             if margin <= 0:
                 continue

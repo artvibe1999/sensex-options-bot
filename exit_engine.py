@@ -2,9 +2,11 @@
 
 Rules (all on the COMBINED mark-to-market P&L of every leg, quantities already include the lot size):
 
-  1. HARD STOP     combined P&L <= -hard_stop_rs                         -> exit "HARD_STOP"
-  2. NEUTRAL ZONE  -hard_stop_rs < P&L < +arm_rs                         -> HOLD, nothing here may exit the trade
-  3. TRAILING      once the peak P&L reaches +arm_rs the trail is armed. The lock-in floor only ever moves UP:
+  Levels are per structure: stop = min(hard_stop_rs, sl_frac x max loss), arm = min(arm_rs, arm_frac x max profit).
+
+  1. HARD STOP     combined P&L <= -stop                                 -> exit "HARD_STOP"
+  2. NEUTRAL ZONE  -stop < P&L < +arm                                    -> HOLD, nothing here may exit the trade
+  3. TRAILING      once the peak P&L reaches +arm the trail is armed. The lock-in floor only ever moves UP:
                      floor = max(previous floor, arm_rs,
                                  peak x (1 - giveback),                  # percentage of peak profit
                                  ladder milestone - lag)                 # step-up floor at 3000, 4000, ...
@@ -44,8 +46,12 @@ def _env_float(name: str, default: float) -> float:
 @dataclass(frozen=True)
 class ExitParams:
     enabled: bool = True
-    hard_stop_rs: float = 2000.0          # combined stop loss
-    arm_rs: float = 2000.0                # trailing arms at, and never exits below, this profit
+    hard_stop_rs: float = 2000.0          # combined stop CEILING; the variant's sl_frac x max loss applies if tighter
+    arm_rs: float = 2000.0                # trailing arms at, and never exits below, this profit (a ceiling, see arm_frac)
+    # Scale the arm level to the structure: arm = min(arm_rs, arm_frac x max profit). A fixed Rs 2000 is out of reach
+    # for a 1-lot narrow spread (max profit ~Rs 1.8k), so the entry gate only let iron flies through, and a fly's
+    # max loss (~Rs 1.9k) sits inside the Rs 2000 stop, so nothing but 15:15 ever closed it. 0 = fixed arm_rs.
+    arm_frac: float = 0.35
     base_giveback: float = 0.40           # share of peak profit the trail may give back before adaptation
     min_giveback: float = 0.15
     max_giveback: float = 0.60
@@ -73,6 +79,7 @@ class ExitParams:
             enabled=(os.getenv("EXIT_ENGINE", "1") or "1") != "0",
             hard_stop_rs=_env_float("POSITION_STOP_RS", d.hard_stop_rs),
             arm_rs=_env_float("TRAIL_MIN_PROFIT_RS", d.arm_rs),
+            arm_frac=_env_float("TRAIL_ARM_FRAC", d.arm_frac),
             base_giveback=_env_float("TRAIL_GIVEBACK", d.base_giveback),
             min_giveback=_env_float("TRAIL_GIVEBACK_MIN", d.min_giveback),
             max_giveback=_env_float("TRAIL_GIVEBACK_MAX", d.max_giveback),
@@ -132,19 +139,41 @@ class ExitEngine:
     def __init__(self, params: ExitParams) -> None:
         self.p = params
 
+    # ------------------------------------------------------------------ levels
+    def arm_for(self, max_profit_total: float) -> float:
+        """Profit at which the trail arms for a structure with this maximum profit (all lots)."""
+        p = self.p
+        if p.arm_frac > 0 and max_profit_total > 0:
+            return min(p.arm_rs, p.arm_frac * max_profit_total)
+        return p.arm_rs
+
+    def stop_for(self, max_loss_total: float, sl_frac: Optional[float]) -> float:
+        """Combined stop distance in rupees (0 = no stop): the variant's own stop, capped by hard_stop_rs."""
+        p = self.p
+        own = sl_frac * max_loss_total if sl_frac and max_loss_total > 0 else 0.0
+        if p.hard_stop_rs > 0 and own > 0:
+            return min(p.hard_stop_rs, own)
+        return p.hard_stop_rs if p.hard_stop_rs > 0 else own
+
+    def _levels(self, pos, st: dict) -> tuple[float, float]:
+        if "stop_rs" not in st:                    # positions saved before levels were stored
+            st["stop_rs"] = self.stop_for(getattr(pos, "max_loss", 0.0), getattr(pos.plan, "sl_frac", None))
+            st["arm_rs"] = self.arm_for(getattr(pos, "max_profit", 0.0))
+        return st["stop_rs"], st["arm_rs"]
+
     # ------------------------------------------------------------------ state
     def init_state(self, pos, chain, spot: float) -> None:
         """Call once when the position opens (or when restoring one that has no exit state yet)."""
         desc = describe_position(pos.legs, chain, pos.plan.name)
         pos.exit_state = {"bias": desc["bias"], "vega": desc["vega"], "theta": desc["theta"],
                           "entry_spot": spot, "hi": spot, "lo": spot, "floor": None, "armed": False, "notes": []}
+        stop, arm = self._levels(pos, pos.exit_state)
         log.info("EXIT-ENGINE init %s bias=%+d vega=%.0f theta=%.0f greeks=%s hard_stop=-%.0f arm=+%.0f",
-                 pos.plan.variant_id, desc["bias"], desc["vega"], desc["theta"], desc["greeks"],
-                 self.p.hard_stop_rs, self.p.arm_rs)
+                 pos.plan.variant_id, desc["bias"], desc["vega"], desc["theta"], desc["greeks"], stop, arm)
 
     def reachable(self, max_profit_total: float) -> bool:
         """Can a position with this maximum profit ever cross the arm level? (entry gate)"""
-        return max_profit_total > self.p.arm_rs
+        return max_profit_total > self.arm_for(max_profit_total)
 
     # --------------------------------------------------------------- adaptation
     def _adapt(self, st: dict, pos, sig: Optional[ContextSignals], spot: Optional[float],
@@ -219,14 +248,15 @@ class ExitEngine:
         f = min(max(f, p.factor_min), p.factor_max)
         return min(max(gb * f, p.min_giveback), p.max_giveback), notes
 
-    def _candidate_floor(self, peak: float, giveback: float) -> float:
+    def _candidate_floor(self, peak: float, giveback: float, arm: Optional[float] = None) -> float:
         p = self.p
+        arm = p.arm_rs if arm is None else arm
         pct = peak * (1.0 - giveback)
         ladder = -math.inf
         if p.ladder_step_rs > 0:
-            k = max(math.floor((peak - p.arm_rs) / p.ladder_step_rs), 0)   # highest milestone reached: arm + k x step
-            ladder = p.arm_rs + (k - p.ladder_lag_steps) * p.ladder_step_rs
-        return max(pct, ladder, p.arm_rs)
+            k = max(math.floor((peak - arm) / p.ladder_step_rs), 0)        # highest milestone reached: arm + k x step
+            ladder = arm + (k - p.ladder_lag_steps) * p.ladder_step_rs
+        return max(pct, ladder, arm)
 
     # ------------------------------------------------------------------ main
     def evaluate(self, pos, pnl: float, now: dt.datetime, sig: Optional[ContextSignals] = None,
@@ -242,16 +272,17 @@ class ExitEngine:
                 st["hi"], st["lo"] = max(st.get("hi") or spot, spot), min(st.get("lo") or spot, spot)
             pos.peak_pnl = max(pos.peak_pnl, pnl)
             peak = pos.peak_pnl
-            if pnl <= -p.hard_stop_rs:
-                log.warning("EXIT-ENGINE HARD_STOP %s pnl=%.0f <= -%.0f", pos.plan.variant_id, pnl, p.hard_stop_rs)
+            stop, arm = self._levels(pos, st)
+            if stop > 0 and pnl <= -stop:
+                log.warning("EXIT-ENGINE HARD_STOP %s pnl=%.0f <= -%.0f", pos.plan.variant_id, pnl, stop)
                 return ExitDecision("HARD_STOP", pnl, peak, st.get("floor"), bool(st.get("armed")))
-            if peak < p.arm_rs:
+            if peak < arm:
                 return ExitDecision(None, pnl, peak, None, False, p.base_giveback)      # neutral zone: hold
             if not st.get("armed"):
                 st["armed"] = True
                 log.info("EXIT-ENGINE trail ARMED %s peak=%.0f pnl=%.0f", pos.plan.variant_id, peak, pnl)
             gb, notes = self._adapt(st, pos, sig, spot, now)
-            cand = self._candidate_floor(peak, gb)
+            cand = self._candidate_floor(peak, gb, arm)
             prev = st.get("floor")
             floor = cand if prev is None else max(prev, cand)                          # ratchet: never lowered
             if prev is None or floor > prev + 1e-9:
@@ -268,6 +299,6 @@ class ExitEngine:
             return ExitDecision(None, pnl, peak, floor, True, gb, tuple(notes))
         except Exception:  # noqa: BLE001 - a bug here must not disable the stop
             log.exception("ExitEngine.evaluate failed; applying hard stop only")
-            if pnl <= -p.hard_stop_rs:
+            if p.hard_stop_rs > 0 and pnl <= -p.hard_stop_rs:
                 return ExitDecision("HARD_STOP", pnl, pos.peak_pnl)
             return ExitDecision(None, pnl, pos.peak_pnl)

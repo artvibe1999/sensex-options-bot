@@ -42,7 +42,7 @@ from sheets_sink import ORDERS_HEADER, STATUS_HEADER, TRADES_HEADER, SheetsSink
 from shadow import ShadowBook
 from sheet_log import SheetLogHandler
 from strategy_engine import Leg, RegimeDetector, StrategyEngine, TradePlan
-from strategy_library import build_library, build_plan, load_approved
+from strategy_library import _round_trip_cost, build_library, build_plan, load_approved
 from zerodha_client import AuthError, OptionContract, ZerodhaClient
 
 log = logging.getLogger("bot")
@@ -504,9 +504,18 @@ class Bot:
         return fn
 
     def _gate(self, plan: TradePlan, lots: int, snap: Snapshot) -> bool:
-        """Entry filter (bias, IV skew, OI build-up, reachable trail). Rejections are logged at most once a minute."""
-        arm = self.xp.arm_rs if (self.xp.enabled and self.xp.require_reachable_arm) else None
-        dec = evaluate_entry(plan, snap, self.ctx.signals(), self.ep, lots, arm)
+        """Entry filter (bias, IV skew, OI build-up, reachable trail, costs, intraday theta). Rejections are logged at
+        most once a minute."""
+        arm = (self.exit_engine.arm_for(plan.max_profit_per_lot * lots)
+               if (self.xp.enabled and self.xp.require_reachable_arm) else None)
+        cost = _round_trip_cost(plan.legs) * lots
+        sched, now = self.cfg.schedule, snap.ts
+        session_left = None                                   # None: may be held overnight (NRML before expiry day)
+        if self.cfg.execution.product == "MIS" or plan.expiry <= now.date():
+            day = lambda t: dt.datetime.combine(now.date(), t, now.tzinfo)
+            total = (day(sched.square_off) - day(sched.market_open)).total_seconds()
+            session_left = max((day(sched.square_off) - now).total_seconds(), 0.0) / total if total > 0 else 0.0
+        dec = evaluate_entry(plan, snap, self.ctx.signals(), self.ep, lots, arm, cost, session_left)
         if dec.ok:
             log.info("ENTRY-FILTER pass %s: %s", plan.variant_id, dec.summary())
             return True
@@ -525,8 +534,12 @@ class Bot:
         ok, _why = self.risk.entry_allowed(now, 0)         # window / halt only; the explore cap is applied above
         if not ok:
             return
+        levels = None
+        if self.xp.enabled:                                  # rank by the levels the exit engine will really use
+            levels = lambda p: (self.exit_engine.arm_for(p.max_profit_per_lot),
+                                self.exit_engine.stop_for(p.max_loss_per_lot, p.sl_frac))
         pick = pick_explore(snap, self.specs, self.capital, lambda p: self.risk.size(p, self.capital, self._margin_fn(p)), now,
-                            self.cfg.explore_min_score, gate=lambda p, n: self._gate(p, n, snap))
+                            self.cfg.explore_min_score, gate=lambda p, n: self._gate(p, n, snap), levels=levels)
         if pick:
             plan, lots, score = pick
             self._enter(now, snap, plan, lots, score, 1)

@@ -1,4 +1,5 @@
 """Offline tests: python -m unittest discover -s tests -v"""
+import dataclasses
 import datetime as dt
 import os
 import sqlite3
@@ -498,7 +499,7 @@ class TrendAndTierTests(unittest.TestCase):
         bear = tr.daily_state(flat + [{"high": 100.2, "low": 97.0, "close": 100.3}])
         self.assertEqual((bull.trap, bull.trap_dir), (tr.BULL_TRAP, -1))
         self.assertEqual((bear.trap, bear.trap_dir), (tr.BEAR_TRAP, 1))
-        self.assertEqual(tr.daily_state(self._bars([100.0] * 5)), tr.TrendState())   # too little data: no signal
+        self.assertEqual(tr.daily_state(self._bars([100.0] * 5)), tr.TrendState(ready=False))   # too little data: no signal
 
     def test_trend_modes_fail_closed_and_match_direction(self):
         import trend_regime as tr
@@ -571,6 +572,17 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual((top.setup, top.bias), ("TREND_UP", 1))
         self.assertIn("intraday_trend", top.passed)
         self.assertEqual(scanner.scan(self._snap(-1))[0].setup, "TREND_DOWN")
+
+    def test_no_range_setup_before_the_intraday_read_forms(self):
+        import scanner
+        import trend_regime as tr
+        snap = self._snap(trend_dir=0)
+        flat = tr.TrendState(0, False, None, 0.1)
+        formed = dataclasses.replace(snap, tinfo=tr.TrendInfo(flat, flat))
+        self.assertIn("RANGE_PIN", [o.setup for o in scanner.scan(formed, 0)])
+        warming = dataclasses.replace(snap, tinfo=tr.TrendInfo(flat, tr.TrendState(ready=False)))   # 09:30 open
+        self.assertNotIn("RANGE_PIN", [o.setup for o in scanner.scan(warming, 0)])
+        self.assertNotIn("VOL_EXPANSION", [o.setup for o in scanner.scan(warming, 0)])
 
     def test_no_signal_when_illiquid_spiking_or_no_data(self):
         import scanner

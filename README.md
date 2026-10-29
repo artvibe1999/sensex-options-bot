@@ -204,3 +204,20 @@ Paper trades now go through the same Kite basket-margin check as live (read-only
 
 ### Log tab (remote visibility without shell access)
 With the Sheets feed enabled, `sheet_log.py` mirrors WARNING+ lines and key events (entries, exits, entry-filter passes, exit-engine arm/floor/stop/adaptation lines) to a **Log** tab every minute, with secrets redacted. Entry-filter rejections are summarised hourly by failed check. The first row after each start says which build is running (git commit, or the code files' date inside Docker). The Apps Script creates the tab automatically; no script change is needed.
+
+### Tuning after the first paper week (Oct 26-29: 4 explore trades, all losers, net -Rs 1,991)
+What the trades showed, and what changed:
+- **RANGE_PIN fired at 09:30 every day.** The intraday trend needs ~14 five-minute bars; before that it reported "no
+  trend, no trap", which the scanner and entry filter read as a calm range (score 100). `TrendState.ready` now marks an
+  unformed read; neutral setups and neutral structures are not taken until it forms (~10:25).
+- **Exits were fixed in rupees, not scaled to the structure.** A 1-lot 500-wing iron fly loses at most ~Rs 1.9k, so the
+  Rs 2,000 hard stop could never fire, and the Rs 2,000 arm level was out of reach intraday: 15:15 was the only exit.
+  The same Rs 2,000 arm made every narrow debit spread (max profit ~Rs 1.8k) fail the `reach` gate, so only flies were
+  traded. Now stop = min(`POSITION_STOP_RS`, sl_frac x max loss) and arm = min(`TRAIL_MIN_PROFIT_RS`,
+  `TRAIL_ARM_FRAC` x max profit).
+- **Costs beat the edge.** Charges were Rs 157-298 per trade on gross moves of Rs 10-750. New entry checks: `cost` (arm
+  level >= `MIN_ARM_COST_MULT` x round-trip charges) and `theta` (MIS premium selling must expect to earn
+  `MIN_THETA_COST_MULT` x charges from intraday theta). Replayed on the three flies, all three are rejected.
+- Exploration now ranks candidates by the exit engine's real arm/stop levels, not a 60% take-profit no intraday trade reaches.
+None of this is a proven edge: it removes trades that could not pay for themselves. Keep paper mode until `promote.py`
+approves variants on forward evidence.

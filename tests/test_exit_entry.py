@@ -64,11 +64,22 @@ class NeutralZoneTests(unittest.TestCase):
         self.assertEqual(_run(eng, pos, [-1000, -2000]), [None, "HARD_STOP"])
         self.assertEqual(_run(eng, _pos(), [-3500]), ["HARD_STOP"])
 
-    def test_variant_stop_fractions_do_not_exit_inside_the_zone(self):
+    def test_variant_stop_applies_when_tighter_than_the_rupee_ceiling(self):
         pos = _pos(max_loss=2300.0, max_profit=1700.0)
         pos.plan = SimpleNamespace(**{**pos.plan.__dict__, "sl_frac": 0.5, "tp_frac": 0.5}) \
             if hasattr(pos.plan, "__dict__") else pos.plan
-        self.assertEqual(_run(_engine(), pos, [-1200, 900, 1700]), [None, None, None])
+        self.assertEqual(_run(_engine(), pos, [-1100, -1150]), [None, "HARD_STOP"])     # 0.5 x 2300
+
+    def test_rupee_ceiling_caps_a_loose_variant_stop(self):
+        pos = _pos(max_loss=9000.0, max_profit=9000.0)
+        pos.plan = SimpleNamespace(**{**pos.plan.__dict__, "sl_frac": 0.6})
+        self.assertEqual(_run(_engine(), pos, [-1999, -2000]), [None, "HARD_STOP"])
+
+    def test_arm_level_scales_to_a_small_structure(self):
+        eng, pos = _engine(), _pos(max_loss=2200.0, max_profit=1800.0)      # 1-lot 200-wide debit spread
+        self.assertAlmostEqual(eng.arm_for(1800.0), 630.0)                   # 0.35 x max profit, below Rs 2000
+        self.assertEqual(_run(eng, pos, [600, 700, 640, 629]), [None, None, None, "TRAILING_STOP"])
+        self.assertAlmostEqual(_engine(arm_frac=0).arm_for(1800.0), 2000.0)  # 0 = fixed rupee arm
 
     def test_trailing_never_exits_below_arm_level(self):
         eng, pos = _engine(), _pos()
@@ -256,11 +267,19 @@ class EntryFilterTests(unittest.TestCase):
 
     def test_neutral_structure_rejected_in_a_valid_trend(self):
         plan = self._plan("iron_condor")
-        calm = _snap(trend_daily=0)
+        calm = _snap(trend_daily=0, intraday=TrendState())
         self.assertTrue(evaluate_entry(plan, calm, _sig(buildup=NEUTRAL), self.P).ok)
-        trending = _snap(trend_daily=1, daily=TrendState(dir=1, valid=True, er=0.8))
+        trending = _snap(trend_daily=1, daily=TrendState(dir=1, valid=True, er=0.8), intraday=TrendState())
         self.assertFalse(evaluate_entry(plan, trending, _sig(buildup=NEUTRAL), self.P).ok)
         self.assertFalse(evaluate_entry(plan, calm, _sig(buildup=LONG_BUILDUP), self.P).ok)          # directional OI flow
+
+    def test_neutral_structure_needs_a_formed_intraday_read(self):
+        plan = self._plan("iron_condor")
+        warming = _snap(trend_daily=0, intraday=TrendState(ready=False))            # 09:30: too few 5-min bars
+        dec = evaluate_entry(plan, warming, _sig(buildup=NEUTRAL), self.P)
+        self.assertFalse(dec.ok)
+        self.assertIn("direction", dec.reason)
+        self.assertFalse(evaluate_entry(plan, _snap(trend_daily=0), _sig(buildup=NEUTRAL), self.P).ok)  # no read at all
 
     def test_arm_level_must_be_reachable(self):
         plan = self._plan("bull_call_spread")
@@ -268,6 +287,26 @@ class EntryFilterTests(unittest.TestCase):
         self.assertFalse(small.ok)
         self.assertIn("reach", small.reason)
         self.assertTrue(evaluate_entry(plan, _snap(), _sig(), self.P, lots=1, arm_rs=2000.0).ok)
+
+    def test_arm_level_must_beat_costs(self):
+        plan = self._plan("bull_call_spread")
+        self.assertTrue(evaluate_entry(plan, _snap(), _sig(), self.P, lots=1, arm_rs=600.0, cost_rs=150.0).ok)
+        dec = evaluate_entry(plan, _snap(), _sig(), self.P, lots=1, arm_rs=250.0, cost_rs=150.0)
+        self.assertFalse(dec.ok)
+        self.assertIn("cost", dec.reason)
+
+    def test_same_day_premium_selling_must_earn_its_costs_from_theta(self):
+        plan = self._plan("iron_condor")
+        calm = _snap(trend_daily=0, intraday=TrendState())
+        theta = plan_bias(plan, CH)["theta"]
+        self.assertGreater(theta, 0)                                                 # net short premium
+        ok_cost = theta * self.P.theta_capture_frac / (2 * self.P.min_theta_cost_mult)
+        self.assertTrue(evaluate_entry(plan, calm, _sig(buildup=NEUTRAL), self.P, cost_rs=ok_cost, session_left=1.0).ok)
+        late = evaluate_entry(plan, calm, _sig(buildup=NEUTRAL), self.P, cost_rs=ok_cost, session_left=0.2)
+        self.assertFalse(late.ok)
+        self.assertIn("theta", late.reason)
+        # held overnight (session_left None): no intraday theta check
+        self.assertTrue(evaluate_entry(plan, calm, _sig(buildup=NEUTRAL), self.P, cost_rs=ok_cost).ok)
 
     def test_disabled_and_error_paths(self):
         plan = self._plan("bull_call_spread")

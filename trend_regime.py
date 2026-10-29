@@ -21,6 +21,7 @@ class TrendState:
     valid: bool = False             # a clean single-direction move that is worth trading with
     trap: Optional[str] = None      # BULL_TRAP | BEAR_TRAP | None
     er: float = 0.0                 # efficiency ratio over the look-back (0 = chop, 1 = straight line)
+    ready: bool = True              # False = not enough bars yet: "no trend" means UNKNOWN, not "range"
 
     @property
     def trap_dir(self) -> int:
@@ -62,7 +63,7 @@ def daily_state(candles: Sequence[dict], look: int = 10, er_min: float = 0.35,
                 breach: float = 0.0005, back: float = 0.0005) -> TrendState:
     """From COMPLETED daily candles (dicts with high/low/close)."""
     if len(candles) < 25:
-        return TrendState()
+        return TrendState(ready=False)
     closes = [c["close"] for c in candles]
     er = efficiency_ratio(closes[-(look + 1):])
     fast, slow = _ema(closes[-60:], 9), _ema(closes[-60:], 21)
@@ -81,7 +82,7 @@ def intraday_state(candles: Sequence[dict], spot: float, prior_high: Optional[fl
     """From 5-minute candles (oldest first; dicts with high/low/close), the live spot as the latest close,
     and the previous day's high/low. Pass TODAY's candles only; needs about 14 bars (about 70 minutes of session)."""
     if len(candles) < look + 2 or spot <= 0:
-        return TrendState()
+        return TrendState(ready=False)
     closes = [c["close"] for c in candles] + [spot]
     recent = closes[-(look + 1):]
     er = efficiency_ratio(recent)

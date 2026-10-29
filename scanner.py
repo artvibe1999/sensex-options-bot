@@ -90,23 +90,26 @@ def scan(snap, min_score: float = 55.0) -> list[Opportunity]:
         ]
         out.append(_score(setup, checks))
 
-    inside = (f.put_wall is not None and f.call_wall is not None and f.put_wall < spot < f.call_wall
-              and (f.call_wall - f.put_wall) / spot > 0.02)
-    out.append(_score("RANGE_PIN", [
-        ("calm_regime", 2, rs.regime in (Regime.LOW_VOL, Regime.NORMAL)),
-        ("positive_gamma", 3, f.net_gex > 0),
-        ("inside_wide_walls", 2, inside),
-        ("no_valid_trend", 2, not ((d and d.valid) or (i and i.valid))),
-        ("no_trap", 1, not ((d and d.trap) or (i and i.trap))),
-    ]))
+    # Neutral setups score on the ABSENCE of a trend/trap. Until the intraday read has enough bars (~70 min) that
+    # absence is unknown, not a range: without this RANGE_PIN scored 100 at the 09:30 open every day.
+    if i is not None and i.ready:
+        inside = (f.put_wall is not None and f.call_wall is not None and f.put_wall < spot < f.call_wall
+                  and (f.call_wall - f.put_wall) / spot > 0.02)
+        out.append(_score("RANGE_PIN", [
+            ("calm_regime", 2, rs.regime in (Regime.LOW_VOL, Regime.NORMAL)),
+            ("positive_gamma", 3, f.net_gex > 0),
+            ("inside_wide_walls", 2, inside),
+            ("no_valid_trend", 2, not ((d and d.valid) or i.valid)),
+            ("no_trap", 1, not ((d and d.trap) or i.trap)),
+        ]))
 
-    out.append(_score("VOL_EXPANSION", [
-        ("negative_gamma", 3, f.net_gex < 0),
-        ("elevated_vol", 2, rs.regime != Regime.LOW_VOL),
-        ("no_valid_trend", 1, not ((d and d.valid) or (i and i.valid))),
-        ("price_near_max_pain_or_wall", 1, any(x is not None and abs(x - spot) / spot < 0.004
-                                               for x in (f.max_pain, f.call_wall, f.put_wall))),
-    ]))
+        out.append(_score("VOL_EXPANSION", [
+            ("negative_gamma", 3, f.net_gex < 0),
+            ("elevated_vol", 2, rs.regime != Regime.LOW_VOL),
+            ("no_valid_trend", 1, not ((d and d.valid) or i.valid)),
+            ("price_near_max_pain_or_wall", 1, any(x is not None and abs(x - spot) / spot < 0.004
+                                                   for x in (f.max_pain, f.call_wall, f.put_wall))),
+        ]))
     out = [o for o in out if o.score >= min_score]
     return sorted(out, key=lambda o: -o.score)
 
