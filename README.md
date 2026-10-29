@@ -201,3 +201,6 @@ The backtest and shadow book do **not** apply these exit or entry rules, so appr
 
 ### Margin in paper mode
 Paper trades now go through the same Kite basket-margin check as live (read-only API call, no orders): lots are sized to fit `margin_utilisation` x capital, and the final entry is blocked if the whole structure needs more. A failed margin query blocks the trade. The Telegram ENTRY alert shows the margin used. Order rows in the Orders sheet are listed in execution order (BUY hedges first, then SELLs).
+
+### Log tab (remote visibility without shell access)
+With the Sheets feed enabled, `sheet_log.py` mirrors WARNING+ lines and key events (entries, exits, entry-filter passes, exit-engine arm/floor/stop/adaptation lines) to a **Log** tab every minute, with secrets redacted. Entry-filter rejections are summarised hourly by failed check. The first row after each start says which build is running (git commit, or the code files' date inside Docker). The Apps Script creates the tab automatically; no script change is needed.

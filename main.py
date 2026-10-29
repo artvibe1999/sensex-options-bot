@@ -40,6 +40,7 @@ from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as
 from risk_manager import ManagedPosition, OpenLeg, RiskManager
 from sheets_sink import ORDERS_HEADER, STATUS_HEADER, TRADES_HEADER, SheetsSink
 from shadow import ShadowBook
+from sheet_log import SheetLogHandler
 from strategy_engine import Leg, RegimeDetector, StrategyEngine, TradePlan
 from strategy_library import build_library, build_plan, load_approved
 from zerodha_client import AuthError, OptionContract, ZerodhaClient
@@ -106,6 +107,10 @@ class Bot:
         self.alerts = Alerter(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id, background=True)
         self.rec = Recorder(cfg.paths.db)
         self.sheets = SheetsSink(cfg.sheets_url, cfg.sheets_secret)
+        self.sheet_log = SheetLogHandler(self.sheets, self.mode)     # mirrors key log lines to the sheet's Log tab
+        logging.getLogger().addHandler(self.sheet_log)
+        if self.sheets.enabled:
+            self.sheet_log.start()
         self.specs = build_library()
         self.spec_by_id = {s.id: s for s in self.specs}
         self.shadow = ShadowBook(self.specs, self.rec, cfg.risk, cfg.schedule, cfg.costs)

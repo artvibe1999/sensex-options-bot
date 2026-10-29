@@ -363,5 +363,46 @@ class MarginInPaperModeTests(unittest.TestCase):
         self.assertEqual(fail.risk.size(plan, fail.capital, fail._margin_fn(plan)), 0)
 
 
+class SheetLogTests(unittest.TestCase):
+    def _handler(self):
+        from sheet_log import SheetLogHandler
+        sent = []
+        sink = SimpleNamespace(append=lambda tab, header, rows: sent.append((tab, rows)))
+        return SheetLogHandler(sink, "PAPER", flush_s=999, max_rows=5, summary_s=0.0), sent
+
+    def _rec(self, msg, level=20, name="main"):
+        import logging
+        return logging.LogRecord(name, level, __file__, 1, msg, None, None)
+
+    def test_filters_redacts_and_summarises(self):
+        h, sent = self._handler()
+        h.emit(self._rec("EXIT-ENGINE floor x -> 2000"))
+        h.emit(self._rec("some chatty info line"))                           # ignored
+        h.emit(self._rec("token=abc123SECRETvalue failed", 30))              # warning kept, secret redacted
+        h.emit(self._rec("Sheets post failed", 30, "sheets"))                # sender loggers skipped (no feedback)
+        h.emit(self._rec("ENTRY-FILTER reject v1: direction: trend opposes; skew: x"))
+        h.emit(self._rec("ENTRY-FILTER reject v2: direction: no confirming trend"))
+        n = h.flush(now_s=10.0)
+        tab, rows = sent[0]
+        self.assertEqual(tab, "Log")
+        text = " | ".join(r[4] for r in rows)
+        self.assertIn("EXIT-ENGINE", text)
+        self.assertNotIn("chatty", text)
+        self.assertNotIn("abc123SECRETvalue", text)
+        self.assertIn("rejections since last summary: 2 (direction x2)", text)
+        self.assertEqual(n, len(rows))
+
+    def test_dedupe_and_cap(self):
+        h, sent = self._handler()
+        for _ in range(4):
+            h.emit(self._rec("same warning", 30))
+        for i in range(10):
+            h.emit(self._rec(f"warning number {i}", 30))
+        h.flush(now_s=10.0)
+        rows = sent[0][1]
+        self.assertLessEqual(len(rows), 6)                                   # 5 + the "omitted" note
+        self.assertIn("omitted", rows[0][4])
+
+
 if __name__ == "__main__":
     unittest.main()
