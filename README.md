@@ -1,24 +1,135 @@
 # SENSEX options bot (Zerodha Kite Connect)
 
-Autonomous, defined-risk SENSEX options bot. **Paper mode by default.** Live trading needs
-`--live` AND `LIVE_TRADING_CONFIRM=YES`.
+Autonomous SENSEX options bot. **Paper mode by default.** Live trading needs `--live` AND `LIVE_TRADING_CONFIRM=YES`.
 
-## Honest status
-- **164 strategy candidates** (8 templates x parameters x regime x DTE x trend filter x stop/target). They are
-  *candidates*, not "proven". Nothing trades live until it passes: walk-forward backtest -> forward shadow
-  book -> `promote.py` -> `data/approved_live.json` (valid 30 days; missing/expired = no trades).
-- The backtest prices options with Black-Scholes (Kite has no expired-option history). It is an approximation.
-  Real evidence = the data the bot records (`data/sxbot.db`): full chain every 10 s, ATM+/-5 strikes every second.
-- On synthetic data every template is slightly negative after costs. That is expected: costs are real and
-  the model gives no free edge. Do not expect the pipeline to approve much until real data says so.
-- NOT verified (flagged VERIFY in `config.py`): SENSEX weekly expiry weekday (Thursday assumed), strike step
-  (100 assumed), lot size (20 assumed; the live bot reads lot size/expiries/tokens from the instruments dump).
-- `token_service.py`'s `redirect_params` state nonce is untested against live Kite.
+## Current status (31 Oct 2026)
+- **Active strategy: the playbook** (`playbook.py`, on by default, `PLAYBOOK=0` switches it off). Four setups, one
+  position at a time, **no stop-loss and no trailing stop**; every trade is closed by 15:15 at the latest.
+- Deployed on the GCP VM `sxbot` in **paper mode** with `PAPER_CAPITAL=40000`. Default 2 lots per trade, changeable
+  from Telegram. The bot only goes live when you switch the compose command to `--live` and set
+  `LIVE_TRADING_CONFIRM=YES`.
+- Results so far are a **backtest** (see "How the playbook was chosen"). Option prices in it are modelled from the index
+  and India VIX, because Kite serves no history for expired option contracts. Forward paper results will show whether
+  the edge holds; follow them on the trading report page.
+- The older approvals pipeline (164+ variants, walk-forward backtest, shadow book, `promote.py`) is still in the code
+  and still records data, but it does not place entries while the playbook is on. Its documentation is kept below.
+
+## The playbook (`playbook.py`, `pb_indicators.py`)
+Indicators are computed on 15-minute bars built from Kite's 5-minute history, using **only candles that had closed
+when the history was fetched** (`MarketData.completed_5m`).
+
+| Setup | When | What | Exit |
+|---|---|---|---|
+| **Single leg** (top priority) | 15-min Supertrend(10,2) flips and Supertrend(10,3) already agrees, signal bar ending 10:30-13:00, India VIX >= 14. Max 2 per day. | Buy a CE (up) or PE (down). Strike against time decay: ATM with 3+ trading days to expiry, 200 pts ITM with 2 days, 400 pts ITM with 1 day. | Trend reversal (Supertrend(10,2) turns against the trade), Rs 1,500 loss cap, else 15:15. |
+| **Iron condor** | No trend: first moment 10:00-12:00 with 15-min ADX(14) < 25, no single-leg trade yet today. Any VIX. Once per day. | Sell CE/PE 0.8% out of the money when VIX >= 14, 0.6% out when VIX < 14; buy wings 1.7% further out. | 15:15, Rs 1,500 loss cap, or a single-leg signal (condor closed, trend trade taken). |
+| **Trend credit spread** | Strong trend without a fresh flip: ADX >= 30, both Supertrends and +DI/-DI agree, 10:30-13:00, no other trade today. | Sell the option 1% OTM on the side away from the trend (PE in an uptrend, CE in a downtrend), buy one 1.2% further out. | Trend reversal, Rs 1,500 loss cap, a single-leg signal, or 15:15. |
+
+- **Expiry day:** the bot never trades the expiring contract on expiry day; the chain uses the next weekly expiry.
+  Using next week's contract on the day *before* expiry was tested and made results worse, so it is not used.
+- **Lots:** the Telegram setting (default 2), or fewer (down to 1) when that many lots need more margin than the capital
+  allows (Kite's basket margin, max 80% of capital on small accounts). A trade that does not fit even at 1 lot is skipped
+  with a Telegram warning.
+- **Pre-emption:** an open condor or credit spread is closed for a trend signal only if the trend trade can actually be
+  placed (quote and margin), checked at most every 10 s.
+- **Quotes:** a trend signal whose option is not quoted yet is retried for 60 s; a margin refusal is final.
+- The playbook bypasses the old exit engine, daily-loss stop and portfolio trailing stop. Only broker-safety halts
+  (position mismatch, unconfirmed unwind, exits not completing, shutdown) can close a playbook position early.
+
+## Telegram commands (`telegram_control.py`)
+Only messages from `TELEGRAM_CHAT_ID` are obeyed (in a group chat every member can use them; a private chat is safer).
+
+| Command | Effect |
+|---|---|
+| `/lots` | Show the lot settings |
+| `/lots N` | Single-leg lots, 1-20, paper and live, from the next entry |
+| `/mlots N` | Condor and credit-spread lots, 1-20, from the next entry |
+| `/status` | Mode, open position, today's P&L, lot settings |
+| `/report` | Link to the trading report page |
+
+Settings persist in `data/settings.json` (created on the first change). An open position is never resized.
+
+## Trading report page (`report_site.py`)
+One self-contained HTML page with **Paper** and **Live** tabs: net P&L since `REPORT_SINCE`, trades, win rate, days
+won / lost / without a trade, best and worst day, largest drop from a peak, daily P&L chart, by month, by setup
+(paper) or bot vs manual (live), and every day with its trades.
+- **Paper:** the bot's own trade log (`trades` table, mode PAPER).
+- **Live:** after each close (~15:30, before the 15:40 auto-stop) the bot reads the account's real option orders and
+  fills from Kite (`orders()`, `trades()`; read-only) and saves them in `data/live/YYYY-MM-DD.json` (no account ids).
+  Kite keeps only the current day, so a day the VM is off at the close cannot be fetched later. Realised P&L per
+  contract per day; charges estimated per order from the Zerodha schedule; **Bot** = orders tagged `SXALGO`.
+- **Hosting:** the page is **one Cloud Storage object**, `gs://REPORT_GCS_BUCKET/r/<REPORT_TOKEN>/index.html`,
+  overwritten in place on every rebuild (start-up and each close), so its link never changes and works while the VM is
+  off. Uploaded with the VM's own service-account token from the metadata server (no key file), `cacheControl:
+  no-cache`. The page carries `noindex` and a Content-Security-Policy meta tag. The VM no longer serves the page.
+- **Telegram:** the link with a one-line summary is sent only when the page's data changed (fingerprint in
+  `data/report.hash`); a failed upload is retried at the next build.
+- **Cloud setup** (done for `sxbot`): a dedicated bucket with uniform access; `allUsers` =
+  `roles/storage.legacyObjectReader` (read an object, no listing, so the token path cannot be discovered); a service
+  account `sxbot-report` with `roles/storage.objectUser` on that bucket only; the VM runs as `sxbot-report` with scopes
+  `storage-rw,logging-write` (instead of the default compute account with project Editor).
+
+## Configuration added for the playbook and report
+| Variable | Default | Meaning |
+|---|---|---|
+| `PLAYBOOK` | `1` | `0` = old approvals + explorer entry path |
+| `PB_LOSS_CAP_RS` | `1500` | Loss cap per playbook trade (Rs); `0` = off |
+| `PB_SINGLE_MIN_VIX` | `14` | Minimum India VIX for single-leg entries |
+| `PB_CREDIT_SPREAD` | `1` | `0` switches off the trend credit spread (thinnest edge) |
+| `SINGLE_LOTS` / `MULTI_LOTS` | `2` / `2` | Default lots until changed from Telegram |
+| `PAPER_CAPITAL` | `500000` (VM: `40000`) | Paper account size used for margin checks |
+| `REPORT_TOKEN` | (none) | Long random string, the secret part of the report path |
+| `REPORT_GCS_BUCKET` | (none) | Bucket holding the report page; unset = no page |
+| `REPORT_SINCE` | `2026-11-02` | First date shown on the report |
+| `REPORT_BACKTEST_URL` | backtest page | Link shown in the report footer |
+
+## How the playbook was chosen (research, Oct 2026)
+Data: SENSEX and India VIX 1-minute candles from Kite, 14 Mar 2018 - 30 Oct 2026 (2,118 trading days), built into
+5-minute bars. Option prices: Black-Scholes on India VIX (calls x0.91, puts x1.02), calibrated on 8,319 real recorded
+quotes (median error under 2%); real intraday straddle decay was checked against the model. Costs: 0.5% slippage per
+fill (real median half-spread is 0.12% at the money) plus Zerodha brokerage, STT 0.15% on sells, exchange, SEBI, GST
+and stamp duty. Rules were chosen on 2018-2022 and kept only if they also worked on 2023-2026.
+1. **Indicator grid with stops and trails** (167,105 combinations: 16 entry families, 972 filters, 3 exits, 5 option
+   structures): nothing passed; the best in-sample configurations lost out of sample. Re-tuning each year on the
+   previous 3 years lost in 5 of 6 years.
+2. **No stop-loss / no trail, exit on trend reversal** (~99k single-leg and ~23k multi-leg combinations): only the
+   confirmed 15-minute Supertrend flip worked for single legs. A Rs 1,500 loss cap beat reversal-only exits by far.
+   A far-wing iron condor on no-trend days was the strongest multi-leg result.
+3. **Loss reduction:** 33 variants (cap sizes, condor filters on gap / range / opening range, single-leg VIX and DI
+   filters, keeping the condor instead of closing it) - none improved both periods, so none was adopted.
+4. **Filling no-trade days:** the condor at VIX below 14 (232 of 240 variants helped on both periods) and the trend
+   credit spread (a narrower group helped on both) were added; a 1-lot fall-back fixed margin skips at Rs 40,000.
+
+**Final replay of the bot's own code** (commit `54a33e3`, Rs 40,000 capital, 2 lots or 1 when 2 do not fit):
+
+| Setup | Trades | Net (Rs) | Win rate | Profit factor |
+|---|---|---|---|---|
+| Single leg | 111 | +2,39,012 | 25% | 2.74 |
+| Iron condor, VIX >= 14 | 711 | +3,91,955 | 69% | 2.78 |
+| Iron condor, VIX < 14 | 450 | +2,77,124 | 80% | 3.75 |
+| Trend credit spread | 824 | +72,441 | 47% | 1.16 |
+| **Total** | **2,096** | **+9,80,531** | 60% | 2.07 |
+
+Every year 2018-2026 positive; trades on 2,001 of 2,118 days (1,248 won, 753 lost); 88% of months positive, worst
+month -Rs 7,127. At 1% slippage per fill: +Rs 6,21,380, still every year positive, but the credit spread alone turns
+slightly negative. Caveats: SENSEX weekly options were illiquid before mid-2023, so the early years are a model of what
+the rules would have done; not every day or month is profitable.
+
+## Code review fixes (31 Oct 2026)
+- Trend state used Kite's still-forming last 5-minute candle for a few seconds after each close, which could fake a
+  flip or reversal: now only candles closed at fetch time are used.
+- A trend signal was dropped when its option was not quoted yet: now retried for 60 s.
+- A condor or credit spread was closed for a trend signal even when that trade could not be placed: now only when it can.
+- Quiet far-OTM legs triggered a REST quote per leg per second (Kite allows ~1/s): playbook legs now accept streamed
+  ticks up to 60 s old.
+- No more misleading "No approved strategies" alerts while the playbook trades; the session alert shows playbook and lots.
 
 ## Layout
 `config.py` `costs.py` `zerodha_client.py` `strategy_engine.py` `strategy_library.py` `risk_manager.py`
 `market_data.py` `shadow.py` `recorder.py` `backtest.py` `promote.py` `token_service.py` `token_store.py`
 `alerts.py` `main.py`, `tests/`, `Dockerfile`, `docker-compose.yml`, `deploy/`.
+Playbook and report: `playbook.py` (setups, entries, exits), `pb_indicators.py` (pure-Python EMA / ATR / RSI / ADX /
+Supertrend / MACD, 15-minute bars), `telegram_control.py` (Telegram commands), `report_site.py` (report page and
+Cloud Storage upload); tests in `tests/test_playbook.py` and `tests/test_report_site.py`.
 
 ## Setup
 ```bash
@@ -27,7 +138,7 @@ cp .env.example .env        # fill KITE_API_KEY / KITE_API_SECRET (+ Telegram op
 python -m unittest discover -s tests -v
 ```
 
-## Pipeline
+## Legacy pipeline (approvals; entries only with `PLAYBOOK=0`)
 ```bash
 # 1. Backtest on real index + VIX history (writes data/approved_backtest.json)
 python backtest.py --fetch-kite 700
@@ -178,8 +289,10 @@ the forward shadow stage matters.
 
 ## Is it working?
 `docker compose exec bot python health_report.py` prints login status, approvals, latest spot/VIX/regime,
-recorded rows, shadow-trade results and a list of problems. With no approved variants the bot records data and
-shadow-trades but places NO paper orders; run the backtest first (step 1 above), then restart the bot.
+recorded rows, shadow-trade results and a list of problems. With the playbook on (default) the bot trades without
+approvals; follow its results on the trading report page and with `/status` in Telegram. With `PLAYBOOK=0` and no
+approved variants the bot records data and shadow-trades but places NO paper orders; run the backtest first (step 1 of
+the legacy pipeline), then restart the bot.
 
 ## Daily token
 See `deploy/DEPLOY.md`.
