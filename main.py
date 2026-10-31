@@ -35,8 +35,8 @@ from execution import (LiveBroker, OrderLeg, PaperBroker, apply_exit_fills, roun
 from market_context import MarketContext
 from market_data import MarketData, Snapshot
 from pb_indicators import Candle
-from playbook import (DayState, Playbook, PlaybookParams, TrendState, build_condor, build_single, is_playbook,
-                      plan_direction, trend_state)
+from playbook import (DayState, Playbook, PlaybookParams, TrendState, build_condor, build_credit, build_single,
+                      is_playbook, is_single, trend_state)
 from telegram_control import TelegramControl
 from recorder import Recorder
 from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
@@ -551,28 +551,49 @@ class Bot:
         if d.action == "single":                       # a strong trend: single leg first
             plan = build_single(snap.chain, d.direction, now, d.why)
             qc = validate_plan_quotes(plan, snap.chain) if plan else None
-            if plan and qc.ok:
-                self._enter(now, snap, plan, self.tg.single_lots, 100.0, 1)
+            lots = self._pb_lots(plan, self.tg.single_lots) if plan and qc.ok else 0
+            if lots:
+                self._enter(now, snap, plan, lots, 100.0, 1)
             if self.position:
                 self.pb.took_single(d)
             else:
                 self.pb.skipped_signal(d)
                 self.alerts.send(f"Trend signal NOT traded ({d.why}): "
-                                 f"{qc.reason if qc and not qc.ok else 'no quote / margin check failed'}",
+                                 f"{qc.reason if qc and not qc.ok else 'no quote / not even 1 lot fits the margin'}",
                                  level="WARNING", key="pb-single-skip")
             self._save_state()
             return
-        d = self.pb.multi_signal(ts, now, snap.vix)
-        if d.action == "multi":
-            plan = build_condor(snap.chain, self.pb.p, d.why)
+        d = self.pb.range_signal(ts, now, snap.vix)
+        if d.action in ("condor", "credit"):
+            plan = (build_condor(snap.chain, d.short_pct, d.wing_pct, d.why) if d.action == "condor"
+                    else build_credit(snap.chain, d.direction, d.short_pct, d.wing_pct, d.why))
             if plan is None or not validate_plan_quotes(plan, snap.chain).ok:
                 return                                 # quotes not ready: try again next second
-            self._enter(now, snap, plan, self.tg.multi_lots, 50.0, 1)
-            self.pb.took_multi()                       # one attempt per day (a margin refusal is not retried)
+            lots = self._pb_lots(plan, self.tg.multi_lots)
+            if lots:
+                self._enter(now, snap, plan, lots, 50.0, 1)
+            self.pb.took_range()                       # one attempt per day (a margin refusal is not retried)
             if not self.position:
-                self.alerts.send(f"Range setup NOT traded ({d.why}): margin check failed for "
-                                 f"{self.tg.multi_lots} lot(s)", level="WARNING", key="pb-multi-skip")
+                self.alerts.send(f"{plan.name} NOT traded ({d.why}): not even 1 lot fits the margin",
+                                 level="WARNING", key="pb-multi-skip")
             self._save_state()
+
+    def _pb_lots(self, plan: TradePlan, wanted: int) -> int:
+        """The Telegram lot setting, or fewer (down to 1) when that many lots need more margin than the capital allows
+        (Kite's basket margin, the same check _enter makes). 0 = not even one lot fits, or the margin query failed."""
+        fn = self._margin_fn(plan)
+        cash = self.client.available_cash() if self.live else self.capital
+        limit = cash * self.risk.p.margin_utilisation
+        for n in range(max(wanted, 1), 0, -1):
+            m = fn(n)
+            if m is None:
+                return 0
+            if m <= limit:
+                if n < wanted:
+                    log.info("PLAYBOOK %s: %d lot(s) need more margin than allowed; trading %d", plan.variant_id,
+                             wanted, n)
+                return n
+        return 0
 
     def _manage_playbook(self, now: dt.datetime, pos: ManagedPosition) -> None:
         """No stop-loss and no trailing stop: exit on trend reversal, the Rs loss cap, a trend signal while a condor is
@@ -585,7 +606,7 @@ class Bot:
         if not reason:
             ts = self._pb_trend(now)
             pending = False
-            if plan_direction(pos.plan) == 0 and self._last_snap is not None:
+            if not is_single(pos.plan) and self._last_snap is not None:
                 pending = self.pb.single_signal(ts, now, self._last_snap.vix).action == "single"
             reason = self.pb.exit_reason(pos.plan, pnl, ts, pending)
         if not reason and now.time() >= self.cfg.schedule.square_off and (
