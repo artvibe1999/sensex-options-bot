@@ -209,6 +209,122 @@ class TestTrendState(unittest.TestCase):
         self.assertEqual(d[-1], -1)
 
 
+class TestBotWiring(unittest.TestCase):
+    """Bot-level playbook wiring (review fixes): stale part-bars, quote retries, pre-emption only when tradable."""
+
+    def _bot(self, hist, fetched, lots_fit=2):
+        import types
+
+        import main
+        from config import RiskParams, Schedule
+        from risk_manager import RiskManager
+        b = object.__new__(main.Bot)
+        b.md = types.SimpleNamespace(completed_5m=lambda: (hist, fetched))
+        b.pb = Playbook(PlaybookParams())
+        b._pb_cache = (None, None)
+        b._pb_ready_cache = (None, -1e18, False)
+        b.tg = types.SimpleNamespace(single_lots=2, multi_lots=2)
+        b._pb_lots = lambda plan, wanted: min(wanted, lots_fit)
+        b.risk = RiskManager(RiskParams(), Schedule())
+        b._entry_block_until = 0.0
+        b.position = None
+        b.entered = []
+        b.alerts = types.SimpleNamespace(send=lambda *a, **k: b.entered.append(("alert", a[0])))
+        b._save_state = lambda: None
+        b.cfg = types.SimpleNamespace(schedule=Schedule())
+
+        def enter(now, snap, plan, lots, score, n):
+            b.entered.append(("enter", plan.variant_id, lots))
+            b.position = types.SimpleNamespace(plan=plan)
+        b._enter = enter
+        return b
+
+    def test_trend_uses_only_bars_closed_at_fetch_time(self):
+        bars, k = [], 0
+        for day in (D - dt.timedelta(days=3), D):     # Friday + Monday: two sessions of 5-minute candles
+            for i in range(75 if day != D else 30):
+                c = 80000.0 + 10 * k
+                bars.append({"date": T(9, 15, day) + dt.timedelta(minutes=5 * i), "open": c, "high": c + 20,
+                             "low": c - 20, "close": c})
+                k += 1
+        fetched = bars[-1]["date"] + dt.timedelta(minutes=2)          # last candle still forming at fetch time
+        b = self._bot(bars, fetched)
+        # a later clock must not turn the stale last candle into a "completed" bar
+        later = bars[-1]["date"] + dt.timedelta(minutes=5, seconds=2)
+        st_later = b._pb_trend(later)
+        st_fetch = trend_state([Candle(x["date"], x["open"], x["high"], x["low"], x["close"]) for x in bars], fetched)
+        self.assertEqual(st_later, st_fetch)
+        self.assertLessEqual(st_later.bar_end, fetched)
+        b2 = self._bot([], None)
+        self.assertIsNone(b2._pb_trend(later))                        # no history: no signal (fail closed)
+
+    def _snap(self):
+        import types
+        return types.SimpleNamespace(fresh=True, chain=chain(), vix=16.0)
+
+    def test_single_signal_retried_while_quote_missing(self):
+        b = self._bot([], None)
+        sig = ts(1, -1, 1, end=T(10, 45))
+        b._pb_trend = lambda now: sig
+        snap = self._snap()
+        ok_plan = build_single(snap.chain, 1, T(10, 45, D), "x")
+        b._pb_single_ready = lambda now, s, d: (None, 0, "quote: strike not quoted")
+        b._try_playbook(T(10, 45, D) + dt.timedelta(seconds=10), snap)
+        self.assertEqual(b.entered, [])                               # no alert, signal still live
+        b._pb_single_ready = lambda now, s, d: (ok_plan, 2, "")
+        b._try_playbook(T(10, 45, D) + dt.timedelta(seconds=20), snap)
+        self.assertEqual(b.entered, [("enter", "pb_single_UP", 2)])
+
+    def test_single_signal_given_up_after_retry_window(self):
+        b = self._bot([], None)
+        sig = ts(1, -1, 1, end=T(10, 45))
+        b._pb_trend = lambda now: sig
+        b._pb_single_ready = lambda now, s, d: (None, 0, "quote: strike not quoted")
+        b._try_playbook(T(10, 46, D) + dt.timedelta(seconds=30), self._snap())     # 90 s after the bar
+        self.assertEqual([e[0] for e in b.entered], ["alert"])
+        self.assertEqual(b.pb.day.last_signal_bar, sig.bar_end.isoformat())
+
+    def test_margin_refusal_is_not_retried(self):
+        b = self._bot([], None)
+        sig = ts(1, -1, 1, end=T(10, 45))
+        b._pb_trend = lambda now: sig
+        b._pb_single_ready = lambda now, s, d: (None, 0, "not even 1 lot fits the margin")
+        b._try_playbook(T(10, 45, D) + dt.timedelta(seconds=10), self._snap())
+        self.assertEqual([e[0] for e in b.entered], ["alert"])
+
+    def test_condor_not_closed_for_an_untradable_trend_signal(self):
+        import types
+        b = self._bot([], None)
+        condor = build_condor(chain(), 0.008, 0.017, "x")
+        pos = types.SimpleNamespace(plan=condor, peak_pnl=0.0, pnl=lambda ltps: 200.0)
+        ages = []
+        b._ltps = lambda p, max_age_s=5.0: ages.append(max_age_s) or {}
+        b._last_snap = self._snap()
+        b.capital, b.realized = 40000.0, 0.0
+        b._last_exit_status = b._last_state_save = 1e18
+        exits = []
+        b._exit = exits.append
+        b.cfg = types.SimpleNamespace(schedule=b.cfg.schedule, execution=types.SimpleNamespace(product="MIS"))
+        sig = ts(1, -1, 1, end=T(10, 45))
+        b._pb_trend = lambda now: sig
+        now = T(10, 45, D) + dt.timedelta(seconds=10)
+        calls = []
+
+        def not_ready(n, s, d):
+            calls.append(1)
+            return None, 0, "not even 1 lot fits the margin"
+        b._pb_single_ready = not_ready
+        b._manage_playbook(now, pos)
+        b._manage_playbook(now, pos)                       # within the re-check interval: cached, no new margin query
+        self.assertEqual(exits, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ages[0], b.PB_TICK_MAX_AGE_S)     # quiet wings are priced from their last tick, not REST
+        b._pb_ready_cache = (None, -1e18, False)           # re-check due
+        b._pb_single_ready = lambda n, s, d: (build_single(chain(), 1, now, "x"), 2, "")
+        b._manage_playbook(now, pos)
+        self.assertEqual(exits, ["TREND_SIGNAL_PRIORITY"])
+
+
 class TestTelegram(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

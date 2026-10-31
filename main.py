@@ -160,6 +160,7 @@ class Bot:
         self.pb_enabled = os.getenv("PLAYBOOK", "1") != "0"
         self.pb = Playbook(PlaybookParams.from_env())
         self._pb_cache: tuple[Optional[tuple], Optional[TrendState]] = (None, None)
+        self._pb_ready_cache: tuple[Optional[str], float, bool] = (None, -1e18, False)
         self.tg = TelegramControl(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id,
                                   os.path.join(cfg.paths.data_dir, "settings.json"),
                                   reply=lambda t: self.alerts.send(t), status_fn=self._status_text,
@@ -358,7 +359,9 @@ class Bot:
         for p in paths:
             approved.update(load_approved(p, now.date(), capital_tier(getattr(self, "capital", 0.0) or self.cfg.paper_capital)))
         self.approved = approved
-        if self.approved:
+        if getattr(self, "pb_enabled", False):        # the playbook trades without approvals: no misleading alert
+            log.info("%d approved variants loaded (not used for entries: the playbook is on)", len(self.approved))
+        elif self.approved:
             log.info("%d approved variants loaded from %s", len(self.approved), ", ".join(paths))
             self.alerts.send(f"{len(self.approved)} approved variants loaded", key="approved-loaded")
         else:
@@ -465,11 +468,11 @@ class Bot:
         if self.live:
             self._reconcile()
         self.session_ready = True
+        what = (f"playbook ON, lots single {self.tg.single_lots} / multi {self.tg.multi_lots}"
+                if getattr(self, "pb_enabled", False) else f"{len(self.approved)} approved variants")
         self.sheets.append("Status", STATUS_HEADER, [[now.isoformat(timespec="seconds"), self.mode,
-                                                      "SESSION_READY", f"capital {self.capital:,.0f}, "
-                                                      f"{len(self.approved)} approved variants"]])
-        self.alerts.send(f"Session ready ({self.mode}), capital {self.capital:,.0f}, "
-                         f"{len(self.approved)} approved variants", key="session")
+                                                      "SESSION_READY", f"capital {self.capital:,.0f}, {what}"]])
+        self.alerts.send(f"Session ready ({self.mode}), capital {self.capital:,.0f}, {what}", key="session")
         return True
 
     def _reconcile(self) -> None:
@@ -507,14 +510,15 @@ class Bot:
         self._save_state()
 
     # ---------------------------------------------------------------- trading
-    def _ltps(self, pos: ManagedPosition) -> dict[int, float]:
+    def _ltps(self, pos: ManagedPosition, max_age_s: float = 5.0) -> dict[int, float]:
         """Leg prices for stops and exits. A leg with no valid price right now (no trades, API blip) uses its last good
-        price, else its entry price, so one dead quote can never block a stop or square-off."""
+        price, else its entry price, so one dead quote can never block a stop or square-off. A streamed tick older than
+        `max_age_s` is re-fetched over REST."""
         out: dict[int, float] = {}
         for l in pos.legs:
             tok = l.contract.token
             try:
-                px = self.client.get_ltp(tok)
+                px = self.client.get_ltp(tok, max_age_s=max_age_s)
                 self._last_px[tok] = px
             except kex.TokenException:
                 raise
@@ -526,16 +530,21 @@ class Bot:
 
     # -------------------------------------------------------------- playbook
     def _pb_trend(self, now: dt.datetime) -> Optional[TrendState]:
-        """15-minute trend state from Kite's 5-minute history (completed bars only). Recomputed when a bar completes."""
-        hist = self.md._hist5
-        key = (len(hist), hist[-1]["date"] if hist else None, int(now.timestamp() // 300))
+        """15-minute trend state from Kite's 5-minute history. Only candles that had CLOSED when the history was fetched
+        are used: the last candle of a fetch is still forming, and stays a stale part-bar until the next refresh (a
+        few seconds after each 5-minute close), so it must never be read as a completed bar. Recomputed per fetch."""
+        hist, fetched = self.md.completed_5m()
+        if not hist or fetched is None:
+            self._pb_cache = (None, None)
+            return None
+        key = (fetched, len(hist))
         if key == self._pb_cache[0]:
             return self._pb_cache[1]
         ts: Optional[TrendState] = None
         try:
             bars = [Candle(x["date"], float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]))
                     for x in hist]
-            ts = trend_state(bars, now)
+            ts = trend_state(bars, min(now, fetched))
         except Exception:  # noqa: BLE001 - no signal is safer than a crash
             log.exception("Playbook trend state failed")
         self._pb_cache = (key, ts)
@@ -549,17 +558,17 @@ class Bot:
         ts = self._pb_trend(now)
         d = self.pb.single_signal(ts, now, snap.vix)
         if d.action == "single":                       # a strong trend: single leg first
-            plan = build_single(snap.chain, d.direction, now, d.why)
-            qc = validate_plan_quotes(plan, snap.chain) if plan else None
-            lots = self._pb_lots(plan, self.tg.single_lots) if plan and qc.ok else 0
-            if lots:
+            plan, lots, why_not = self._pb_single_ready(now, snap, d)
+            if plan is None and why_not.startswith("quote") and ts is not None \
+                    and (now - ts.bar_end).total_seconds() < self.PB_QUOTE_RETRY_S:
+                return                                 # quotes still settling: retry next second, the signal stays live
+            if plan is not None:
                 self._enter(now, snap, plan, lots, 100.0, 1)
             if self.position:
                 self.pb.took_single(d)
             else:
                 self.pb.skipped_signal(d)
-                self.alerts.send(f"Trend signal NOT traded ({d.why}): "
-                                 f"{qc.reason if qc and not qc.ok else 'no quote / not even 1 lot fits the margin'}",
+                self.alerts.send(f"Trend signal NOT traded ({d.why}): {why_not or 'entry failed'}",
                                  level="WARNING", key="pb-single-skip")
             self._save_state()
             return
@@ -577,6 +586,26 @@ class Bot:
                 self.alerts.send(f"{plan.name} NOT traded ({d.why}): not even 1 lot fits the margin",
                                  level="WARNING", key="pb-multi-skip")
             self._save_state()
+
+    PB_QUOTE_RETRY_S = 60.0          # a trend signal whose option is not quoted yet is retried this long
+    PB_TICK_MAX_AGE_S = 60.0         # playbook legs: streamed ticks this old are still the price (see _manage_playbook)
+    PB_READY_RECHECK_S = 10.0        # pre-emption tradability re-check interval
+
+    def _pb_single_ready(self, now: dt.datetime, snap: Snapshot, d) -> tuple[Optional[TradePlan], int, str]:
+        """(plan, lots, '') when the single-leg trade for signal `d` can be placed now, else (None, 0, why not).
+        A reason starting with 'quote' is transient (the stream is still filling the strike)."""
+        if snap.chain is None:
+            return None, 0, "quote: no option chain yet"
+        plan = build_single(snap.chain, d.direction, now, d.why)
+        if plan is None:
+            return None, 0, "quote: strike not quoted"
+        qc = validate_plan_quotes(plan, snap.chain)
+        if not qc.ok:
+            return None, 0, f"quote: {qc.reason}"
+        lots = self._pb_lots(plan, self.tg.single_lots)
+        if lots < 1:
+            return None, 0, "not even 1 lot fits the margin (or the margin query failed)"
+        return plan, lots, ""
 
     def _pb_lots(self, plan: TradePlan, wanted: int) -> int:
         """The Telegram lot setting, or fewer (down to 1) when that many lots need more margin than the capital allows
@@ -598,7 +627,10 @@ class Bot:
     def _manage_playbook(self, now: dt.datetime, pos: ManagedPosition) -> None:
         """No stop-loss and no trailing stop: exit on trend reversal, the Rs loss cap, a trend signal while a condor is
         open, or square-off. Only loss-control / broker-safety halts (FLATTEN_HALTS) can close it otherwise."""
-        pnl = pos.pnl(self._ltps(pos))
+        # Kite ticks a contract only when it trades or its book changes, so far-OTM wings are often quiet for longer than
+        # 5 s; their last tick IS their price. A short REST fallback window would fire ~1 quote call per leg per second
+        # (Kite allows ~1/s in total) and stall this loop, so playbook legs accept ticks up to PB_TICK_MAX_AGE_S old.
+        pnl = pos.pnl(self._ltps(pos, max_age_s=self.PB_TICK_MAX_AGE_S))
         pos.peak_pnl = max(pos.peak_pnl, pnl)
         reason: Optional[str] = None
         if self.risk.halted:
@@ -606,8 +638,17 @@ class Bot:
         if not reason:
             ts = self._pb_trend(now)
             pending = False
-            if not is_single(pos.plan) and self._last_snap is not None:
-                pending = self.pb.single_signal(ts, now, self._last_snap.vix).action == "single"
+            snap = self._last_snap
+            if not is_single(pos.plan) and snap is not None:
+                d = self.pb.single_signal(ts, now, snap.vix)
+                # close the condor / credit spread only if the trend trade can really be placed right after; checked at
+                # most every PB_READY_RECHECK_S per signal bar (it may query Kite margins and cash)
+                if d.action == "single":
+                    key, at, ok = self._pb_ready_cache
+                    if key != d.bar_key or time.monotonic() - at >= self.PB_READY_RECHECK_S:
+                        ok = self._pb_single_ready(now, snap, d)[0] is not None
+                        self._pb_ready_cache = (d.bar_key, time.monotonic(), ok)
+                    pending = ok
             reason = self.pb.exit_reason(pos.plan, pnl, ts, pending)
         if not reason and now.time() >= self.cfg.schedule.square_off and (
                 self.cfg.execution.product == "MIS" or pos.plan.expiry <= now.date()):

@@ -50,6 +50,7 @@ class MarketData:
         self._daily_day: Optional[dt.date] = None
         self._daily_retry_at = 0.0
         self._hist5: list[dict] = []
+        self._hist5_wall: Optional[dt.datetime] = None
         self._tinfo_day: Optional[dt.date] = None
         self._tdaily = None
         self._hist5_at = -1e9
@@ -124,10 +125,18 @@ class MarketData:
             try:
                 c = self.client.historical(self.client.spot_token, now - dt.timedelta(days=5), now, "5minute")
                 self._hist5 = [x for x in c]
+                self._hist5_wall = now                 # wall-clock time of this fetch (see completed_5m)
             except Exception as exc:  # noqa: BLE001
                 log.warning("5-minute history unavailable (%s); using own bars", exc)
                 self._hist5 = []
+                self._hist5_wall = None
         return [x["close"] for x in self._hist5] if self._hist5 else list(self._bars.values())
+
+    def completed_5m(self) -> tuple[list[dict], Optional[dt.datetime]]:
+        """(Kite 5-minute candles, the time they were fetched). Kite includes the candle still forming, so between a
+        bar's close and the next refresh the last candle is a stale part-bar: only candles that ENDED by the fetch
+        time are final. Callers pass the fetch time (not the clock) as `now` to playbook.trend_state."""
+        return self._hist5, self._hist5_wall
 
     def trend_info(self, now: dt.datetime, spot: float, daily: list[dict]) -> TrendInfo:
         """Daily (cached per day) and intraday valid-trend / trap state. Never raises."""
