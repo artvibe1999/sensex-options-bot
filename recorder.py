@@ -158,6 +158,28 @@ class Recorder:
                                  (lo, hi)).fetchall()
         return {v for (v,) in a} | {v for (v,) in b}
 
+    def trades_since(self, since: str, mode: str) -> list[tuple]:
+        """Rows (ts, variant, event, reason, gross, cost, net, payload) of the bot's own trades in `mode` from `since`
+        (ISO date) on, in time order. Used by the trading report page."""
+        with self._lock:
+            return self._db.execute("SELECT ts, variant, event, reason, gross, cost, net, payload FROM trades "
+                                    "WHERE mode=? AND ts>=? ORDER BY ts", (mode, since)).fetchall()
+
+    def day_summary_days(self, since: str, mode: str) -> list[str]:
+        """Dates (ISO) on which the bot finished a trading day in `mode` (its day_summary event), from `since` on."""
+        with self._lock:
+            rows = self._db.execute("SELECT ts, payload FROM events WHERE kind='day_summary' AND ts>=?",
+                                    (since,)).fetchall()
+        out = set()
+        for ts, payload in rows:
+            try:
+                p = json.loads(payload or "{}")
+                if p.get("mode") == mode and p.get("market_open", True):   # holidays are not trading days
+                    out.add(ts[:10])
+            except ValueError:
+                continue
+        return sorted(out)
+
     def shadow_results(self, since: str, before: str) -> list[tuple[str, float]]:
         """(variant, net) of shadow trades entered on or after `since` and before `before` (ISO dates)."""
         with self._lock:

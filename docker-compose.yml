@@ -29,8 +29,10 @@ services:
       - "443:443"
     environment:
       BOT_DOMAIN: ${BOT_DOMAIN}
+      REPORT_TOKEN: ${REPORT_TOKEN:?set REPORT_TOKEN in .env (long random string; the report page path)}
     volumes:
       - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/site:/srv/site:ro       # trading report page written by the bot (report_site.py)
       - caddy_data:/data
     depends_on:
       - token

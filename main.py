@@ -37,6 +37,7 @@ from market_data import MarketData, Snapshot
 from pb_indicators import Candle
 from playbook import (DayState, Playbook, PlaybookParams, TrendState, build_condor, build_credit, build_single,
                       is_playbook, is_single, trend_state)
+from report_site import ReportSite
 from telegram_control import TelegramControl
 from recorder import Recorder
 from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
@@ -161,11 +162,17 @@ class Bot:
         self.pb = Playbook(PlaybookParams.from_env())
         self._pb_cache: tuple[Optional[tuple], Optional[TrendState]] = (None, None)
         self._pb_ready_cache: tuple[Optional[str], float, bool] = (None, -1e18, False)
+        # Trading report page (report_site.py), served by Caddy at https://BOT_DOMAIN/r/REPORT_TOKEN/
+        dom, tok = os.getenv("BOT_DOMAIN", "").strip(), os.getenv("REPORT_TOKEN", "").strip()
+        self.report = ReportSite(cfg.paths.data_dir, f"https://{dom}/r/{tok}/" if dom and tok else None,
+                                 os.getenv("REPORT_SINCE", "2026-11-02"), cfg.costs,
+                                 os.getenv("REPORT_BACKTEST_URL", "https://claude.ai/artifact/X3zZSYuYHr3B6Lwqt9jhti"))
         self.tg = TelegramControl(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id,
                                   os.path.join(cfg.paths.data_dir, "settings.json"),
                                   reply=lambda t: self.alerts.send(t), status_fn=self._status_text,
                                   default_single=int(os.getenv("SINGLE_LOTS", "2")),
-                                  default_multi=int(os.getenv("MULTI_LOTS", "2")))
+                                  default_multi=int(os.getenv("MULTI_LOTS", "2")),
+                                  report_url=self.report.url)
         self._load_state()
         self.tg.start()
 
@@ -222,8 +229,12 @@ class Bot:
             self.position = None
 
     # -------------------------------------------------------------- lifecycle
+    def _build_report(self) -> tuple[bool, dict]:
+        return self.report.build(self.rec, self.rec.day_summary_days(self.report.since, self.mode))
+
     def run(self) -> None:
         self.alerts.send(f"Bot started in {self.mode} mode", key="start")
+        self._build_report()                       # the report link works right after a (re)start
         next_at = time.monotonic()
         while not self.stop.is_set():
             now = dt.datetime.now(IST)
@@ -500,9 +511,19 @@ class Bot:
             self.alerts.send("MIS position still open after close: verify broker auto square-off",
                              level="CRITICAL")
         self.shadow.reset_day()
+        market_open = self._last_snap is not None           # a live snapshot was seen today (False on holidays)
         self.rec.event(now.isoformat(timespec="seconds"), "day_summary", "",
-                       {"realized": self.realized, "trades": self.trades_today, "mode": self.mode})
+                       {"realized": self.realized, "trades": self.trades_today, "mode": self.mode,
+                        "market_open": market_open})
         self.alerts.send(f"Day done ({self.mode}): net PnL {self.realized:,.0f} over {self.trades_today} trades")
+        try:                                                # report page: never allowed to disturb the day's close
+            if self.session_ready and market_open:
+                self.report.save_live(self.client, now.date())   # the account's real fills (read-only)
+            changed, summary = self._build_report()
+            if changed and self.report.url:
+                self.alerts.send(self.report.summary_text(now.date().isoformat(), summary), key="report")
+        except Exception:  # noqa: BLE001
+            log.exception("Report page update failed")
         self.sheets.append("Status", STATUS_HEADER, [[now.isoformat(timespec="seconds"), self.mode, "DAY_DONE",
                                                       f"net {self.realized:,.0f} over {self.trades_today} trades"]])
         self.client.stop_stream()

@@ -4,6 +4,7 @@
     /lots 3          single-leg trades use 3 lots from the next entry (paper and live)
     /mlots 1         multi-leg trades use 1 lot from the next entry
     /status          mode, open position, today's P&L
+    /report          link to the trading report page
     /help
 
 Only messages from the configured TELEGRAM_CHAT_ID are obeyed; anything else is ignored. Settings persist in
@@ -73,8 +74,9 @@ class TelegramControl:
 
     def __init__(self, token: Optional[str], chat_id: Optional[str], settings_path: str,
                  reply: Callable[[str], None], status_fn: Callable[[], str] = lambda: "",
-                 default_single: int = 2, default_multi: int = 1) -> None:
+                 default_single: int = 2, default_multi: int = 1, report_url: Optional[str] = None) -> None:
         self._token, self._chat = token, str(chat_id) if chat_id else None
+        self._report_url = report_url
         self.path = settings_path
         self.settings = load_settings(settings_path, default_single, default_multi)
         self._reply, self._status = reply, status_fn
@@ -132,9 +134,12 @@ class TelegramControl:
             return "OK. " + self._lots_text() + " (applies from the next entry)"
         if cmd == "/status":
             return self._status() or "No status available."
+        if cmd == "/report":
+            return (f"Trading report (paper and live): {self._report_url}" if self._report_url
+                    else "The report link is not configured (BOT_DOMAIN / REPORT_TOKEN).")
         if cmd in ("/help", "/start"):
             return ("/lots - show lots\n/lots N - single-leg lots (paper and live)\n/mlots N - multi-leg lots\n"
-                    "/status - position and today's P&L")
+                    "/status - position and today's P&L\n/report - link to the trading report page")
         return None
 
     def _lots_text(self) -> str:

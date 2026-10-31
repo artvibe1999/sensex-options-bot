@@ -173,6 +173,14 @@ class ZerodhaClient:
         """Requires the Kite historical-data add-on subscription."""
         return self._call(self.kite.historical_data, token, start, end, interval)
 
+    def day_orders(self) -> list[dict]:
+        """Today's orders of the whole account (read-only; Kite keeps only the current day)."""
+        return self._call(self.kite.orders) or []
+
+    def day_trades(self) -> list[dict]:
+        """Today's executed fills of the whole account (read-only; Kite keeps only the current day)."""
+        return self._call(self.kite.trades) or []
+
     def available_cash(self) -> float:
         m = self._call(self.kite.margins, "equity")
         return float(m["available"]["live_balance"])
