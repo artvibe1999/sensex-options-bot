@@ -1,10 +1,10 @@
 """Trading report page: paper trades (the bot's own trade log) and LIVE trades (the account's real fills, fetched read-only
-from Kite after the close), one static self-contained HTML page served by Caddy at a fixed secret link.
+from Kite after the close), one static self-contained HTML page kept as ONE Cloud Storage object
+(gs://REPORT_GCS_BUCKET/r/<REPORT_TOKEN>/index.html) that every rebuild overwrites in place, so its link never changes.
 
     data/live/YYYY-MM-DD.json   one file per trading day: the account's option fills and order tags (Kite keeps only
                                 the current day, so each day is saved at the close; a day the VM was off is missing)
-    data/site/index.html        the page (rebuilt at start-up and after each close; atomic replace)
-    data/site/.hash             fingerprint of the page's data: the Telegram notice is sent only when it changes
+    data/report.hash            fingerprint of the page's data: the Telegram notice is sent only when it changes
 
 Nothing here places or changes orders: Kite is only read (orders(), trades()).
 """
@@ -39,7 +39,6 @@ def _atomic_write(path: str, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), prefix=".tmp-")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
-    os.chmod(tmp, 0o644)                      # Caddy (another container) must be able to read the page
     os.replace(tmp, path)
 
 
@@ -187,16 +186,14 @@ def render(data: dict, generated_at: str) -> str:
 
 
 class ReportSite:
-    def __init__(self, data_dir: str, url: Optional[str], since: str, costs: CostParams,
-                 backtest_url: str = "", gcs_bucket: str = "", gcs_object: str = "") -> None:
+    def __init__(self, data_dir: str, since: str, costs: CostParams, backtest_url: str = "",
+                 gcs_bucket: str = "", gcs_object: str = "") -> None:
         self.live_dir = os.path.join(data_dir, "live")
-        self.site_dir = os.path.join(data_dir, "site")
+        self.hash_path = os.path.join(data_dir, "report.hash")
         self.since, self.costs, self.backtest_url = since, costs, backtest_url
-        self.vm_url = url
         self.gcs_bucket, self.gcs_object = gcs_bucket, gcs_object
-        self.gcs_url = (f"https://storage.googleapis.com/{gcs_bucket}/{gcs_object}"
-                        if gcs_bucket and gcs_object else None)
-        self.url = self.gcs_url or url              # the always-on mirror when configured, else the VM link
+        self.url = (f"https://storage.googleapis.com/{gcs_bucket}/{gcs_object}"
+                    if gcs_bucket and gcs_object else None)      # None: page not configured, nothing is published
         self.publish = publish_gcs
 
     def save_live(self, client, day: dt.date) -> Optional[dict]:
@@ -208,24 +205,24 @@ class ReportSite:
             return None
 
     def build(self, rec, paper_days: list[str]) -> tuple[bool, dict]:
-        """Rebuild the page. Returns (data changed since the last build, today's summary). Never raises."""
+        """Rebuild the page and overwrite the Cloud Storage object. Returns (data changed since the last published build,
+        today's summary). Never raises."""
+        if not self.url:
+            return False, {}
         try:
             paper = paper_trades(rec.trades_since(self.since, "PAPER"))
             live, live_days = live_trades(load_live(self.live_dir, self.since), self.costs)
             data = page_data(paper, paper_days, live, live_days, self.since, self.backtest_url)
             fp = fingerprint(data)
-            hpath = os.path.join(self.site_dir, ".hash")
             try:
-                with open(hpath, encoding="utf-8") as f:
+                with open(self.hash_path, encoding="utf-8") as f:
                     old = f.read().strip()
             except OSError:
                 old = ""
             now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-            html = render(data, now)
-            _atomic_write(os.path.join(self.site_dir, "index.html"), html)
-            if self.gcs_url and not self.publish(html, self.gcs_bucket, self.gcs_object):
+            if not self.publish(render(data, now), self.gcs_bucket, self.gcs_object):
                 return False, {"paper": paper, "live": live}   # keep the old hash: retried (and notified) next build
-            _atomic_write(hpath, fp)
+            _atomic_write(self.hash_path, fp)
             return fp != old, {"paper": paper, "live": live}
         except Exception:  # noqa: BLE001
             log.exception("Report page build failed")

@@ -162,13 +162,10 @@ class Bot:
         self.pb = Playbook(PlaybookParams.from_env())
         self._pb_cache: tuple[Optional[tuple], Optional[TrendState]] = (None, None)
         self._pb_ready_cache: tuple[Optional[str], float, bool] = (None, -1e18, False)
-        # Trading report page (report_site.py), served by Caddy at https://BOT_DOMAIN/r/REPORT_TOKEN/
-        dom, tok = os.getenv("BOT_DOMAIN", "").strip(), os.getenv("REPORT_TOKEN", "").strip()
-        # Optional always-on mirror: REPORT_GCS_BUCKET -> one fixed object gs://bucket/r/<REPORT_TOKEN>/index.html,
-        # overwritten in place on every rebuild (the VM is off nights and weekends).
-        bucket = os.getenv("REPORT_GCS_BUCKET", "").strip()
-        self.report = ReportSite(cfg.paths.data_dir, f"https://{dom}/r/{tok}/" if dom and tok else None,
-                                 os.getenv("REPORT_SINCE", "2026-11-02"), cfg.costs,
+        # Trading report page (report_site.py): ONE Cloud Storage object gs://REPORT_GCS_BUCKET/r/<REPORT_TOKEN>/index.html,
+        # overwritten in place on every rebuild, so the link never changes and works while the VM is off.
+        tok, bucket = os.getenv("REPORT_TOKEN", "").strip(), os.getenv("REPORT_GCS_BUCKET", "").strip()
+        self.report = ReportSite(cfg.paths.data_dir, os.getenv("REPORT_SINCE", "2026-11-02"), cfg.costs,
                                  os.getenv("REPORT_BACKTEST_URL", "https://claude.ai/artifact/X3zZSYuYHr3B6Lwqt9jhti"),
                                  bucket, f"r/{tok}/index.html" if bucket and tok else "")
         self.tg = TelegramControl(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id,

@@ -82,8 +82,10 @@ class PaperAndPageTests(unittest.TestCase):
         single = next(r for r in rows if r["setup"] == "Single leg Up")
         self.assertEqual((single["entry"], single["exit"], single["lots"], single["net"]), ("10:46", "15:15", 2, 2100.0))
 
-    def test_build_writes_page_and_detects_changes(self):
-        site = ReportSite(self.dir, "https://x/r/tok/", "2026-11-02", CostParams())
+    def test_build_publishes_page_and_detects_changes(self):
+        site = ReportSite(self.dir, "2026-11-02", CostParams(), gcs_bucket="bkt", gcs_object="r/tok/index.html")
+        pages = []
+        site.publish = lambda html, b, o: pages.append((html, b, o)) or True
         changed, _ = site.build(self.rec, ["2026-11-02"])
         self.assertTrue(changed)                               # first build
         changed, _ = site.build(self.rec, ["2026-11-02"])
@@ -91,12 +93,14 @@ class PaperAndPageTests(unittest.TestCase):
         self._trade("2026-11-02T10:46:00", "2026-11-02T15:15:00", "pb_single_UP", 2100.0)
         changed, summary = site.build(self.rec, ["2026-11-02"])
         self.assertTrue(changed)
-        html = open(os.path.join(self.dir, "site", "index.html"), encoding="utf-8").read()
+        html, b, o = pages[-1]
+        self.assertEqual((b, o), ("bkt", "r/tok/index.html"))
         self.assertIn("pb_single_UP", html)
         self.assertNotIn("/*__DATA__*/null", html)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "site")))      # no local page copy is written
         text = site.summary_text("2026-11-02", summary)
         self.assertIn("Paper: net +2,100 over 1 trade", text)
-        self.assertIn("https://x/r/tok/", text)
+        self.assertIn("https://storage.googleapis.com/bkt/r/tok/index.html", text)
 
     def test_data_cannot_break_out_of_the_script(self):
         html = render({"since": "x", "paper": {"trades": [{"why": "</script><script>alert(1)</script>"}], "days": []},
@@ -136,8 +140,7 @@ class GcsMirrorTests(unittest.TestCase):
         self.rec = Recorder(os.path.join(self.dir, "t.db"))
 
     def _site(self, http):
-        site = ReportSite(self.dir, "https://vm/r/tok/", "2026-11-02", CostParams(), gcs_bucket="bkt",
-                          gcs_object="r/tok/index.html")
+        site = ReportSite(self.dir, "2026-11-02", CostParams(), gcs_bucket="bkt", gcs_object="r/tok/index.html")
         from report_site import publish_gcs
         site.publish = lambda html, b, o: publish_gcs(html, b, o, http=http)
         return site
@@ -165,14 +168,18 @@ class GcsMirrorTests(unittest.TestCase):
             changed, _ = site.build(self.rec, ["2026-11-02"])
         self.assertFalse(changed)                                             # no notice for an unpublished page
         self.assertNotIn("SECRET-TOKEN", "\n".join(logs.output))
-        self.assertFalse(os.path.exists(os.path.join(self.dir, "site", ".hash")))   # next build retries
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "report.hash")))      # next build retries
         http.upload_ok = True
         changed, _ = site.build(self.rec, ["2026-11-02"])
         self.assertTrue(changed)
 
-    def test_no_bucket_keeps_vm_link(self):
-        site = ReportSite(self.dir, "https://vm/r/tok/", "2026-11-02", CostParams())
-        self.assertEqual(site.url, "https://vm/r/tok/")
+    def test_no_bucket_publishes_nothing(self):
+        site = ReportSite(self.dir, "2026-11-02", CostParams())
+        site.publish = lambda *a: self.fail("must not publish without a bucket")
+        self.assertIsNone(site.url)
+        self.assertEqual(site.build(self.rec, ["2026-11-02"]), (False, {}))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "site")))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "report.hash")))
 
 
 class TelegramReportTests(unittest.TestCase):

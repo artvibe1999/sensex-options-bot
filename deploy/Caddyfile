@@ -3,22 +3,6 @@
 	handle @public {
 		reverse_proxy token:8765
 	}
-	# Trading report page (report_site.py): read-only static files behind an unguessable path (REPORT_TOKEN in .env)
-	redir /r/{$REPORT_TOKEN} /r/{$REPORT_TOKEN}/
-	handle_path /r/{$REPORT_TOKEN}/* {
-		root * /srv/site
-		file_server {
-			hide .*
-		}
-		header {
-			X-Robots-Tag "noindex, nofollow"
-			Referrer-Policy "no-referrer"
-			Cache-Control "no-store"
-			X-Content-Type-Options "nosniff"
-			X-Frame-Options "DENY"
-			Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-		}
-	}
 	handle {
 		respond "not found" 404
 	}
