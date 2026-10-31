@@ -149,6 +149,38 @@ def fingerprint(data: dict) -> str:
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
 
 
+METADATA_TOKEN_URL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+
+
+def publish_gcs(html: str, bucket: str, obj: str, http=None) -> bool:
+    """Overwrite ONE fixed object (gs://bucket/obj) with the page, so its public link never changes. Uses the VM's own
+    service-account token from the metadata server (no key file, no extra package). cacheControl no-cache: readers see
+    an update at once instead of a cached copy. Never raises; returns success."""
+    if http is None:
+        import requests as http
+    try:
+        tok = http.get(METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}, timeout=5)
+        tok.raise_for_status()
+        access = tok.json()["access_token"]
+        boundary = "sxbot-report-" + hashlib.sha256(html.encode()).hexdigest()[:24]
+        meta = json.dumps({"name": obj, "contentType": "text/html; charset=utf-8",
+                           "cacheControl": "no-cache, max-age=0"})
+        body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{meta}\r\n"
+                f"--{boundary}\r\nContent-Type: text/html; charset=utf-8\r\n\r\n").encode() + html.encode() + \
+            f"\r\n--{boundary}--\r\n".encode()
+        r = http.post(f"https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o",
+                      params={"uploadType": "multipart"}, data=body, timeout=20,
+                      headers={"Authorization": f"Bearer {access}",
+                               "Content-Type": f"multipart/related; boundary={boundary}"})
+        if not r.ok:
+            log.warning("Report upload to Cloud Storage refused (HTTP %s)", r.status_code)   # never log the token
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001 - the mirror must never disturb trading
+        log.warning("Report upload to Cloud Storage failed: %s", exc.__class__.__name__)
+        return False
+
+
 def render(data: dict, generated_at: str) -> str:
     blob = json.dumps({**data, "generated_at": generated_at}).replace("<", "\\u003c")   # no </script> break-out
     return PAGE.replace("/*__DATA__*/null", blob)
@@ -156,10 +188,16 @@ def render(data: dict, generated_at: str) -> str:
 
 class ReportSite:
     def __init__(self, data_dir: str, url: Optional[str], since: str, costs: CostParams,
-                 backtest_url: str = "") -> None:
+                 backtest_url: str = "", gcs_bucket: str = "", gcs_object: str = "") -> None:
         self.live_dir = os.path.join(data_dir, "live")
         self.site_dir = os.path.join(data_dir, "site")
-        self.url, self.since, self.costs, self.backtest_url = url, since, costs, backtest_url
+        self.since, self.costs, self.backtest_url = since, costs, backtest_url
+        self.vm_url = url
+        self.gcs_bucket, self.gcs_object = gcs_bucket, gcs_object
+        self.gcs_url = (f"https://storage.googleapis.com/{gcs_bucket}/{gcs_object}"
+                        if gcs_bucket and gcs_object else None)
+        self.url = self.gcs_url or url              # the always-on mirror when configured, else the VM link
+        self.publish = publish_gcs
 
     def save_live(self, client, day: dt.date) -> Optional[dict]:
         """Fetch and store today's real fills. Never raises (the report must not disturb trading)."""
@@ -183,7 +221,10 @@ class ReportSite:
             except OSError:
                 old = ""
             now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-            _atomic_write(os.path.join(self.site_dir, "index.html"), render(data, now))
+            html = render(data, now)
+            _atomic_write(os.path.join(self.site_dir, "index.html"), html)
+            if self.gcs_url and not self.publish(html, self.gcs_bucket, self.gcs_object):
+                return False, {"paper": paper, "live": live}   # keep the old hash: retried (and notified) next build
             _atomic_write(hpath, fp)
             return fp != old, {"paper": paper, "live": live}
         except Exception:  # noqa: BLE001
@@ -203,6 +244,7 @@ class ReportSite:
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow"><meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
 <title>SENSEX Bot Trading Report</title>
 <style>
 :root{--bg:#f6f7f9;--panel:#fff;--fg:#17202b;--muted:#5d6b7a;--line:#dfe4ea;--ok:#147a4b;--bad:#b42b2b;--accent:#2f5d8a;--zero:#9aa5b1;color-scheme:light}

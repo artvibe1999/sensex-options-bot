@@ -105,6 +105,76 @@ class PaperAndPageTests(unittest.TestCase):
         self.assertEqual(html.count("</script>"), 1)
 
 
+class _Resp:
+    def __init__(self, ok=True, payload=None, status=200):
+        self.ok, self._p, self.status_code = ok, payload or {}, status
+
+    def json(self):
+        return self._p
+
+    def raise_for_status(self):
+        if not self.ok:
+            raise RuntimeError("http")
+
+
+class _Http:
+    def __init__(self, upload_ok=True):
+        self.posts, self.upload_ok = [], upload_ok
+
+    def get(self, url, headers=None, timeout=None):
+        assert headers == {"Metadata-Flavor": "Google"}
+        return _Resp(payload={"access_token": "SECRET-TOKEN"})
+
+    def post(self, url, params=None, data=None, timeout=None, headers=None):
+        self.posts.append((url, params, data, headers))
+        return _Resp(ok=self.upload_ok, status=200 if self.upload_ok else 403)
+
+
+class GcsMirrorTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.rec = Recorder(os.path.join(self.dir, "t.db"))
+
+    def _site(self, http):
+        site = ReportSite(self.dir, "https://vm/r/tok/", "2026-11-02", CostParams(), gcs_bucket="bkt",
+                          gcs_object="r/tok/index.html")
+        from report_site import publish_gcs
+        site.publish = lambda html, b, o: publish_gcs(html, b, o, http=http)
+        return site
+
+    def test_overwrites_one_fixed_object_with_no_cache(self):
+        http = _Http()
+        site = self._site(http)
+        self.assertEqual(site.url, "https://storage.googleapis.com/bkt/r/tok/index.html")   # links use the mirror
+        site.build(self.rec, ["2026-11-02"])
+        self.rec.trade("2026-11-02T10:46:00", "PAPER", "pb_single_UP", "entry", "", 0, 0, 0, {"lots": 2})
+        self.rec.trade("2026-11-02T15:15:00", "PAPER", "pb_single_UP", "exit", "SQUARE_OFF_TIME", 10, 1, 9, {})
+        site.build(self.rec, ["2026-11-02"])
+        self.assertEqual(len(http.posts), 2)
+        for url, params, body, headers in http.posts:
+            self.assertEqual(url, "https://storage.googleapis.com/upload/storage/v1/b/bkt/o")
+            self.assertEqual(params, {"uploadType": "multipart"})
+            self.assertIn(b'"name": "r/tok/index.html"', body)                # the SAME object every time
+            self.assertIn(b'"cacheControl": "no-cache, max-age=0"', body)
+            self.assertEqual(headers["Authorization"], "Bearer SECRET-TOKEN")
+
+    def test_failed_upload_is_retried_and_token_never_logged(self):
+        http = _Http(upload_ok=False)
+        site = self._site(http)
+        with self.assertLogs("report_site", level="WARNING") as logs:
+            changed, _ = site.build(self.rec, ["2026-11-02"])
+        self.assertFalse(changed)                                             # no notice for an unpublished page
+        self.assertNotIn("SECRET-TOKEN", "\n".join(logs.output))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "site", ".hash")))   # next build retries
+        http.upload_ok = True
+        changed, _ = site.build(self.rec, ["2026-11-02"])
+        self.assertTrue(changed)
+
+    def test_no_bucket_keeps_vm_link(self):
+        site = ReportSite(self.dir, "https://vm/r/tok/", "2026-11-02", CostParams())
+        self.assertEqual(site.url, "https://vm/r/tok/")
+
+
 class TelegramReportTests(unittest.TestCase):
     def test_report_command(self):
         d = tempfile.mkdtemp()
