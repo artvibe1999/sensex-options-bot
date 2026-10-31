@@ -34,6 +34,10 @@ from execution import (LiveBroker, OrderLeg, PaperBroker, apply_exit_fills, roun
                        validate_margin, validate_plan_quotes)
 from market_context import MarketContext
 from market_data import MarketData, Snapshot
+from pb_indicators import Candle
+from playbook import (DayState, Playbook, PlaybookParams, TrendState, build_condor, build_single, is_playbook,
+                      plan_direction, trend_state)
+from telegram_control import TelegramControl
 from recorder import Recorder
 from health_report import HEALTH_HEADER, collect as health_collect, sheet_row as health_row
 from risk_manager import ManagedPosition, OpenLeg, RiskManager
@@ -151,7 +155,18 @@ class Bot:
         self._gate_logged: dict[str, float] = {}
         self._last_exit_status = 0.0
         self._margin_cache: dict[tuple, tuple[float, Optional[float]]] = {}
+        # Playbook (playbook.py): trend single-leg / range multi-leg, no stop-loss or trailing stop. PLAYBOOK=0 restores
+        # the approvals + explorer entry path.
+        self.pb_enabled = os.getenv("PLAYBOOK", "1") != "0"
+        self.pb = Playbook(PlaybookParams.from_env())
+        self._pb_cache: tuple[Optional[tuple], Optional[TrendState]] = (None, None)
+        self.tg = TelegramControl(cfg.alerts.telegram_token, cfg.alerts.telegram_chat_id,
+                                  os.path.join(cfg.paths.data_dir, "settings.json"),
+                                  reply=lambda t: self.alerts.send(t), status_fn=self._status_text,
+                                  default_single=int(os.getenv("SINGLE_LOTS", "2")),
+                                  default_multi=int(os.getenv("MULTI_LOTS", "2")))
         self._load_state()
+        self.tg.start()
 
     # ------------------------------------------------------------ persistence
     def _state_path(self) -> str:
@@ -166,6 +181,7 @@ class Bot:
         doc = {"date": (self.day or dt.date.today()).isoformat(), "mode": self.mode,
                "realized": self.realized, "trades_today": self.trades_today, "eod_done": self.eod_done,
                "risk": self.risk.export(),
+               "playbook": self.pb.day.export() if hasattr(self, "pb") else {},
                "position": _position_to_dict(self.position) if self.position else None}
         path = self._state_path()
         try:
@@ -195,6 +211,8 @@ class Bot:
             self.trades_today = int(doc.get("trades_today", 0))
             self.eod_done = bool(doc.get("eod_done", False))   # a restart after the close must not repeat the day summary
             self.risk.restore(doc.get("risk", {}))
+            if hasattr(self, "pb"):
+                self.pb.day = DayState.restore(doc.get("playbook") or {})
             if doc.get("position"):
                 self.position = _position_from_dict(doc["position"])
                 log.warning("Restored open position %s from state file", self.position.plan.name)
@@ -231,6 +249,7 @@ class Bot:
                 self._exit("SHUTDOWN")
             except Exception:  # noqa: BLE001
                 log.critical("Could not flatten on shutdown: check positions manually", exc_info=True)
+        self.tg.stop()
         self.client.stop_stream()
         self.rec.close()
 
@@ -505,9 +524,96 @@ class Bot:
             out[tok] = px
         return out
 
+    # -------------------------------------------------------------- playbook
+    def _pb_trend(self, now: dt.datetime) -> Optional[TrendState]:
+        """15-minute trend state from Kite's 5-minute history (completed bars only). Recomputed when a bar completes."""
+        hist = self.md._hist5
+        key = (len(hist), hist[-1]["date"] if hist else None, int(now.timestamp() // 300))
+        if key == self._pb_cache[0]:
+            return self._pb_cache[1]
+        ts: Optional[TrendState] = None
+        try:
+            bars = [Candle(x["date"], float(x["open"]), float(x["high"]), float(x["low"]), float(x["close"]))
+                    for x in hist]
+            ts = trend_state(bars, now)
+        except Exception:  # noqa: BLE001 - no signal is safer than a crash
+            log.exception("Playbook trend state failed")
+        self._pb_cache = (key, ts)
+        return ts
+
+    def _try_playbook(self, now: dt.datetime, snap: Snapshot) -> None:
+        if not snap.fresh or snap.chain is None or self.risk.halted or time.monotonic() < self._entry_block_until:
+            return
+        if now.time() >= self.cfg.schedule.square_off:
+            return
+        ts = self._pb_trend(now)
+        d = self.pb.single_signal(ts, now, snap.vix)
+        if d.action == "single":                       # a strong trend: single leg first
+            plan = build_single(snap.chain, d.direction, now, d.why)
+            qc = validate_plan_quotes(plan, snap.chain) if plan else None
+            if plan and qc.ok:
+                self._enter(now, snap, plan, self.tg.single_lots, 100.0, 1)
+            if self.position:
+                self.pb.took_single(d)
+            else:
+                self.pb.skipped_signal(d)
+                self.alerts.send(f"Trend signal NOT traded ({d.why}): "
+                                 f"{qc.reason if qc and not qc.ok else 'no quote / margin check failed'}",
+                                 level="WARNING", key="pb-single-skip")
+            self._save_state()
+            return
+        d = self.pb.multi_signal(ts, now, snap.vix)
+        if d.action == "multi":
+            plan = build_condor(snap.chain, self.pb.p, d.why)
+            if plan is None or not validate_plan_quotes(plan, snap.chain).ok:
+                return                                 # quotes not ready: try again next second
+            self._enter(now, snap, plan, self.tg.multi_lots, 50.0, 1)
+            self.pb.took_multi()                       # one attempt per day (a margin refusal is not retried)
+            if not self.position:
+                self.alerts.send(f"Range setup NOT traded ({d.why}): margin check failed for "
+                                 f"{self.tg.multi_lots} lot(s)", level="WARNING", key="pb-multi-skip")
+            self._save_state()
+
+    def _manage_playbook(self, now: dt.datetime, pos: ManagedPosition) -> None:
+        """No stop-loss and no trailing stop: exit on trend reversal, the Rs loss cap, a trend signal while a condor is
+        open, or square-off. Only loss-control / broker-safety halts (FLATTEN_HALTS) can close it otherwise."""
+        pnl = pos.pnl(self._ltps(pos))
+        pos.peak_pnl = max(pos.peak_pnl, pnl)
+        reason: Optional[str] = None
+        if self.risk.halted:
+            reason = self.risk.update_portfolio(self.capital, self.realized + pnl)   # returns only FLATTEN halts
+        if not reason:
+            ts = self._pb_trend(now)
+            pending = False
+            if plan_direction(pos.plan) == 0 and self._last_snap is not None:
+                pending = self.pb.single_signal(ts, now, self._last_snap.vix).action == "single"
+            reason = self.pb.exit_reason(pos.plan, pnl, ts, pending)
+        if not reason and now.time() >= self.cfg.schedule.square_off and (
+                self.cfg.execution.product == "MIS" or pos.plan.expiry <= now.date()):
+            reason = "SQUARE_OFF_TIME"
+        if time.monotonic() - self._last_exit_status > 60:
+            self._last_exit_status = time.monotonic()
+            log.info("MTM %s pnl=%.0f peak=%.0f (no stop/trail; cap %.0f)", pos.plan.variant_id, pnl, pos.peak_pnl,
+                     self.pb.p.loss_cap_rs)
+        if time.monotonic() - self._last_state_save > 30:
+            self._save_state()
+        if reason:
+            self._exit(reason)
+
+    def _status_text(self) -> str:
+        pos = self.position
+        p = (f"open: {pos.plan.name} x{pos.lots} [{pos.plan.variant_id}] since {pos.entered_at:%H:%M}"
+             if pos else "no open position")
+        return (f"{self.mode} | {p} | today net {self.realized:,.0f} over {self.trades_today} trades | "
+                f"lots single {self.tg.single_lots}, multi {self.tg.multi_lots} | playbook "
+                f"{'ON' if self.pb_enabled else 'OFF'}")
+
     def _manage(self, now: dt.datetime) -> None:
         pos = self.position
         assert pos
+        if is_playbook(pos.plan):
+            self._manage_playbook(now, pos)
+            return
         pnl = pos.pnl(self._ltps(pos))
         if self.xp.enabled:
             # Safety kill-switches first (daily loss / halts). The day-level trailing stop is off: it could exit
@@ -606,6 +712,9 @@ class Bot:
             self._enter(now, snap, plan, lots, score, 1)
 
     def _try_entry(self, now: dt.datetime, snap: Snapshot) -> None:
+        if getattr(self, "pb_enabled", False):
+            self._try_playbook(now, snap)
+            return
         if not snap.fresh or snap.chain is None:
             return
         usable = any(self._capital_allows(self.spec_by_id[v]) for v in self.approved if v in self.spec_by_id)
