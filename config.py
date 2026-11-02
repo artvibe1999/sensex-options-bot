@@ -201,7 +201,8 @@ class Schedule:
     entry_start: time = time(9, 30)
     entry_end: time = time(14, 30)
     square_off: time = time(15, 15)
-    market_close: time = time(15, 30)
+    market_close: time = time(15, 40)         # exchange options close (moved from 15:30): the bot ends its day after it
+    report_time: time = time(16, 0)           # save the account's live fills/P&L/charges and rebuild the report page
 
 
 @dataclass(frozen=True)

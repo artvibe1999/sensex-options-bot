@@ -71,7 +71,7 @@ def collect(cfg: Config, now: dt.datetime, day: Optional[str] = None) -> dict[st
                         "ORDER BY ts DESC LIMIT 1", lo, hi)[0]
             info.update(last_ts=r[0], spot=r[1], vix=r[2], regime=r[3], score=r[4], spike=bool(r[5]))
             info["age_s"] = (now - dt.datetime.fromisoformat(r[0])).total_seconds()
-        in_hours = day == now.date().isoformat() and now.weekday() < 5 and dt.time(9, 20) <= now.time() <= dt.time(15, 30)
+        in_hours = day == now.date().isoformat() and now.weekday() < 5 and dt.time(9, 20) <= now.time() <= dt.time(15, 40)
         if in_hours and info["market_rows"] and info["age_s"] > 120:
             flags.append(f"Data is stale: last snapshot {info['age_s']:.0f}s ago during market hours.")
         elif (day == now.date().isoformat() and now.weekday() < 5 and now.time() > dt.time(9, 30)

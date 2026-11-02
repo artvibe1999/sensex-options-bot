@@ -134,6 +134,8 @@ class Bot:
         self.day: Optional[dt.date] = None
         self.session_ready = False
         self.eod_done = False
+        self.report_done = False                  # live fills saved + report rebuilt for the day (at schedule.report_time)
+        self.market_open_today = False            # a live snapshot was seen today (False on holidays)
         self._auth_alerted = False
         self._halt_alerted = False
         self._exit_failures = 0
@@ -189,6 +191,7 @@ class Bot:
     def _save_state(self) -> None:
         doc = {"date": (self.day or dt.date.today()).isoformat(), "mode": self.mode,
                "realized": self.realized, "trades_today": self.trades_today, "eod_done": self.eod_done,
+               "report_done": self.report_done, "market_open_today": self.market_open_today,
                "risk": self.risk.export(),
                "playbook": self.pb.day.export() if hasattr(self, "pb") else {},
                "position": _position_to_dict(self.position) if self.position else None}
@@ -219,6 +222,8 @@ class Bot:
             self.realized = float(doc.get("realized", 0.0))
             self.trades_today = int(doc.get("trades_today", 0))
             self.eod_done = bool(doc.get("eod_done", False))   # a restart after the close must not repeat the day summary
+            self.report_done = bool(doc.get("report_done", self.eod_done))   # old state files: report already done
+            self.market_open_today = bool(doc.get("market_open_today", False))
             self.risk.restore(doc.get("risk", {}))
             if hasattr(self, "pb"):
                 self.pb.day = DayState.restore(doc.get("playbook") or {})
@@ -276,6 +281,8 @@ class Bot:
         if now.time() > s.market_close:
             if not self.eod_done:
                 self._end_day(now)
+            if not self.report_done and now.time() >= s.report_time:
+                self._end_report(now)
             self.stop.wait(60)
             return
         self._refresh_approvals(now)
@@ -395,7 +402,7 @@ class Bot:
                 log.info("Pruned %d old flow rows", n)
         except Exception:  # noqa: BLE001
             log.exception("Prune failed")
-        self.session_ready = self.eod_done = False
+        self.session_ready = self.eod_done = self.report_done = self.market_open_today = False
         self._auth_alerted = self._halt_alerted = False
         self._exit_failures = self._entry_failures = 0
         self._entry_block_until, self._stall_alerted = 0.0, False
@@ -517,18 +524,30 @@ class Bot:
                        {"realized": self.realized, "trades": self.trades_today, "mode": self.mode,
                         "market_open": market_open})
         self.alerts.send(f"Day done ({self.mode}): net PnL {self.realized:,.0f} over {self.trades_today} trades")
-        try:                                                # report page: never allowed to disturb the day's close
-            if self.session_ready and market_open:
-                self.report.save_live(self.client, now.date())   # the account's real fills (read-only)
+        self.market_open_today = market_open
+        self.sheets.append("Status", STATUS_HEADER, [[now.isoformat(timespec="seconds"), self.mode, "DAY_DONE",
+                                                      f"net {self.realized:,.0f} over {self.trades_today} trades"]])
+        self.client.stop_stream()
+        self.session_ready, self.eod_done = False, True
+        self._save_state()
+
+    def _end_report(self, now: dt.datetime) -> None:
+        """At schedule.report_time (after the options close, so every late fill is in): save the account's real fills,
+        Zerodha's day positions and charges (read-only), rebuild the report page, notify on change. Runs once a day,
+        also after a restart between the close and report_time; never allowed to disturb the bot."""
+        try:
+            if self.market_open_today:
+                try:
+                    self.client.authenticate()              # the session may be from before a restart, or not set up
+                except Exception:  # noqa: BLE001
+                    log.exception("Kite authentication for the report failed: trying the saved session")
+                self.report.save_live(self.client, now.date())
             changed, summary = self._build_report()
             if changed and self.report.url:
                 self.alerts.send(self.report.summary_text(now.date().isoformat(), summary), key="report")
         except Exception:  # noqa: BLE001
             log.exception("Report page update failed")
-        self.sheets.append("Status", STATUS_HEADER, [[now.isoformat(timespec="seconds"), self.mode, "DAY_DONE",
-                                                      f"net {self.realized:,.0f} over {self.trades_today} trades"]])
-        self.client.stop_stream()
-        self.session_ready, self.eod_done = False, True
+        self.report_done = True
         self._save_state()
 
     # ---------------------------------------------------------------- trading

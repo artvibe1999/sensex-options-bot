@@ -181,6 +181,14 @@ class ZerodhaClient:
         """Today's executed fills of the whole account (read-only; Kite keeps only the current day)."""
         return self._call(self.kite.trades) or []
 
+    def day_positions(self) -> list[dict]:
+        """Today's positions (Kite positions()["day"]: the day's buys/sells and M2M P&L; read-only)."""
+        return (self._call(self.kite.positions) or {}).get("day") or []
+
+    def order_charges(self, orders: list[dict]) -> list[dict]:
+        """Zerodha's charges for already-executed orders (virtual contract note). Only calculates; places nothing."""
+        return self._call(self.kite.get_virtual_contract_note, orders) or []
+
     def available_cash(self) -> float:
         m = self._call(self.kite.margins, "equity")
         return float(m["available"]["live_balance"])

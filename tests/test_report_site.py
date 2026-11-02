@@ -62,6 +62,70 @@ class LiveTests(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["gross"], (300.0 - 245.0) * 20)
 
 
+    def test_zerodha_positions_and_charges_override_rebuilt_figures(self):
+        # a late fill missing from the fills must not matter once Zerodha's own day position is saved
+        fills = [fill("1", "BUY", 40, 245.0, (10, 46)), fill("2", "SELL", 20, 300.0, (14, 0))]
+        rec = {"date": "2026-11-02", "orders": [], "fills": fills,
+               "positions": [{"tradingsymbol": "SENSEX26N0580000CE", "exchange": "BFO", "m2m": -636.0}],
+               "charges": {"SENSEX26N0580000CE": 61.5}}
+        r = live_trades([rec], CostParams())[0][0]
+        self.assertEqual((r["gross"], r["cost"], r["net"]), (-636.0, 61.5, -697.5))
+        self.assertEqual((r["pnl_source"], r["cost_source"]), ("zerodha", "zerodha"))
+
+    def test_flat_contract_without_positions_uses_cash_flow(self):
+        fills = [fill("1", "BUY", 40, 245.0, (10, 0)), fill("2", "SELL", 40, 250.0, (10, 5)),
+                 fill("3", "BUY", 20, 260.0, (11, 0)), fill("4", "SELL", 20, 240.0, (11, 5))]
+        r = live_trades([{"date": "2026-11-02", "orders": [], "fills": fills}], CostParams())[0][0]
+        self.assertAlmostEqual(r["gross"], (40 * 250 + 20 * 240) - (40 * 245 + 20 * 260))
+        self.assertEqual((r["pnl_source"], r["cost_source"]), ("fills", "estimate"))
+
+    def test_save_live_stores_positions_and_contract_note_charges(self):
+        class Client:
+            sent = None
+            def day_orders(self):
+                return [{"order_id": "1", "tag": "", "exchange": "BFO", "tradingsymbol": "A", "status": "COMPLETE",
+                         "transaction_type": "BUY", "variety": "regular", "product": "NRML", "order_type": "MARKET",
+                         "filled_quantity": 40, "average_price": 100.0, "placed_by": "AB1234"},
+                        {"order_id": "2", "tag": "", "exchange": "BFO", "tradingsymbol": "A", "status": "REJECTED",
+                         "transaction_type": "SELL", "filled_quantity": 0, "average_price": 0}]
+            def day_trades(self):
+                return [fill("1", "BUY", 40, 100.0, (10, 0), "A")]
+            def day_positions(self):
+                return [{"tradingsymbol": "A", "exchange": "BFO", "m2m": -40.0, "user_id": "AB1234"},
+                        {"tradingsymbol": "INFY", "exchange": "NSE", "m2m": 5.0}]
+            def order_charges(self, params):
+                Client.sent = params
+                return [{"tradingsymbol": "A", "charges": {"total": 32.85}}]
+        site = ReportSite(self.dir, "2026-11-01", CostParams())
+        rec = site.save_live(Client(), DAY)
+        self.assertEqual([p["order_id"] for p in Client.sent], ["1"])     # rejected / unfilled orders are not costed
+        self.assertEqual(Client.sent[0]["quantity"], 40)
+        self.assertEqual(rec["charges"], {"A": 32.85})
+        self.assertEqual([p["tradingsymbol"] for p in rec["positions"]], ["A"])
+        raw = open(os.path.join(self.dir, "live", "2026-11-02.json"), encoding="utf-8").read()
+        self.assertNotIn("AB1234", raw)
+
+    def test_save_live_falls_back_when_positions_and_charges_fail(self):
+        class Client:
+            def day_orders(self):
+                return []
+            def day_trades(self):
+                return [fill("1", "BUY", 40, 100.0, (10, 0))]
+            def day_positions(self):
+                raise RuntimeError("down")
+            def order_charges(self, params):
+                raise RuntimeError("down")
+        rec = ReportSite(self.dir, "2026-11-01", CostParams()).save_live(Client(), DAY)
+        self.assertEqual(len(rec["fills"]), 1)
+        self.assertNotIn("positions", rec)
+        self.assertEqual(rec.get("charges"), {})          # no executed orders to cost
+
+    def test_contract_note_out_of_order_is_rejected(self):
+        from report_site import charges_by_symbol
+        with self.assertRaises(ValueError):
+            charges_by_symbol([{"tradingsymbol": "A"}, {"tradingsymbol": "B"}],
+                              [{"tradingsymbol": "B", "charges": {"total": 1}}, {"tradingsymbol": "A", "charges": {"total": 1}}])
+
 class PaperAndPageTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

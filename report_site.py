@@ -2,11 +2,17 @@
 from Kite after the close), one static self-contained HTML page kept as ONE Cloud Storage object
 (gs://REPORT_GCS_BUCKET/r/<REPORT_TOKEN>/index.html) that every rebuild overwrites in place, so its link never changes.
 
-    data/live/YYYY-MM-DD.json   one file per trading day: the account's option fills and order tags (Kite keeps only
-                                the current day, so each day is saved at the close; a day the VM was off is missing)
+    data/live/YYYY-MM-DD.json   one file per trading day: the account's option fills, order tags, Zerodha's own day
+                                positions (P&L) and Zerodha's own per-order charges (virtual contract note). Kite keeps
+                                only the current day, so each day is saved at the schedule's report_time (16:00 IST,
+                                after the 15:40 options close); a day the VM was off then is missing
     data/report.hash            fingerprint of the page's data: the Telegram notice is sent only when it changes
 
-Nothing here places or changes orders: Kite is only read (orders(), trades()).
+Nothing here places or changes orders: Kite is only read (orders(), trades(), positions(), and the virtual contract
+note, which only calculates the charges of orders that already executed).
+
+Live P&L per (day, contract) is Zerodha's own day-position M2M when it was saved (the figure Kite shows), else it is
+rebuilt from the fills. Charges are Zerodha's contract-note figures when saved, else estimated from costs.py.
 """
 from __future__ import annotations
 
@@ -28,6 +34,10 @@ BOT_TAG_PREFIX = "SXALGO"
 _FILL_FIELDS = ("trade_id", "order_id", "exchange", "tradingsymbol", "product", "average_price", "quantity",
                 "transaction_type", "fill_timestamp")
 _ORDER_FIELDS = ("order_id", "tag", "tradingsymbol", "status", "transaction_type", "product", "exchange")
+_POSITION_FIELDS = ("tradingsymbol", "exchange", "product", "quantity", "buy_quantity", "sell_quantity", "buy_value",
+                    "sell_value", "last_price", "m2m", "pnl")
+_CONTRACT_NOTE_FIELDS = ("order_id", "exchange", "tradingsymbol", "transaction_type", "variety", "product",
+                         "order_type")
 
 
 def _iso(v: Any) -> Any:
@@ -43,14 +53,45 @@ def _atomic_write(path: str, text: str) -> None:
 
 
 # ------------------------------------------------------------------ live: save the day's real fills
-def save_live_day(day_orders: list[dict], day_trades: list[dict], day: dt.date, live_dir: str) -> dict:
-    """Keep only option fills/orders and only the fields the report needs (no account ids). Returns the record."""
+def contract_note_params(day_orders: list[dict]) -> list[dict]:
+    """The executed option orders, in the shape Kite's virtual contract note takes (filled quantity, average price)."""
+    out = []
+    for o in day_orders:
+        qty = int(o.get("filled_quantity") or 0)
+        if o.get("exchange") in OPTION_EXCHANGES and qty > 0:
+            out.append({**{k: o.get(k) for k in _CONTRACT_NOTE_FIELDS}, "quantity": qty,
+                        "average_price": float(o.get("average_price") or 0)})
+    return out
+
+
+def charges_by_symbol(params: list[dict], note: list[dict]) -> dict[str, float]:
+    """Sum Zerodha's per-order charges by contract. The note answers in request order; each row's symbol is checked."""
+    if len(note) != len(params):
+        raise ValueError(f"contract note has {len(note)} rows for {len(params)} orders")
+    out: dict[str, float] = defaultdict(float)
+    for p, n in zip(params, note):
+        if n.get("tradingsymbol") != p["tradingsymbol"]:
+            raise ValueError("contract note rows are not in request order")
+        out[p["tradingsymbol"]] += float(n["charges"]["total"])
+    return {k: round(v, 2) for k, v in out.items()}
+
+
+def save_live_day(day_orders: list[dict], day_trades: list[dict], day: dt.date, live_dir: str,
+                  day_positions: Optional[list[dict]] = None, charges: Optional[dict[str, float]] = None) -> dict:
+    """Keep only option fills/orders/positions and only the fields the report needs (no account ids). `day_positions`
+    (Kite positions()["day"]) and `charges` (charges_by_symbol) are left out when they could not be fetched; the report
+    then rebuilds P&L from the fills and estimates the charges. Returns the record."""
     fills = [{k: _iso(t.get(k)) for k in _FILL_FIELDS} for t in day_trades
              if t.get("exchange") in OPTION_EXCHANGES]
     orders = [{k: _iso(o.get(k)) for k in _ORDER_FIELDS} for o in day_orders
               if o.get("exchange") in OPTION_EXCHANGES]
     rec = {"date": day.isoformat(), "fetched_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
            "fills": fills, "orders": orders}
+    if day_positions is not None:
+        rec["positions"] = [{k: _iso(p.get(k)) for k in _POSITION_FIELDS} for p in day_positions
+                            if p.get("exchange") in OPTION_EXCHANGES]
+    if charges is not None:
+        rec["charges"] = charges
     _atomic_write(os.path.join(live_dir, f"{day.isoformat()}.json"), json.dumps(rec))
     return rec
 
@@ -71,13 +112,18 @@ def load_live(live_dir: str, since: str) -> list[dict]:
 
 
 def live_trades(records: Iterable[dict], costs: CostParams) -> tuple[list[dict], list[str]]:
-    """One row per (day, contract): bought / sold quantity and average, realised P&L of the closed quantity, estimated
-    charges (Zerodha schedule, per order), open quantity left. Returns (rows, days fetched)."""
+    """One row per (day, contract): bought / sold quantity and average, P&L, charges, open quantity left.
+    P&L: Zerodha's day-position M2M when saved (exactly what Kite shows: the day's cash flow, plus any quantity still
+    open marked at its last price); otherwise rebuilt from the fills (cash flow when flat, else the closed quantity at
+    the average prices). Charges: Zerodha's contract note when saved, else estimated per order from costs.py.
+    Returns (rows, days fetched)."""
     rows, days = [], []
     for rec in records:
         day = rec["date"]
         days.append(day)
         tags = {o["order_id"]: (o.get("tag") or "") for o in rec.get("orders", [])}
+        pos = {p["tradingsymbol"]: p for p in rec.get("positions") or []}
+        zcharges = rec.get("charges")
         by_sym: dict[str, list[dict]] = defaultdict(list)
         for f in rec.get("fills", []):
             by_sym[f["tradingsymbol"]].append(f)
@@ -88,12 +134,21 @@ def live_trades(records: Iterable[dict], costs: CostParams) -> tuple[list[dict],
             bv = sum(int(f["quantity"]) * float(f["average_price"]) for f in fills if f["transaction_type"] == "BUY")
             sv = sum(int(f["quantity"]) * float(f["average_price"]) for f in fills if f["transaction_type"] == "SELL")
             closed = min(bq, sq)
-            gross = (sv / sq - bv / bq) * closed if closed else 0.0
+            if pos.get(sym, {}).get("m2m") is not None:
+                gross, source = float(pos[sym]["m2m"]), "zerodha"
+            elif bq == sq:
+                gross, source = sv - bv, "fills"
+            else:
+                gross, source = ((sv / sq - bv / bq) * closed if closed else 0.0), "fills"
             per_order: dict[str, list] = {}
             for f in fills:                     # brokerage is per order: cost each order once, at its average fill
                 o = per_order.setdefault(f["order_id"], [f["transaction_type"], 0.0, 0])
                 o[1] += float(f["average_price"]) * int(f["quantity"]); o[2] += int(f["quantity"])
-            cost = trade_cost([(s, v / q, q) for s, v, q in per_order.values() if q], costs)
+            if zcharges is not None and sym in zcharges:
+                cost, cost_source = float(zcharges[sym]), "zerodha"
+            else:
+                cost = trade_cost([(s, v / q, q) for s, v, q in per_order.values() if q], costs)
+                cost_source = "estimate"
             bot = any(str(tags.get(f["order_id"], "")).startswith(BOT_TAG_PREFIX) for f in fills)
             t0 = str(fills[0].get("fill_timestamp") or "")[11:16]
             t1 = str(fills[-1].get("fill_timestamp") or "")[11:16]
@@ -101,7 +156,7 @@ def live_trades(records: Iterable[dict], costs: CostParams) -> tuple[list[dict],
                          "bought": bq, "buy_avg": round(bv / bq, 2) if bq else None,
                          "sold": sq, "sell_avg": round(sv / sq, 2) if sq else None,
                          "open_qty": bq - sq, "gross": round(gross, 2), "cost": round(cost, 2),
-                         "net": round(gross - cost, 2)})
+                         "net": round(gross - cost, 2), "pnl_source": source, "cost_source": cost_source})
     return rows, days
 
 
@@ -197,9 +252,21 @@ class ReportSite:
         self.publish = publish_gcs
 
     def save_live(self, client, day: dt.date) -> Optional[dict]:
-        """Fetch and store today's real fills. Never raises (the report must not disturb trading)."""
+        """Fetch and store today's real fills, Zerodha's day positions and Zerodha's charges. Never raises (the report
+        must not disturb trading); positions or charges that fail are left out and the report falls back."""
         try:
-            return save_live_day(client.day_orders(), client.day_trades(), day, self.live_dir)
+            orders, trades = client.day_orders(), client.day_trades()
+            positions = charges = None
+            try:
+                positions = client.day_positions()
+            except Exception:  # noqa: BLE001
+                log.exception("Day positions fetch failed: P&L will be rebuilt from the fills")
+            try:
+                params = contract_note_params(orders)
+                charges = charges_by_symbol(params, client.order_charges(params)) if params else {}
+            except Exception:  # noqa: BLE001
+                log.exception("Contract-note charges fetch failed: charges will be estimated")
+            return save_live_day(orders, trades, day, self.live_dir, positions, charges)
         except Exception:  # noqa: BLE001
             log.exception("Live fills fetch failed")
             return None
@@ -299,7 +366,7 @@ s.addEventListener('pointerleave',()=>{tip.hidden=true})});return box}
 function view(kind){const v=document.getElementById('view');v.replaceChildren();const st=stats(kind);const dd=daily(kind);const wrap=el('div',{style:'display:flex;flex-direction:column;gap:12px'});
 const isLive=kind==='live';
 if(!dd.length){wrap.append(el('div',{class:'card empty'},isLive?'No live trading days recorded yet. The account\'s real fills are fetched from Kite after each close.':'No paper trades yet. Paper trading with the playbook starts on the first trading day.'));v.append(wrap);return}
-const tl=el('div',{class:'tiles'});tl.append(tile('Net P&L since '+D.since+' (Rs)',sg(st.net),cls(st.net),isLive?'Realised, after estimated charges':'After charges, paper fills at bid/ask'),tile('Trades',inr.format(st.n),'',st.pf==null?'':'Profit factor '+st.pf.toFixed(2)),tile('Win rate',Math.round(st.win*100)+'%','',''),tile('Days: won / lost / no trade',st.wd+' / '+st.ld+' / '+st.idle,'',''),tile('Best day / worst day (Rs)',sg(st.best)+' / '+sg(st.worst),'',''),tile('Largest drop from a peak (Rs)',sg(-st.mdd),st.mdd>0?'neg':'',''));wrap.append(tl);
+const tl=el('div',{class:'tiles'});tl.append(tile('Net P&L since '+D.since+' (Rs)',sg(st.net),cls(st.net),isLive?'After Zerodha\'s charges and taxes':'After charges, paper fills at bid/ask'),tile('Trades',inr.format(st.n),'',st.pf==null?'':'Profit factor '+st.pf.toFixed(2)),tile('Win rate',Math.round(st.win*100)+'%','',''),tile('Days: won / lost / no trade',st.wd+' / '+st.ld+' / '+st.idle,'',''),tile('Best day / worst day (Rs)',sg(st.best)+' / '+sg(st.worst),'',''),tile('Largest drop from a peak (Rs)',sg(-st.mdd),st.mdd>0?'neg':'',''));wrap.append(tl);
 const c1=el('div',{class:'card'},el('h2',{},'Daily P&L'),el('p',{class:'note'},'Every trading day recorded. Bars above the line made money.'),chart(dd));wrap.append(c1);
 const g=el('div',{class:'grid2'});
 const mon=new Map();dd.forEach(d=>{const k=d.date.slice(0,7);const o=mon.get(k)||{k,net:0,n:0,w:0,l:0};o.net+=d.net;o.n+=d.n;if(d.net>0)o.w++;else if(d.net<0)o.l++;mon.set(k,o)});
@@ -309,7 +376,7 @@ g.append(el('div',{class:'card'},el('h2',{},isLive?'Bot and manual orders':'By s
 wrap.append(g);
 const rows=[...dd].reverse().map(d=>[d.date,inr.format(d.n),{t:d.n?sg(d.net):'0',c:cls(d.net)},d.n?d.items.map(r=>isLive?`${r.symbol} [${r.who}] bought ${r.bought}${r.buy_avg?' @ '+r.buy_avg:''}, sold ${r.sold}${r.sell_avg?' @ '+r.sell_avg:''} (${r.entry}-${r.exit})${r.open_qty?' OPEN '+r.open_qty:''}: ${sg(r.net)} (charges ${inr.format(r.cost)})`:`${r.setup} x${r.lots??'?'} ${r.entry}-${r.exit} ${String(r.reason).replace(/_/g,' ').toLowerCase()}: ${sg(r.net)}`).join('; '):'No trade'].map((c,i)=>i===3?{t:c,c:'detail'}:c));
 wrap.append(el('div',{class:'card'},el('h2',{},'Every day'),el('div',{class:'scroll'},table(['Date','Trades','Day net (Rs)','Trades and exits'],rows,[1,2]))));
-if(isLive)wrap.append(el('p',{class:'note'},'Live P&L is realised P&L per contract per day from the account\'s fills; charges are estimated from Zerodha\'s schedule, so the contract note can differ by a few rupees. A day the VM was off at the close is missing, because Kite only keeps the current day\'s orders.'));
+if(isLive)wrap.append(el('p',{class:'note'},'Live P&L per contract per day is Zerodha\'s own position P&L for the day (a quantity still open is marked at its last price), minus Zerodha\'s own charges and taxes from its contract-note calculation, both saved at 16:00 IST. A day the VM was off at 16:00 is missing, because Kite only keeps the current day\'s orders.'));
 v.append(wrap)}
 function show(kind){document.getElementById('tab-paper').setAttribute('aria-selected',kind==='paper');document.getElementById('tab-live').setAttribute('aria-selected',kind==='live');view(kind);try{history.replaceState(null,'','#'+kind)}catch(e){}}
 document.getElementById('tab-paper').onclick=()=>show('paper');document.getElementById('tab-live').onclick=()=>show('live');

@@ -1,6 +1,7 @@
 """Regression tests for the second review: shadow/live consistency, realistic paper fills, restart safety,
 partial-exit accounting and the forward-evidence exploration filter."""
 import datetime as dt
+import json
 import os
 import sys
 import tempfile
@@ -121,6 +122,7 @@ def _bare_bot(tmpdir):
     b.live, b.mode, b.position = False, "PAPER", None
     b.cfg = types.SimpleNamespace(paths=types.SimpleNamespace(state=os.path.join(tmpdir, "state.json")))
     b.day, b.realized, b.trades_today, b.eod_done = dt.date(2026, 10, 29), -1047.0, 1, False
+    b.report_done, b.market_open_today = False, False
     b.risk = RiskManager(RiskParams(), Schedule())
     b.alerts = types.SimpleNamespace(send=lambda *a, **k: None)
     return b
@@ -136,6 +138,36 @@ class RestartTests(unittest.TestCase):
             b2._load_state()
             self.assertTrue(b2.eod_done)
             self.assertEqual(b2.realized, -1047.0)
+
+    def test_restart_between_close_and_report_time_still_saves_the_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = _bare_bot(d)
+            b.eod_done, b.market_open_today = True, True      # day closed at 15:40, report (16:00) not yet done
+            b._save_state()
+            b2 = _bare_bot(d)
+            b2._load_state()
+            self.assertEqual((b2.eod_done, b2.report_done, b2.market_open_today), (True, False, True))
+            calls = []
+            b2.client = types.SimpleNamespace(authenticate=lambda: calls.append("auth"))
+            b2.report = types.SimpleNamespace(save_live=lambda c, day: calls.append(("save", day)), url=None)
+            b2._build_report = lambda: (False, {})
+            b2._end_report(dt.datetime(2026, 10, 29, 16, 0))
+            self.assertEqual(calls, ["auth", ("save", dt.date(2026, 10, 29))])
+            b3 = _bare_bot(d)
+            b3._load_state()
+            self.assertTrue(b3.report_done)                    # once a day
+
+    def test_old_state_file_after_close_does_not_redo_the_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "state.json"), "w", encoding="utf-8") as f:
+                json.dump({"date": "2026-10-29", "mode": "PAPER", "eod_done": True}, f)
+            b = _bare_bot(d)
+            b._load_state()
+            self.assertTrue(b.report_done)
+
+    def test_report_runs_after_the_options_close(self):
+        s = Schedule()
+        self.assertEqual((s.market_close, s.report_time), (dt.time(15, 40), dt.time(16, 0)))
 
 
 class ExploreBlockTests(unittest.TestCase):

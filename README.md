@@ -53,10 +53,12 @@ One self-contained HTML page with **Paper** and **Live** tabs: net P&L since `RE
 won / lost / without a trade, best and worst day, largest drop from a peak, daily P&L chart, by month, by setup
 (paper) or bot vs manual (live), and every day with its trades.
 - **Paper:** the bot's own trade log (`trades` table, mode PAPER).
-- **Live:** after each close (~15:30, before the 15:40 auto-stop) the bot reads the account's real option orders and
-  fills from Kite (`orders()`, `trades()`; read-only) and saves them in `data/live/YYYY-MM-DD.json` (no account ids).
-  Kite keeps only the current day, so a day the VM is off at the close cannot be fetched later. Realised P&L per
-  contract per day; charges estimated per order from the Zerodha schedule; **Bot** = orders tagged `SXALGO`.
+- **Live:** at 16:00 IST (after the 15:40 options close, before the 16:30 auto-stop) the bot reads the account's real
+  option orders, fills and day positions from Kite (`orders()`, `trades()`, `positions()`; read-only) plus Zerodha's own
+  per-order charges (virtual contract note, a calculation only) and saves them in `data/live/YYYY-MM-DD.json` (no
+  account ids). Kite keeps only the current day, so a day the VM is off at 16:00 cannot be fetched later. P&L per
+  contract per day is Zerodha's day-position P&L, net of Zerodha's charges and taxes (if either fetch fails, P&L is
+  rebuilt from the fills / charges are estimated from the schedule); **Bot** = orders tagged `SXALGO`.
 - **Hosting:** the page is **one Cloud Storage object**, `gs://REPORT_GCS_BUCKET/r/<REPORT_TOKEN>/index.html`,
   overwritten in place on every rebuild (start-up and each close), so its link never changes and works while the VM is
   off. Uploaded with the VM's own service-account token from the metadata server (no key file), `cacheControl:

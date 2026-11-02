@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-time install of the weekly intraday-approval refresh:  sudo bash deploy/install_intraday_refresh.sh
-# Runs deploy/refresh_intraday.sh every Friday at 15:35 IST (10:05 UTC), after the close and before the auto-stop
-# window (15:40-16:30), which it holds off while it works. Not catch-up (Persistent=false): if the VM is off on
+# Runs deploy/refresh_intraday.sh every Friday at 16:05 IST (10:35 UTC), after the 15:40 options close and the 16:00
+# report, before the auto-stop window (16:30-17:30), which it holds off while it works. Not catch-up (Persistent=false): if the VM is off on
 # Friday afternoon the run is skipped, and the approvals (valid 60 days) simply stay as they are.
 set -eu
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -19,10 +19,10 @@ TimeoutStartSec=3600
 UNIT
 cat > /etc/systemd/system/sxbot-intraday-refresh.timer <<UNIT
 [Unit]
-Description=Run the SXBOT intraday refresh every Friday 15:35 IST
+Description=Run the SXBOT intraday refresh every Friday 16:05 IST
 
 [Timer]
-OnCalendar=Fri *-*-* 10:05:00 UTC
+OnCalendar=Fri *-*-* 10:35:00 UTC
 Persistent=false
 
 [Install]
