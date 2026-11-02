@@ -22,11 +22,17 @@ from kiteconnect import KiteConnect, KiteTicker
 from kiteconnect import exceptions as kex
 
 from config import Credentials
+from models import IndexRow, OptionRow, parse_rows
+from rate_limit import KITE_LIMITS, CircuitBreaker, TokenBucket, backoff_s, endpoint_for
 from token_store import is_fresh, read_token
 
 log = logging.getLogger(__name__)
 
 _RETRYABLE = (kex.NetworkException, kex.GeneralException, requests.exceptions.RequestException)
+# Market-data calls guarded by the circuit breaker. Orders, order book, positions and the login check are never
+# blocked by it: exits and reconciliation must always be attempted.
+_BREAKER_GUARDED = {"quote", "ltp", "ohlc", "historical_data", "instruments", "margins", "basket_order_margins",
+                    "get_virtual_contract_note"}
 
 
 class AuthError(RuntimeError):
@@ -49,27 +55,17 @@ class OptionContract:
         return f"{self.exchange}:{self.symbol}"
 
 
-class _RateLimiter:
-    def __init__(self, per_second: float) -> None:
-        self._gap = 1.0 / per_second
-        self._last = 0.0
-        self._lock = threading.Lock()
-
-    def wait(self) -> None:
-        with self._lock:
-            delay = self._gap - (time.monotonic() - self._last)
-            if delay > 0:
-                time.sleep(delay)
-            self._last = time.monotonic()
-
-
 class ZerodhaClient:
     def __init__(self, creds: Credentials, token_file: Optional[str] = None) -> None:
         self._creds = creds
         self._token_file = token_file
         self.kite = KiteConnect(api_key=creds.api_key)
-        self._data_limit = _RateLimiter(3)    # Kite: ~3 req/s for data endpoints
-        self._order_limit = _RateLimiter(8)   # Kite: 10 orders/s; stay below
+        # one token bucket per Kite endpoint class (rate_limit.KITE_LIMITS): quotes 1/s, history 3/s, orders 8/s
+        self._buckets = {k: TokenBucket(r, b) for k, (r, b) in KITE_LIMITS.items()}
+        self._order_limit = self._buckets["order"]
+        self._breaker = CircuitBreaker()
+        self._dumps: dict[str, list[dict]] = {}              # exchange -> instruments dump (this session)
+        self._index_contracts: dict[str, list[OptionContract]] = {}   # multi-index engine: name -> contracts
         self._contracts: list[OptionContract] = []
         self.spot_token: int = 0
         self.vix_token: int = 0
@@ -115,24 +111,69 @@ class ZerodhaClient:
                         "token_service (or run: python token_service.py url)")
 
     # ------------------------------------------------------- generic caller
-    def _call(self, fn: Callable, *args, retries: int = 4, limiter: Optional[_RateLimiter] = None, **kw):
-        limiter = limiter or self._data_limit
+    def _call(self, fn: Callable, *args, retries: int = 4, limiter: Optional[TokenBucket] = None, **kw):
+        """Every Kite call: paced by its endpoint's token bucket, retried with jittered exponential backoff on network
+        errors, market-data calls short-circuited while the breaker is open. A TokenException is never retried."""
+        name = getattr(fn, "__name__", "")
+        bucket = limiter or self._buckets[endpoint_for(fn)]
+        guarded = name in _BREAKER_GUARDED
         for attempt in range(retries + 1):
-            limiter.wait()
+            if guarded:
+                self._breaker.before()                       # raises CircuitOpen (a ConnectionError) while open
+            bucket.acquire()
             try:
-                return fn(*args, **kw)
+                res = fn(*args, **kw)
             except kex.TokenException:
                 raise  # fatal: needs a new login
             except _RETRYABLE as exc:
+                if guarded:
+                    self._breaker.failure()
                 if attempt == retries:
                     raise
-                backoff = min(2 ** attempt, 20)
-                log.warning("%s failed (%s); retry in %ss", getattr(fn, "__name__", fn), exc, backoff)
-                time.sleep(backoff)
+                wait = backoff_s(attempt)
+                log.warning("%s failed (%s); retry in %.1fs", name or fn, exc.__class__.__name__, wait)
+                time.sleep(wait)
+                continue
+            if guarded:
+                self._breaker.success()
+            return res
 
     # ----------------------------------------------------------- instruments
+    def _dump(self, exchange: str) -> list[dict]:
+        """Kite's instruments dump for an exchange, fetched once per session (load_instruments clears it)."""
+        if exchange not in self._dumps:
+            self._dumps[exchange] = self._call(self.kite.instruments, exchange) or []
+        return self._dumps[exchange]
+
+    def index_contracts(self, name: str, exchange: str) -> list[OptionContract]:
+        """All option contracts of one index (e.g. NIFTY on NFO), validated row by row; registers them for positions
+        reconciliation and REST price fall-back."""
+        rows = [r for r in self._dump(exchange) if r.get("name") == name and r.get("instrument_type") in ("CE", "PE")]
+        out = [OptionContract(token=r.instrument_token, symbol=r.tradingsymbol, exchange=r.exchange, strike=r.strike,
+                              expiry=r.expiry, kind=r.instrument_type, lot_size=r.lot_size, tick_size=r.tick_size)
+               for r in parse_rows(OptionRow, rows, f"{exchange} {name} options")]
+        self._index_contracts[name] = out
+        self._keys.update({c.token: c.key for c in out})
+        return out
+
+    def index_token(self, exchange: str, symbol: str) -> int:
+        """Instrument token of an index (e.g. NSE "NIFTY 50"), validated."""
+        for r in parse_rows(IndexRow, [r for r in self._dump(exchange) if r.get("tradingsymbol") == symbol],
+                            f"{exchange} {symbol}"):
+            self._keys[r.instrument_token] = f"{exchange}:{symbol}"
+            return r.instrument_token
+        raise RuntimeError(f"Index {exchange}:{symbol} not found in instruments dump")
+
+    def tick_ltp(self, token: int, max_age_s: float = 5.0) -> Optional[float]:
+        """Streamed LTP if it ticked within max_age_s, else None (never a REST call: safe to poll every second)."""
+        tick = self._ticks.get(token)
+        if tick and tick[0] > 0 and time.monotonic() - tick[1] <= max_age_s:
+            return float(tick[0])
+        return None
+
     def load_instruments(self) -> None:
-        bfo = self._call(self.kite.instruments, "BFO")
+        self._dumps = {}                                     # a new session reads fresh dumps (lot sizes, expiries)
+        bfo = self._dump("BFO")
         self._contracts = [
             OptionContract(
                 token=i["instrument_token"], symbol=i["tradingsymbol"], exchange="BFO",
@@ -151,7 +192,7 @@ class ZerodhaClient:
         log.info("Loaded %d SENSEX option contracts", len(self._contracts))
 
     def _find_index(self, exchange: str, symbol: str) -> int:
-        for i in self._call(self.kite.instruments, exchange):
+        for i in self._dump(exchange):
             if i["tradingsymbol"] == symbol:
                 return i["instrument_token"]
         raise RuntimeError(f"Index {exchange}:{symbol} not found in instruments dump")
@@ -207,11 +248,14 @@ class ZerodhaClient:
             return None
 
     def net_positions(self) -> dict[str, int]:
-        """Open SENSEX option positions at the broker: tradingsymbol -> signed quantity."""
-        symbols = {c.symbol for c in self._contracts}
+        """Open option positions at the broker in every contract the bot has loaded (SENSEX on BFO and each scanned
+        index on NFO / BFO): tradingsymbol -> signed quantity."""
+        known = {(c.exchange, c.symbol) for c in self._contracts}
+        for cs in self._index_contracts.values():
+            known |= {(c.exchange, c.symbol) for c in cs}
         out: dict[str, int] = {}
         for p in self._call(self.kite.positions)["net"]:
-            if p["exchange"] == "BFO" and p["tradingsymbol"] in symbols and int(p["quantity"]) != 0:
+            if (p["exchange"], p["tradingsymbol"]) in known and int(p["quantity"]) != 0:
                 out[p["tradingsymbol"]] = int(p["quantity"])
         return out
 
