@@ -3,7 +3,7 @@ services:
     build: .
     # Change to ["python", "main.py", "--live"] only after the paper -> promote
     # pipeline in README.md, and set LIVE_TRADING_CONFIRM=YES in .env.
-    command: ["python", "main.py", "--paper"]
+    command: ["python", "main.py", "--auto"]   # mode from data/mode.json (Telegram /mode); PAPER by default
     restart: unless-stopped
     stop_grace_period: 40s      # time to flatten/flush on shutdown
     env_file: .env

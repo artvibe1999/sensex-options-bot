@@ -184,7 +184,9 @@ def paper_trades(rows: Iterable[tuple]) -> list[dict]:
                 p = json.loads(ep or "{}")
             except ValueError:
                 p = {}
-            out.append({"date": ets[:10], "setup": _setup_name(variant), "variant": variant,
+            ix = str(p.get("index") or "SENSEX")               # multi-index entries record their index
+            out.append({"date": ets[:10], "setup": (f"{ix} " if ix != "SENSEX" else "") + _setup_name(variant),
+                        "variant": variant, "index": ix,
                         "entry": ets[11:16], "exit": ts[11:16], "lots": p.get("lots"),
                         "spot": p.get("spot"), "vix": p.get("vix"), "why": str(p.get("rationale", ""))[:220],
                         "reason": reason, "gross": round(gross or 0, 2), "cost": round(cost or 0, 2),

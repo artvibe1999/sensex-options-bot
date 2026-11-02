@@ -27,6 +27,10 @@ from kiteconnect import exceptions as kex
 from alerts import Alerter
 from config import IST, Config, capital_tier, load_config
 from costs import trade_cost
+from day_guard import DayGuard
+from indices import INDICES
+from mode_control import live_allowed, startup_mode, write_mode
+from multi_index import MultiIndex
 from entry_filter import EntryParams, evaluate_entry
 from exit_engine import ExitEngine, ExitParams
 from explorer import pick_explore
@@ -74,7 +78,8 @@ def _position_to_dict(pos: ManagedPosition) -> dict:
                  "lot_size": p.lot_size, "max_loss_unit": p.max_loss_unit,
                  "max_profit_unit": p.max_profit_unit, "rationale": p.rationale,
                  "variant_id": p.variant_id, "sl_frac": p.sl_frac, "tp_frac": p.tp_frac,
-                 "spot_lo": p.spot_lo, "spot_hi": p.spot_hi, "spot_be": p.spot_be, "entry_spot": p.entry_spot},
+                 "spot_lo": p.spot_lo, "spot_hi": p.spot_hi, "spot_be": p.spot_be, "entry_spot": p.entry_spot,
+                 "underlying": p.underlying},
         "lots": pos.lots,
         "legs": [{"contract": _contract_to_dict(l.contract), "side": l.side, "qty": l.qty,
                   "entry_price": l.entry_price} for l in pos.legs],
@@ -92,7 +97,7 @@ def _position_from_dict(d: dict) -> ManagedPosition:
         lot_size=p["lot_size"], max_loss_unit=p["max_loss_unit"], max_profit_unit=p["max_profit_unit"],
         rationale=p["rationale"], variant_id=p.get("variant_id", ""),
         sl_frac=p.get("sl_frac"), tp_frac=p.get("tp_frac"), spot_lo=p.get("spot_lo"), spot_hi=p.get("spot_hi"),
-        spot_be=p.get("spot_be"), entry_spot=p.get("entry_spot"))
+        spot_be=p.get("spot_be"), entry_spot=p.get("entry_spot"), underlying=p.get("underlying", "SENSEX"))
     legs = [OpenLeg(_contract_from_dict(l["contract"]), l["side"], l["qty"], l["entry_price"]) for l in d["legs"]]
     return ManagedPosition(plan, d["lots"], legs, dt.datetime.fromisoformat(d["entered_at"]),
                            d["max_loss"], d["max_profit"], d.get("peak_pnl", 0.0), d.get("exit_state") or {})
@@ -164,6 +169,13 @@ class Bot:
         self.pb = Playbook(PlaybookParams.from_env())
         self._pb_cache: tuple[Optional[tuple], Optional[TrendState]] = (None, None)
         self._pb_ready_cache: tuple[Optional[str], float, bool] = (None, -1e18, False)
+        # Multi-index engine (multi_index.py): all six indices scanned, the best candidate trade wins, one position at
+        # a time. MULTI_INDEX=0 restores the SENSEX-only playbook path. STOP_AFTER_WIN=0 disables the day lock.
+        self.multi = self.pb_enabled and os.getenv("MULTI_INDEX", "1") != "0"
+        self.mi = MultiIndex(self.client, PlaybookParams.from_env()) if self.multi else None
+        self.guard = DayGuard(enabled=os.getenv("STOP_AFTER_WIN", "1") != "0")
+        self._mode_path = os.path.join(cfg.paths.data_dir, "mode.json")
+        self._switch_to: Optional[str] = None
         # Trading report page (report_site.py): ONE Cloud Storage object gs://REPORT_GCS_BUCKET/r/<REPORT_TOKEN>/index.html,
         # overwritten in place on every rebuild, so the link never changes and works while the VM is off.
         tok, bucket = os.getenv("REPORT_TOKEN", "").strip(), os.getenv("REPORT_GCS_BUCKET", "").strip()
@@ -175,7 +187,12 @@ class Bot:
                                   reply=lambda t: self.alerts.send(t), status_fn=self._status_text,
                                   default_single=int(os.getenv("SINGLE_LOTS", "2")),
                                   default_multi=int(os.getenv("MULTI_LOTS", "2")),
-                                  report_url=self.report.url)
+                                  report_url=self.report.url,
+                                  index_defaults={n: s.default_lots for n, s in INDICES.items() if n != "SENSEX"},
+                                  indices_fn=self._indices_text, mode_fn=self._request_mode,
+                                  mode_now=lambda: self.mode,
+                                  admin_ids={x.strip() for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",")
+                                             if x.strip()})
         self._load_state()
         self.tg.start()
 
@@ -194,6 +211,8 @@ class Bot:
                "report_done": self.report_done, "market_open_today": self.market_open_today,
                "risk": self.risk.export(),
                "playbook": self.pb.day.export() if hasattr(self, "pb") else {},
+               "multi": self.mi.export() if getattr(self, "mi", None) else {},
+               "guard": self.guard.export() if hasattr(self, "guard") else {},
                "position": _position_to_dict(self.position) if self.position else None}
         path = self._state_path()
         try:
@@ -227,6 +246,10 @@ class Bot:
             self.risk.restore(doc.get("risk", {}))
             if hasattr(self, "pb"):
                 self.pb.day = DayState.restore(doc.get("playbook") or {})
+            if getattr(self, "mi", None):
+                self.mi.restore(doc.get("multi") or {})
+            if hasattr(self, "guard"):
+                self.guard = DayGuard.restore(doc.get("guard") or {}, enabled=self.guard.enabled)
             if doc.get("position"):
                 self.position = _position_from_dict(doc["position"])
                 log.warning("Restored open position %s from state file", self.position.plan.name)
@@ -273,6 +296,12 @@ class Bot:
 
     def _cycle(self, now: dt.datetime) -> None:
         s = self.cfg.schedule
+        if getattr(self, "_switch_to", None) and self._switch_to != self.mode and not self.position:
+            self.alerts.send(f"Restarting in {self._switch_to} mode now (no open position).", level="WARNING",
+                             key="mode-switch")
+            log.warning("Mode switch to %s: stopping for a restart", self._switch_to)
+            self.stop.set()                       # Docker restarts the container; main() reads data/mode.json
+            return
         if self.day != now.date():
             self._new_day(now)
         if now.weekday() >= 5 or now.time() < s.prep_time:
@@ -323,6 +352,8 @@ class Bot:
                 raise
             except Exception:  # noqa: BLE001 - recording / shadow bugs must never skip position management
                 log.exception("Recording / shadow step failed")
+        if getattr(self, "mi", None) is not None:
+            self.mi.refresh(now)                  # spot windows, 5-minute history per index (never raises)
         if self.position:
             self._manage(now)
         elif not self.risk.halted and snap is not None:
@@ -392,6 +423,8 @@ class Bot:
         self.day = now.date()
         self.realized, self.trades_today = 0.0, 0
         self.risk.reset_day()
+        if hasattr(self, "guard"):
+            self.guard.roll(now.date())
         self.shadow.reset_day()
         self.md.reset_day()
         self.ctx.reset()
@@ -452,10 +485,10 @@ class Bot:
         """(bid, ask) of this contract from the latest chain (at most 10 s old), so paper fills pay the real spread."""
         snap = self._last_snap
         if snap is None or snap.chain is None or time.monotonic() - self._last_snap_at > 10.0:
-            return None
+            return self.mi.bid_ask(c) if getattr(self, "mi", None) is not None else None
         q = snap.chain.get(c.strike, c.kind)
         if q is None or q.contract.symbol != c.symbol or not (q.bid and q.ask and q.ask >= q.bid > 0):
-            return None
+            return self.mi.bid_ask(c) if getattr(self, "mi", None) is not None else None
         return q.bid, q.ask
 
     def _ensure_session(self, now: dt.datetime) -> bool:
@@ -470,6 +503,10 @@ class Bot:
         try:
             self.client.load_instruments()
             self.client.start_stream()               # replaces any earlier stream (no leaked sockets on retries)
+            if getattr(self, "mi", None) is not None:
+                loaded = self.mi.load()
+                log.info("Multi-index engine: %d of %d indices loaded (%s)", len(loaded), len(self.mi.feeds),
+                         ", ".join(loaded))
             if self.position:
                 self.client.subscribe_tokens({l.contract.token: l.contract.key for l in self.position.legs})
             self.capital = self.client.available_cash() if self.live else self.cfg.paper_capital
@@ -628,6 +665,84 @@ class Bot:
                                  level="WARNING", key="pb-multi-skip")
             self._save_state()
 
+    def _try_multi(self, now: dt.datetime, snap: Snapshot) -> None:
+        """All six indices: the best placeable candidate (highest backtest edge) is entered, at most one position at a
+        time, max trades per day from the risk manager, no new entry after the day's first profitable trade."""
+        if self.risk.halted or time.monotonic() < self._entry_block_until or now.time() >= self.cfg.schedule.square_off:
+            return
+        if not self.guard.allows_entry(now.date()):
+            return
+        ok, _why = self.risk.entry_allowed(now, self.trades_today)
+        if not ok:
+            return
+        vix = snap.vix
+        cands = self.mi.candidates(now, vix)
+        if not cands:
+            self._expire_stale_singles(now, vix)
+            return
+        entered = None
+        for c in cands:
+            lots = self._pb_lots(c.plan, self.tg.lots_for(c.index, c.setup))
+            feed = self.mi.feed(c.index)
+            if lots < 1:
+                self.alerts.send(f"{c.index} {c.plan.name} NOT traded ({c.decision.why}): not even 1 lot fits the "
+                                 "margin", level="WARNING", key=f"mi-skip-{c.index}-{c.setup}")
+                (feed.pb.skipped_signal(c.decision) if c.setup == "single" else feed.pb.took_range())
+                continue
+            self._enter(now, snap, c.plan, lots, c.edge, len(cands), chain=feed.chain(now), spot=c.spot)
+            if self.position:
+                (feed.pb.took_single(c.decision) if c.setup == "single" else feed.pb.took_range())
+                entered = c
+            else:                                         # entry failed: never retry this signal blindly
+                (feed.pb.skipped_signal(c.decision) if c.setup == "single" else feed.pb.took_range())
+            break
+        if entered:
+            for c in cands:                               # trend signals that lost to the chosen trade are not chased
+                if c is not entered and c.setup == "single":
+                    self.mi.feed(c.index).pb.skipped_signal(c.decision)
+        self._save_state()
+
+    def _expire_stale_singles(self, now: dt.datetime, vix: float) -> None:
+        """A trend signal whose option never got a usable quote is dropped after PB_QUOTE_RETRY_S (as on SENSEX)."""
+        for name, f in self.mi.feeds.items():
+            if not f.active or "single" not in f.spec.setups:
+                continue
+            ts = f.trend(now)
+            d = f.pb.single_signal(ts, now, vix)
+            if d.action == "single" and ts is not None and (now - ts.bar_end).total_seconds() >= self.PB_QUOTE_RETRY_S:
+                f.pb.skipped_signal(d)
+                self.alerts.send(f"{name} trend signal NOT traded ({d.why}): {self.mi.why_not.get(name, 'no quote')}",
+                                 level="WARNING", key=f"mi-single-stale-{name}")
+
+    def _indices_text(self) -> str:
+        if getattr(self, "mi", None) is None:
+            return "Multi-index engine is off (MULTI_INDEX=0): SENSEX only."
+        now = dt.datetime.now(IST)
+        lines = []
+        for name, f in self.mi.feeds.items():
+            setups = ", ".join(sorted(f.spec.setups)) or "none passed the backtest"
+            exp = f.expiry(now.date()) if f.ready else None
+            lines.append(f"{name}: setups {setups}; lots {self.tg.lots_for(name, 'single')}; "
+                         f"{'expiry ' + exp.isoformat() if exp else 'no tradable expiry today'}; "
+                         f"{self.mi.why_not.get(name, 'waiting')}")
+        lock = (f"Day locked: {self.guard.reason}" if self.guard.locked else
+                "Day open: the first profitable trade locks it")
+        return "\n".join(lines + [lock])
+
+    def _request_mode(self, target: str) -> str:
+        """Confirmed Telegram /mode switch: persist it; the loop restarts the bot once no position is open."""
+        if target == "LIVE" and not live_allowed(os.environ):
+            return ("LIVE is disabled on the VM: LIVE_TRADING_CONFIRM is not YES in .env. Set it there once (the "
+                    "master switch), restart, then use /mode live.")
+        try:
+            write_mode(self._mode_path, target)
+        except OSError:
+            log.exception("Could not write the mode file")
+            return "Could not save the mode (disk?). Nothing changed."
+        self._switch_to = target
+        when = "now" if not self.position else "after the open position closes"
+        return f"OK: switching to {target} {when}. The bot restarts in {target} mode."
+
     PB_QUOTE_RETRY_S = 60.0          # a trend signal whose option is not quoted yet is retried this long
     PB_TICK_MAX_AGE_S = 60.0         # playbook legs: streamed ticks this old are still the price (see _manage_playbook)
     PB_READY_RECHECK_S = 10.0        # pre-emption tradability re-check interval
@@ -676,10 +791,25 @@ class Bot:
         reason: Optional[str] = None
         if self.risk.halted:
             reason = self.risk.update_portfolio(self.capital, self.realized + pnl)   # returns only FLATTEN halts
+        mi = getattr(self, "mi", None)
+        feed = mi.feed(pos.plan.underlying) if mi is not None else None
+        pb = feed.pb if feed is not None else self.pb
         if not reason:
-            ts = self._pb_trend(now)
+            ts = feed.trend(now) if feed is not None else self._pb_trend(now)
             pending = False
             snap = self._last_snap
+            if feed is not None:
+                if not is_single(pos.plan) and snap is not None and "single" in feed.spec.setups:
+                    d = pb.single_signal(ts, now, snap.vix)
+                    if d.action == "single":            # pre-empt only if that index's trend trade is placeable
+                        key, at, ok = self._pb_ready_cache
+                        if key != d.bar_key or time.monotonic() - at >= self.PB_READY_RECHECK_S:
+                            ok = any(c.index == feed.spec.name and c.setup == "single"
+                                     and self._pb_lots(c.plan, self.tg.lots_for(c.index, "single")) >= 1
+                                     for c in mi.candidates(now, snap.vix))
+                            self._pb_ready_cache = (d.bar_key, time.monotonic(), ok)
+                        pending = ok
+                snap = None                               # the SENSEX pre-emption below is for the SENSEX-only path
             if not is_single(pos.plan) and snap is not None:
                 d = self.pb.single_signal(ts, now, snap.vix)
                 # close the condor / credit spread only if the trend trade can really be placed right after; checked at
@@ -690,7 +820,7 @@ class Bot:
                         ok = self._pb_single_ready(now, snap, d)[0] is not None
                         self._pb_ready_cache = (d.bar_key, time.monotonic(), ok)
                     pending = ok
-            reason = self.pb.exit_reason(pos.plan, pnl, ts, pending)
+            reason = pb.exit_reason(pos.plan, pnl, ts, pending)
         if not reason and now.time() >= self.cfg.schedule.square_off and (
                 self.cfg.execution.product == "MIS" or pos.plan.expiry <= now.date()):
             reason = "SQUARE_OFF_TIME"
@@ -707,9 +837,11 @@ class Bot:
         pos = self.position
         p = (f"open: {pos.plan.name} x{pos.lots} [{pos.plan.variant_id}] since {pos.entered_at:%H:%M}"
              if pos else "no open position")
-        return (f"{self.mode} | {p} | today net {self.realized:,.0f} over {self.trades_today} trades | "
+        idx = f" [{pos.plan.underlying}]" if pos else ""
+        lock = " | day LOCKED (first profitable trade done)" if getattr(self, "guard", None) and self.guard.locked else ""
+        return (f"{self.mode} | {p}{idx} | today net {self.realized:,.0f} over {self.trades_today} trades | "
                 f"lots single {self.tg.single_lots}, multi {self.tg.multi_lots} | playbook "
-                f"{'ON' if self.pb_enabled else 'OFF'}")
+                f"{'ON' if self.pb_enabled else 'OFF'} | indices {'6 scanned' if getattr(self, 'mi', None) else 'SENSEX only'}{lock}")
 
     def _manage(self, now: dt.datetime) -> None:
         pos = self.position
@@ -815,6 +947,9 @@ class Bot:
             self._enter(now, snap, plan, lots, score, 1)
 
     def _try_entry(self, now: dt.datetime, snap: Snapshot) -> None:
+        if getattr(self, "mi", None) is not None:
+            self._try_multi(now, snap)
+            return
         if getattr(self, "pb_enabled", False):
             self._try_playbook(now, snap)
             return
@@ -853,7 +988,7 @@ class Bot:
             self._try_explore(now, snap)
 
     def _enter(self, now: dt.datetime, snap: Snapshot, plan: TradePlan, lots: int,
-               score: float, n_candidates: int) -> None:
+               score: float, n_candidates: int, chain=None, spot: Optional[float] = None) -> None:
         log.info("ENTRY %s lots=%d | %s", plan.variant_id, lots, plan.rationale)
         legs = [OrderLeg(l.contract, l.side, plan.qty_for(l, lots), l.ref_price) for l in plan.legs]
         ts = now.isoformat(timespec="seconds")
@@ -876,11 +1011,15 @@ class Bot:
         self.position = ManagedPosition(
             plan, lots, [OpenLeg(l.contract, l.side, l.qty, fills[l.contract.symbol]) for l in legs],
             now, plan.max_loss_per_lot * lots, plan.max_profit_per_lot * lots)
-        self.exit_engine.init_state(self.position, snap.chain, snap.spot)
+        try:
+            self.exit_engine.init_state(self.position, chain or snap.chain, spot or snap.spot)
+        except Exception:  # noqa: BLE001 - descriptive only for playbook trades; never undo an entry over it
+            log.warning("Exit-engine init failed for %s", plan.variant_id, exc_info=True)
         self.trades_today += 1
         self._save_state()
         payload = {"lots": lots, "fills": fills, "rationale": plan.rationale, "score": score,
-                   "candidates": n_candidates, "spot": snap.spot, "vix": snap.vix,
+                   "candidates": n_candidates, "spot": spot or snap.spot, "vix": snap.vix,
+                   "index": plan.underlying,
                    "regime": snap.rs.regime.value, "trend": snap.trend_dir, "margin": margin_req}
         self.rec.event(ts, "entry", plan.variant_id, payload)
         self.rec.trade(ts, self.mode, plan.variant_id, "entry", "", 0.0, 0.0, 0.0, payload)
@@ -1009,6 +1148,10 @@ class Bot:
             return
         self.position, self._exit_failures = None, 0
         log.info("EXIT %s reason=%s net=%.0f day=%.0f", pos.plan.variant_id, reason, net, self.realized)
+        guard = getattr(self, "guard", None)
+        if guard is not None and guard.on_trade_closed(dt.datetime.now(IST).date(), net):
+            self.alerts.send(f"Day target reached: first profitable trade closed (+{net:,.0f}). No new entries "
+                             "today.", key="day-locked")
         self.sheets.append("Trades", TRADES_HEADER, [[ts, self.mode, pos.plan.variant_id, reason, pos.lots,
                                                       round(gross, 2), round(cost, 2), round(net, 2),
                                                       round(self.realized, 2)]])
@@ -1033,6 +1176,8 @@ def main() -> int:
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--paper", action="store_true", help="simulate fills at LTP; no orders sent")
     g.add_argument("--live", action="store_true", help="place real orders")
+    g.add_argument("--auto", action="store_true",
+                   help="mode from data/mode.json (Telegram /mode); PAPER unless it says LIVE and LIVE_TRADING_CONFIRM=YES")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -1040,8 +1185,14 @@ def main() -> int:
     if args.live and os.getenv("LIVE_TRADING_CONFIRM") != "YES":
         log.error("Refusing --live: set LIVE_TRADING_CONFIRM=YES to acknowledge real-money risk")
         return 2
+    live = args.live
+    if args.auto:
+        mode, note = startup_mode(os.path.join(cfg.paths.data_dir, "mode.json"), os.environ)
+        if note:
+            log.error(note)
+        live = mode == "LIVE"
 
-    bot = Bot(cfg, live=args.live)
+    bot = Bot(cfg, live=live)
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: bot.stop.set())
     bot.run()
