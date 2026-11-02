@@ -130,6 +130,7 @@ class TradePlan:
     spot_hi: Optional[float] = None
     spot_be: Optional[float] = None
     entry_spot: Optional[float] = None
+    underlying: str = "SENSEX"        # the index this plan trades (indices.INDICES key)
 
     @property
     def spot_rules(self) -> bool:

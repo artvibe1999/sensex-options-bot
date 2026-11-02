@@ -129,6 +129,18 @@ def single_strike(spot: float, direction: int, days_left: int, now_t: dt.time, s
     return atm
 
 
+def single_strike_pct(spot: float, direction: int, days_left: int, now_t: dt.time, step: float,
+                      itm_pct: tuple[float, float]) -> float:
+    """single_strike for other indices: the same time-decay rule with the in-the-money distance as a share of spot
+    (SENSEX's 2 / 4 steps are 0.27% / 0.53% of SENSEX 75,000), rounded to the index's strike step (at least 1)."""
+    atm = round(spot / step) * step
+    if days_left <= 1 or now_t >= dt.time(13, 30):
+        return atm - direction * max(round(itm_pct[1] * spot / step), 1) * step
+    if days_left == 2:
+        return atm - direction * max(round(itm_pct[0] * spot / step), 1) * step
+    return atm
+
+
 def _q_ok(q) -> bool:
     return q is not None and q.ltp > 0
 
@@ -137,11 +149,13 @@ def _steps(pct: float, spot: float, step: float) -> float:
     return max(round(pct * spot / step), 1) * step
 
 
-def build_single(chain: Chain, direction: int, now: dt.datetime, why: str) -> Optional[TradePlan]:
+def build_single(chain: Chain, direction: int, now: dt.datetime, why: str,
+                 itm_pct: Optional[tuple[float, float]] = None) -> Optional[TradePlan]:
     step = chain.step or 100.0
     kind = "CE" if direction > 0 else "PE"
     dl = trading_days_left(now.date(), chain.expiry)
-    k = single_strike(chain.spot, direction, dl, now.time(), step)
+    k = (single_strike(chain.spot, direction, dl, now.time(), step) if itm_pct is None
+         else single_strike_pct(chain.spot, direction, dl, now.time(), step, itm_pct))
     q = chain.get(k, kind)
     if not _q_ok(q):
         return None
