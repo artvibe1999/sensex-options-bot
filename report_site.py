@@ -161,7 +161,14 @@ def live_trades(records: Iterable[dict], costs: CostParams) -> tuple[list[dict],
 
 
 # ------------------------------------------------------------------ paper: the bot's own trade log
+SP_NAMES = {"orb": "Opening range breakout", "vwap_continuation": "VWAP continuation", "ema_pullback": "EMA pullback",
+            "failed_breakout": "Failed breakout", "bollinger_squeeze": "Bollinger squeeze"}
+
+
 def _setup_name(variant: str) -> str:
+    if variant.startswith("sp_"):                       # SENSEX PRO: sp_<strategy>_<CE|PE>
+        strat, _, side = variant[3:].rpartition("_")
+        return f"{SP_NAMES.get(strat, strat)} {side}"
     if variant.startswith("pb_single_"):
         return f"Single leg {variant.rsplit('_', 1)[1].title()}"
     if variant == "pb_condor":

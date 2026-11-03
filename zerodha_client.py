@@ -156,6 +156,18 @@ class ZerodhaClient:
         self._keys.update({c.token: c.key for c in out})
         return out
 
+    def index_future(self, name: str, exchange: str, today: dt.date) -> Optional[int]:
+        """Instrument token of the index's nearest unexpired future (its volume stands in for the index's, which has
+        none), or None if the dump has no future for it."""
+        rows = [r for r in self._dump(exchange)
+                if r.get("name") == name and r.get("instrument_type") == "FUT" and r.get("expiry")
+                and r["expiry"] >= today]
+        if not rows:
+            return None
+        r = min(rows, key=lambda x: x["expiry"])
+        self._keys[int(r["instrument_token"])] = f"{exchange}:{r['tradingsymbol']}"
+        return int(r["instrument_token"])
+
     def index_token(self, exchange: str, symbol: str) -> int:
         """Instrument token of an index (e.g. NSE "NIFTY 50"), validated."""
         for r in parse_rows(IndexRow, [r for r in self._dump(exchange) if r.get("tradingsymbol") == symbol],
@@ -314,8 +326,13 @@ class ZerodhaClient:
                     depth = t.get("depth") or {}
                     buy, sell = depth.get("buy") or [], depth.get("sell") or []
                     self._flow[tok] = {
-                        "mono": now, "ltp": t["last_price"], "oi": t.get("oi"), "volume": t.get("volume_traded"),
-                        "bid": buy[0].get("price") if buy else None, "ask": sell[0].get("price") if sell else None}
+                        "mono": now, "wall": time.time(), "ltp": t["last_price"], "oi": t.get("oi"),
+                        "volume": t.get("volume_traded"),
+                        "bid": buy[0].get("price") if buy else None, "ask": sell[0].get("price") if sell else None,
+                        "bid_qty": buy[0].get("quantity") if buy else None,
+                        "ask_qty": sell[0].get("quantity") if sell else None,
+                        "avg": t.get("average_traded_price"),
+                        "ex_ts": t.get("exchange_timestamp") or t.get("last_trade_time")}
             except Exception:  # noqa: BLE001
                 log.warning("Bad tick ignored: %r", t, exc_info=True)
 
