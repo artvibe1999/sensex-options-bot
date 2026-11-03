@@ -1,0 +1,31 @@
+# SENSEX PRO risk limits. PROVISIONAL defaults from the requirements brief (section 1.2), not proven optimal values.
+#
+# The rupee amounts below are written for `reference_capital` (Rs 40,000, the brief's assumption). With
+# `scale_with_capital: true` every rupee limit is multiplied by capital / reference_capital, where capital is
+# PAPER_CAPITAL in paper mode and the Kite account's cash in live mode. At PAPER_CAPITAL=200000 (the VM's setting)
+# the factor is 5: Rs 10,000 premium per entry, Rs 3,000 emergency loss per trade, Rs 6,000 daily, Rs 15,000 weekly
+# and Rs 20,000 drawdown. Counts (entries, positions, losses) are never scaled.
+reference_capital: 40000
+scale_with_capital: true
+
+max_premium_per_entry: 2000        # ask x lot size x lots + estimated entry charges must fit, else no trade
+emergency_loss_per_trade: 600      # position loss (at the bid, after exit charges) that triggers emergency exit
+daily_loss_limit: 1200             # realised + unrealised today: blocks entries, emergency-exits an open position
+weekly_loss_limit: 3000            # realised this ISO week (+ unrealised): kill switch latched until manual reset
+max_drawdown: 4000                 # peak-to-trough equity: kill switch latched until manual reset
+
+max_entries_per_day: 3             # across all six indices
+max_open_positions: 1              # the engine supports exactly one
+max_consecutive_losses: 2          # then no new entries for the rest of the day (cool-down / review)
+cooldown_after_exit_min: 10        # no new entry on any index this long after an exit
+
+# Emergency feasibility: the round-trip spread + charges of one entry must stay below this share of the
+# emergency loss budget, otherwise the position would sit close to its emergency exit from the first second.
+emergency_feasibility_frac: 0.5
+
+# Emergency triggers on an open position (section 7.9)
+emergency_spread_pct: 10.0         # bid/ask spread wider than this (% of mid) ...
+emergency_spread_persist_s: 15     # ... for this long
+emergency_stale_s: 30              # option quote older than this (after a REST refresh attempt)
+# Triggers that latch the kill switch (manual reset needed: Telegram /resetkill). Session close never latches.
+latch_on: [trade_loss, daily_loss, weekly_loss, drawdown, broker_mismatch, unreconciled, stale_quote, wide_spread]

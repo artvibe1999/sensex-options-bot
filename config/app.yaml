@@ -1,0 +1,28 @@
+# SENSEX PRO application settings. Times are Asia/Kolkata (IST); everything stored is UTC.
+indices: [SENSEX, NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, NIFTYNXT50]
+
+session:
+  prep_time: "09:00"            # log in, load the instrument master, start the WebSocket
+  market_open: "09:15"
+  entry_start: "09:30"          # no entry before the 15-minute opening range is complete
+  entry_end: "14:30"            # last new entry
+  square_off: "15:15"           # every open position is closed from here (MIS, never overnight)
+  market_close: "15:40"         # options close; the bot ends its day after this
+  report_time: "16:00"          # Zerodha fills / charges saved, report page rebuilt
+
+data:
+  quote_stale_s: 5              # option bid/ask older than this blocks an entry (exchange + receive time)
+  spot_stale_s: 5               # index tick older than this blocks an entry
+  candle_fetch_delay_s: 4       # fetch 1-minute candles this long after each minute closes
+  warmup_days: 6                # calendar days of 1-minute history loaded at session start
+  option_window_strikes: 6      # strikes each side of ATM streamed in FULL mode (bid/ask/depth/volume)
+  record_quotes_for: [SENSEX]   # option quote snapshots recorded for research (1 per second)
+  record_quotes_every_s: 1
+  max_gap_bars: 0               # a missing 1-minute candle inside the last 30 minutes = DATA_UNSAFE
+
+dashboard:
+  enabled: true
+  host: "0.0.0.0"               # inside the container; docker-compose publishes it on 127.0.0.1 only
+  port: 8090
+
+loop_interval_s: 1.0

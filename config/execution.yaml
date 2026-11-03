@@ -1,0 +1,19 @@
+# Order handling. Paper is the default mode; LIVE only after a confirmed Telegram /mode live AND
+# LIVE_TRADING_CONFIRM=YES in .env (both are required; see README "Paper and live").
+product: MIS                    # overridden by PRODUCT in .env
+tag_prefix: SP                  # Kite order tag = tag_prefix + internal client id (max 20 chars)
+
+paper:
+  entry_slippage_pct: 0.25      # buy fills at ask x (1 + this %)
+  exit_slippage_pct: 0.25       # sell fills at bid x (1 - this %)
+  reject_prob: 0.01             # share of orders the paper broker rejects
+  partial_fill_prob: 0.03       # share of multi-lot orders filled only in part (whole lots)
+  no_fill_prob: 0.01            # share of orders that do not fill at all (cancelled after the timeout)
+  ack_delay_s: 0.3              # simulated acknowledgement delay (recorded, not slept)
+  seed: null                    # null = random; set an integer for reproducible paper runs
+
+live:
+  limit_buffer_pct: 1.0         # marketable limit: buy at ask x (1 + this %), sell at bid x (1 - this %)
+  fill_timeout_s: 15            # unfilled remainder is cancelled after this
+  exit_market_after_failures: 2 # exit retries switch to MARKET (with market protection) after this many failures
+  max_exit_attempts: 6          # bounded emergency retry policy; then the kill switch stays latched and you are alerted

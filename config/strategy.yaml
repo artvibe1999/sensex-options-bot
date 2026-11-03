@@ -1,0 +1,88 @@
+# Entry strategies, regime detector, signal scoring, contract selection and adaptive exits.
+# Every number here is a research hypothesis (brief sections 4, 5 and 7), not a validated optimum.
+
+timeframes:
+  signal: 5        # minutes: close-based entry signals use completed 5-minute candles
+  trend: 15        # minutes: higher-timeframe context
+
+indicators:
+  ema_fast: 9
+  ema_slow: 20
+  rsi: 14
+  macd: [12, 26, 9]
+  atr: 14
+  adx: 14
+  bb_period: 20
+  bb_std: 2.0
+  volume_baseline: 20          # prior comparable candles for the volume baseline (median)
+  vwap_slope_bars: 3           # VWAP slope over this many 5-minute bars
+
+regime:
+  adx_trend: 20.0              # 15-minute ADX at or above this can be a trend
+  vwap_slope_atr: 0.05         # |VWAP slope per bar| / ATR above this = sloping
+  max_vwap_crosses_trend: 3    # more VWAP crosses today than this = range behaviour
+  high_vol_atr_ratio: 1.8      # 5-minute ATR / its 20-session median above this = HIGH_VOLATILITY
+  min_warmup_bars_15m: 30      # fewer completed 15-minute bars = DATA_UNSAFE
+
+orb:
+  range_minutes: 15            # 09:15-09:30
+  volume_mult: 1.2
+  max_breakout_atr: 1.8        # breakout candle range above this x ATR = chase: rejected
+  max_attempts: 2              # a third break of the same side the same day is whipsaw: rejected
+  last_entry: "11:30"
+
+vwap_continuation:
+  pullback_atr: 0.6            # low (CE) within this x ATR of VWAP or EMA9 counts as a pullback
+  max_vwap_crosses: 3
+  rsi_min_ce: 50.0             # momentum not deteriorating: RSI above (CE) / below 100 - this (PE)
+
+ema_pullback:
+  pullback_atr: 0.5            # low (CE) within this x ATR of the 9/20 EMA zone
+  max_extension_atr: 1.5       # close farther than this x ATR from EMA20 = late entry: rejected
+  min_ema_gap_atr: 0.10        # EMAs closer than this x ATR = flat: rejected
+  rsi_min_ce: 50.0
+
+failed_breakout:
+  swing_lookback: 12           # 5-minute bars for intraday swing levels
+  max_sweep_bars: 3            # the reclaim must happen within this many bars of the sweep
+  min_sweep_atr: 0.25          # price must trade at least this x ATR beyond the level (not a 1-tick wick)
+  strong_trend_adx: 30.0       # fading a 15-minute trend this strong needs volume confirmation
+
+bollinger_squeeze:
+  lookback: 120                # 5-minute bars for the bandwidth percentile (no future data)
+  squeeze_pct: 20.0            # bandwidth at or below this percentile within the last 6 bars = squeeze
+  squeeze_recent_bars: 6
+  max_extension_atr: 1.5       # close more than this x ATR outside the band = too extended
+  volume_mult: 1.2             # breakout candle volume / baseline at least this (1.5 = "strong")
+
+scoring:
+  eligible: 80                 # 80-100: eligible for risk review
+  watchlist: 70                # 70-79: logged, no order; below: rejected
+  high_vol_extra: 5            # HIGH_VOLATILITY regime: "selective" = this much more than `eligible`
+
+ensemble:
+  signal_ttl_s: 90             # a signal not placed within this long after its bar closed is dropped
+
+contracts:
+  avoid_expiry_day_contract: true   # on an expiry day trade the next expiry (no 0-DTE gamma lottery)
+  candidate_steps: [0, -1, 1]       # ATM, one strike in the money, one out of the money (never farther)
+  max_spread_pct: 1.5               # of mid
+  min_volume: 5000                  # contracts traded today (from the FULL-mode tick)
+  min_depth_lots: 1                 # best-level ask quantity must cover this many of the order's lots
+
+exits:
+  weights: {structure: 30, vwap: 20, momentum: 15, option_health: 15, iv_theta: 10, time: 10}
+  missing_input_share: 0.5          # a missing input scores this share of its weight (never 0 = favourable)
+  hold_below: 30
+  reassess_below: 50
+  prepare_below: 70
+  prepare_bars_to_exit: 2           # PREPARE_EXIT on this many consecutive completed bars = EXIT
+  structure_confirm: close          # close = a completed 5-minute close beyond the level exits immediately
+  structure_trail_bars: 2           # a swing low (CE) / high (PE) needs this many bars each side to be confirmed
+  no_progress_min: 10               # reassess when the underlying has not progressed this long
+  no_progress_exit_min: 15          # still no progress and the thesis weakening: more exit pressure
+  progress_atr: 0.5                 # "meaningful progress" = this x ATR in the trade's direction
+  profit_milestone_premium_pct: 25  # peak profit at or above this % of premium paid ...
+  milestone_exit_threshold: 50      # ... lowers the EXIT threshold to this (protect the runner)
+  reduce_lots_on_weakening: true    # multi-lot positions sell one lot when PREPARE_EXIT appears after the milestone
+  option_ema: [9, 21]               # on 1-minute option prices
