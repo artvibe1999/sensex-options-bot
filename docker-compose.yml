@@ -1,15 +1,22 @@
 services:
   bot:
     build: .
-    # Change to ["python", "main.py", "--live"] only after the paper -> promote
-    # pipeline in README.md, and set LIVE_TRADING_CONFIRM=YES in .env.
-    command: ["python", "main.py", "--auto"]   # mode from data/mode.json (Telegram /mode); PAPER by default
+    # SENSEX PRO. Mode from data/mode.json (Telegram /mode live + /confirm); PAPER by default. LIVE also needs
+    # LIVE_TRADING_CONFIRM=YES in .env. Never change this to --live by hand.
+    command: ["python", "main.py", "--auto"]
     restart: unless-stopped
-    stop_grace_period: 40s      # time to flatten/flush on shutdown
+    stop_grace_period: 40s      # time to journal state on shutdown (an open position is recovered on restart)
     env_file: .env
+    ports:
+      - "127.0.0.1:8090:8090"   # read-only status dashboard, host loopback only (SSH tunnel to view)
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
 
   token:
     build: .

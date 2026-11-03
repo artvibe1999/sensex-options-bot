@@ -1,4 +1,7 @@
-kiteconnect>=5.0.1
-requests>=2.31
-python-dotenv>=1.0
-pydantic>=2.6,<3
+# Pinned (versions running on the sxbot VM on 3 Nov 2026, plus PyYAML for config/*.yaml). Licences: kiteconnect MIT,
+# requests Apache-2.0, python-dotenv BSD-3, pydantic MIT, PyYAML MIT.
+kiteconnect==5.2.2
+requests==2.34.2
+python-dotenv==1.2.4
+pydantic==2.14.2
+PyYAML==6.0.2

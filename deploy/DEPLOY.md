@@ -28,9 +28,13 @@ Manual fallback: `docker compose exec token python token_service.py url`, log in
 `python token_service.py exchange --request-token <request_token>`; `status` shows freshness.
 
 ## Operations
-- Logs: `docker compose logs -f bot`. Data: `./data` volume (back up `sxbot.db`).
-- Unknown positions in BFO halt the bot (`allow_foreign_positions=False`).
-- Kill switch: max daily loss; or `docker compose stop bot` (then square off manually).
+- Logs: `docker compose logs -f bot` (text) and `logs/sensexpro.jsonl` (JSON). Data: `./data` (journal `sxbot.db`,
+  daily copy `sxbot-backup.db`, `token.json`, `settings.json`, `mode.json`, `state.json`).
+- Health: `bash scripts/health_check.sh`; dashboard over an SSH tunnel
+  (`gcloud compute ssh sxbot --zone asia-south1-a -- -L 8090:127.0.0.1:8090`, then http://localhost:8090).
+- Kill switch: Telegram `/kill`; reset with `/resetkill` + `/confirm` (or
+  `docker compose exec bot python -m sensexpro.cli reset-kill --mode PAPER` and restart). Breakers latch it by themselves.
+- In LIVE, broker positions that differ from the journal latch the kill switch at start-up and during a position.
 
 ## Optional: live orders in a Google Sheet
 Tabs created automatically: **Orders** (every leg order with time, side, qty, LTP and fill price),
@@ -64,8 +68,42 @@ It only reads the bot's own record; with live money also check the broker's posi
 
 `install_autostop.sh` also installs `sxbot-compose.service`, which runs `docker compose up -d` on every boot, so the bot, login service and web server always start with the VM.
 
-## Weekly intraday-approval refresh
-`sudo bash deploy/install_intraday_refresh.sh` (once). Every Friday at 15:35 IST it re-downloads 5-minute SENSEX/VIX
-history with that day's Kite login and re-runs `intraday_backtest.py` (~15 min on 2 vCPU), holding off the auto-stop
-while it works, then sends the result to Telegram. A failed run (e.g. no login that day) keeps the old approvals
-(valid 60 days). History: `logs/intraday_refresh_history.log`; last run's output: `logs/intraday_refresh.log`.
+## Deploying SENSEX PRO on the existing VM `sxbot`
+Inspected read-only on 3 Nov 2026: project `eastern-augury-420203`, zone `asia-south1-a`, `e2-small` (2 vCPU shared,
+2 GB), Debian 12, 40 GB disk (19 % used), service account `sxbot-report@eastern-augury-420203.iam.gserviceaccount.com`,
+network tag `https-server`, start schedule `sxbot-start`, SSH user `amazoncentres`, app in `~/sxbot` (git checkout,
+`docker compose`: bot / token / caddy), Docker 29.9. Timers: `sxbot-autostop.timer`, `sxbot-intraday-refresh.timer`
+(the latter belongs to the earlier bot; `scripts/deploy.sh` disables it). No new VM, firewall or IAM change is needed:
+the dashboard is published on the host loopback only.
+
+Hardening already in place / recommended:
+- containers run as uid 10001 (non-root); the code in the image is root-owned and read-only to the bot;
+- `.env` lives outside git; **recommended**: `chmod 600 ~/sxbot/.env` (it is 644 today) and move the `.env.bak*` /
+  `.env.save` copies out of the app directory;
+- restart policy `unless-stopped`; Docker health check on the dashboard; journald via the Docker logging driver;
+- the engine starts PAPER, checks the instrument master, broker login, kill switch and reconciles before any entry.
+
+### Deploy a reviewed commit
+```bash
+cd ~/sxbot
+git fetch origin
+bash scripts/deploy.sh <commit-sha>      # builds, runs the 122 tests inside the image, then restarts; refuses
+                                         # during market hours while a position is open
+bash scripts/health_check.sh
+```
+The repo is public, so `git fetch` works on the VM. If it becomes private again (no GitHub credentials on the VM):
+`git bundle create sp.bundle <branch>` locally, `gcloud compute scp sp.bundle sxbot:~/` and `git fetch ~/sp.bundle
+<branch>` before `deploy.sh`.
+
+### Rollback
+`bash scripts/deploy.sh "$(cat data/deploy.prev)"` returns to the commit that ran before the last deploy (the journal,
+token, settings and `.env` are never touched by a deploy). The earlier engine's last commit on `main` before SENSEX PRO
+is `f625b14`. The new `sp_*` tables are additive, so the old engine runs on the same database.
+
+### Paper -> live (only after review)
+1. At least 30 sessions of paper operation; review the Trades sheet, the report page, `sp_signals`, slippage and
+   recovery behaviour.
+2. Sign off the live-readiness checklist (Zerodha API terms, static IP registration for orders, order tags, rate
+   limits, capital).
+3. Set `LIVE_TRADING_CONFIRM=YES` in `.env`, `docker compose up -d`, then Telegram `/mode live` + `/confirm CODE`.
+   `/mode paper` switches back.

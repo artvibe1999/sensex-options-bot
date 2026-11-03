@@ -7,8 +7,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY *.py ./
+COPY sensexpro ./sensexpro
+COPY config ./config
+COPY tests ./tests
 RUN useradd --create-home --uid 10001 bot \
-    && mkdir -p /app/data /app/logs && chown -R bot:bot /app
+    && mkdir -p /app/data /app/logs && chown -R bot:bot /app/data /app/logs
 USER bot
 
-CMD ["python", "main.py", "--paper"]
+# PAPER unless data/mode.json says LIVE (Telegram /mode live + /confirm) AND LIVE_TRADING_CONFIRM=YES
+CMD ["python", "main.py", "--auto"]

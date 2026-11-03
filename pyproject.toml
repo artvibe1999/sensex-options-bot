@@ -1,0 +1,10 @@
+[project]
+name = "sensex-pro"
+version = "1.0.0"
+description = "Selective intraday long-option (CE/PE) engine for six Indian index-option markets, Zerodha Kite Connect. Paper by default."
+requires-python = ">=3.12"
+dependencies = ["kiteconnect==5.2.2", "requests==2.34.2", "python-dotenv==1.2.4", "pydantic==2.14.2", "PyYAML==6.0.2"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
