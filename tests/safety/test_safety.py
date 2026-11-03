@@ -164,7 +164,10 @@ class TestSecrets(unittest.TestCase):
         self.assertEqual(hits, [])
 
     def test_secrets_files_are_ignored(self):
-        ig = open(os.path.join(ROOT, ".gitignore"), encoding="utf-8").read().split()
+        path = os.path.join(ROOT, ".gitignore")
+        if not os.path.exists(path):
+            self.skipTest("not a git checkout (e.g. inside the Docker image)")
+        ig = open(path, encoding="utf-8").read().split()
         for needed in (".env", "data/", "logs/", "*.db", "token.json"):
             self.assertIn(needed, ig)
 
